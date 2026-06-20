@@ -1,0 +1,51 @@
+[project]
+name = "competitive-analysis-system"
+version = "0.1.0"
+description = "AI驱动的竞品分析多Agent协作系统"
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Codex Agent"}
+]
+keywords = ["competitive-analysis", "multi-agent", "langgraph", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "langgraph>=1.0.0",
+    "langchain>=0.3.0",
+    "langchain-deepseek",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "asyncpg>=0.29.0",
+    "pgvector>=0.3.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "httpx>=0.27.0",
+    "sse-starlette>=2.0",
+    "prometheus-client>=0.20.0",
+    "tiktoken>=0.7.0",
+    "FlagEmbedding>=1.3.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

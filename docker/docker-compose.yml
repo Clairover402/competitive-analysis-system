@@ -1,0 +1,33 @@
+# ============================================================
+# 竞品分析系统 — PostgreSQL Docker Compose
+# 启动: docker compose up -d
+# 停止: docker compose down
+# 重建: docker compose up -d --build
+# ============================================================
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: competitive-analysis-pg
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: competitive_analysis_pwd
+      POSTGRES_DB: competitive_analysis
+    volumes:
+      # 数据持久化（容器删除后数据还在）
+      - pgdata:/var/lib/postgresql/data
+      # 初始化脚本（首次启动自动执行）
+      - ../src/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d competitive_analysis"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+    name: competitive-analysis-pgdata
