@@ -37,7 +37,7 @@ LangGraph 1.0 竞品分析系统。四个Agent（Collector/Analyzer/Writer/Quali
 
 ## 编码规范
 
-**必须**：全异步(no `time.sleep`/`requests`/`psycopg2`同步版) · Type hints + docstring全覆盖 · UTF-8 · `pathlib.Path` · pydantic-settings管理配置
+**必须**：全异步(no `time.sleep`/`requests`/`psycopg2`同步版) · Type hints + docstring全覆盖 · UTF-8 · `pathlib.Path` · pydantic-settings管理配置 ， 日志信息使用中文
 
 **禁止**：创建虚拟环境 · pip install · git操作 · 硬编码密钥/密码 · 写C盘文件
 
