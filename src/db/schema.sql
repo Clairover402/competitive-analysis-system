@@ -293,12 +293,12 @@ CREATE INDEX IF NOT EXISTS idx_agent_memories_embedding_hnsw
 --   - 多线程并行不冲突（thread_id 分区）
 CREATE TABLE IF NOT EXISTS checkpoints (
     thread_id           TEXT NOT NULL,
-    checkpoint_ns       TEXT NOT NULL DEFAULT '',
+    checkpoint_ns       TEXT NOT NULL DEFAULT "",
     checkpoint_id       TEXT NOT NULL,
-    parent_checkpoint_id TEXT,              -- 形成 checkpoint 链（DAG）
+    parent_checkpoint_id TEXT,
     type                TEXT,
-    checkpoint          JSONB NOT NULL,    -- 完整状态快照
-    metadata            JSONB NOT NULL DEFAULT '{}',
+    checkpoint          JSONB NOT NULL,
+    metadata            JSONB NOT NULL DEFAULT "{}",
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
 );
 
@@ -306,7 +306,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 -- 典型场景：Supervisor 暂停 → 保存待发送消息 → 恢复后继续发送
 CREATE TABLE IF NOT EXISTS checkpoint_writes (
     thread_id       TEXT NOT NULL,
-    checkpoint_ns   TEXT NOT NULL DEFAULT '',
+    checkpoint_ns   TEXT NOT NULL DEFAULT "",
     checkpoint_id   TEXT NOT NULL,
     task_id         TEXT NOT NULL,
     idx             INT NOT NULL,
