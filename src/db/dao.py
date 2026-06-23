@@ -498,13 +498,31 @@ class MemorySummaryDAO:
     async def get_by_round_range(
         self, task_id: str, round_range: str
     ) -> list[dict]:
-        """按轮次范围获取摘要。"""
+        """按轮次范围获取摘要（精确匹配 round_range 列）。"""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT * FROM memory_summaries
                    WHERE task_id = $1 AND round_range = $2
                    ORDER BY created_at DESC""",
                 task_id, round_range,
+            )
+            return [dict(r) for r in rows]
+
+    async def get_recent_by_task(
+        self, task_id: str, limit: int = 10
+    ) -> list[dict]:
+        """获取某任务最近的 N 条摘要记录（不按 round_range 过滤）。
+
+        【L4 工程】MemorySummarizer 全量合并路径用此方法取最近 N 轮摘要，
+        不需要知道具体 round_range 值——只按 created_at 倒序取最新记录即可。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT * FROM memory_summaries
+                   WHERE task_id = $1
+                   ORDER BY created_at DESC
+                   LIMIT $2""",
+                task_id, limit,
             )
             return [dict(r) for r in rows]
 

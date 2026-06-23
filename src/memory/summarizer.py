@@ -305,17 +305,16 @@ class MemorySummarizer:
           比查自家的 memory_summaries 表复杂得多。
           摘要表已经存了每轮的摘要文本——对全量合并来说足够。
 
-        【L4 工程】已知缺陷（低严重度）
-        ──────────────────────────
-          get_by_round_range(task_id, "") 传入空字符串作为 round_range，
-          当前实现不匹配任何记录。但触发此路径的只有全量合并
-          （每 10 轮一次），且当前 Summarizer 不集成 Pipeline，
-          所以不影响功能。留给 Phase 5A 修复。
+        【L4 工程】Phase 5A 修复：不再传空字符串给 get_by_round_range
+        ──────────────────────────────────────────────────────────
+          旧实现: dao.get_by_round_range(task_id, "") → 空字符串不匹配任何记录
+          新实现: dao.get_recent_by_task(task_id, count) → 按 created_at 倒序取
+          全量合并只需要"最近 N 条摘要"，不需要按 round_range 字段过滤。
         """
         messages: list[dict] = []
         try:
-            records = await self._dao.get_by_round_range(task_id, "")
-            for r in records[-count:]:
+            records = await self._dao.get_recent_by_task(task_id, limit=count)
+            for r in records:
                 if isinstance(r.get("summary_text"), str):
                     messages.append({"role": "summary", "content": r["summary_text"]})
         except Exception:
