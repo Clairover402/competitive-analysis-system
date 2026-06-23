@@ -85,6 +85,9 @@ from src.agents import (
 )
 from src.pipeline.state import AgentState
 from src.pipeline.checkpoint import PostgresSaver
+from src.memory.long_term import LongTermMemoryEngine
+from src.memory.conflict import MemoryConflictResolver
+from src.db.dao import AgentMemoryDAO
 from src.db.dao import TaskDAO
 from src.db.connection import create_pool
 from src.mcp import create_mcp_server
@@ -180,7 +183,7 @@ def _make_node_collect(mcp_server: MCPServer, llm: ChatDeepSeek):
     return node_collect
 
 
-def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek):
+def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek, engine: LongTermMemoryEngine):
     """创建 analyze 节点函数（闭包注入 LLM t=0.1）。
 
     读取 collected_data 中的 task 元信息，调用 analyzer_agent。
@@ -196,15 +199,26 @@ def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek):
         这是一种"State 瘦身"策略——只传控制信息（task_id），
         大体积数据（chunk 文本）留在 DB 中按需检索。
         """
+        user_id = state["user_id"]
+        query = f"{state['title']} {', '.join(state['dimensions'])}"
+        memories = await engine.retrieve(user_id, query)
+
+        memory_context = ""
+        if memories:
+            memory_context = "\n[历史记忆]\n"
+            for i, m in enumerate(memories[:5]):
+                memory_context += f"{i+1}. [{m.get('memory_type','?')}] {m.get('content','')[:200]}\n"
+
         task = {
             "id": state["task_id"],
             "title": state["title"],
             "competitors": state["competitors"],
             "dimensions": state["dimensions"],
+            "memory_context": memory_context,
         }
-        logger.info("【Pipeline】analyze 开始, task=%s", state["task_id"])
+        logger.info("【Pipeline】analyze 开始, task=%s, memories=%d", state["task_id"], len(memories))
         result = await analyzer_agent(task, mcp_server, llm)
-        return {"analysis_results": result}
+        return {"analysis_results": result, "retrieved_memories": memories}
     return node_analyze
 
 
@@ -294,7 +308,7 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
     return node_quality
 
 
-def _make_node_finalize(pool: Pool):
+def _make_node_finalize(pool: Pool, engine: LongTermMemoryEngine | None = None, llm_extract: ChatDeepSeek | None = None):
     """创建 finalize 节点函数（注入 Pool，不是 LLM）。
 
     【L5 决策】finalize 为什么需要 pool 而不是 llm？
@@ -324,6 +338,34 @@ def _make_node_finalize(pool: Pool):
 
         task_dao = TaskDAO(pool)
         await task_dao.update_status(state["task_id"], "completed")
+
+        # Persist 3-5 key decisions to long-term memory
+        if engine and state.get("report_content"):
+            try:
+                extract_prompt = (
+                    "Extract 3-5 key decisions, user preferences, or important facts from the competitive analysis report below. "
+                    "One per line, format: {type}|{content} "
+                    "type must be one of: decision/preference/fact. "
+                    "No other text. "
+                    "\n\nReport:\n" + state["report_content"][:3000]
+                )
+                llm_result = await llm_extract.ainvoke(extract_prompt)
+                lines = llm_result.content.strip().split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if "|" in line:
+                        parts = line.split("|", 1)
+                        mem_type = parts[0].strip()
+                        mem_content = parts[1].strip()
+                        if mem_type in ("decision", "preference", "fact") and len(mem_content) > 5:
+                            await engine.add_memory(
+                            user_id=state["user_id"],
+                                content=mem_content,
+                                memory_type=mem_type,
+                                source_task_id=state["task_id"],
+                            )
+            except Exception:
+                logger.exception("Failed to persist memories from report")
 
         return {
             "final_report": state["report_content"],
@@ -396,6 +438,7 @@ def route_after_quality(state: AgentState) -> str:
 async def build_pipeline_graph(
     mcp_server: MCPServer,
     pool: Pool,
+    user_id: str = "default",
 ) -> CompiledStateGraph:
     """构建并编译 Pipeline StateGraph。
 
@@ -452,6 +495,11 @@ async def build_pipeline_graph(
     saver = PostgresSaver(pool)
     await saver.setup()  # 确保表存在（幂等）
 
+    # ─── 长期记忆引擎 ───
+    agent_memory_dao = AgentMemoryDAO(pool)
+    conflict_resolver = MemoryConflictResolver(llm_analyzer, agent_memory_dao)
+    ltm_engine = LongTermMemoryEngine(llm_analyzer, agent_memory_dao, conflict_resolver)
+
     # ─── 构建图 ───
     graph = StateGraph(AgentState)
 
@@ -460,10 +508,10 @@ async def build_pipeline_graph(
     # 第二个参数是节点函数（async def node_xxx(state) -> dict）
     # 节点名和节点函数分离：同一个函数可以用不同名字注册（虽然这里没用到）
     graph.add_node("collect", _make_node_collect(mcp_server, llm_collector))
-    graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer))
+    graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer, ltm_engine))
     graph.add_node("write", _make_node_write(mcp_server, llm_writer))
     graph.add_node("quality", _make_node_quality(mcp_server, llm_quality))
-    graph.add_node("finalize", _make_node_finalize(pool))
+    graph.add_node("finalize", _make_node_finalize(pool, ltm_engine, llm_analyzer))
 
     # ─── 确定性边 ───
     # 【L3 核心考点】add_edge("A", "B")
@@ -566,6 +614,7 @@ async def run_pipeline_task(task: dict) -> dict:
         initial_state: AgentState = {
             "task_id": task["id"],
             "title": task["title"],
+            "user_id": user_id,
             "competitors": task["competitors"],
             "dimensions": task["dimensions"],
             "pipeline_mode": "pipeline",

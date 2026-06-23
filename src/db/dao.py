@@ -515,7 +515,7 @@ class AgentMemoryDAO:
     【L5 面试核心】三因子加权检索公式——本系统最核心的工程创新之一
     ============================================================
     排序公式：
-      score = (1.0 - cosine_distance) × importance × 0.5^(age_days / half_life_days)
+      score = 0.6×(1-cosine_distance) + 0.3×importance + 0.1×0.5^(age/half_life)
 
     三个因子拆解：
 
@@ -605,12 +605,12 @@ class AgentMemoryDAO:
                 """SELECT id, user_id, memory_type, content, importance,
                           access_count, half_life_days, created_at,
                           last_accessed,
-                          (1.0 - (embedding <=> $2::vector))
-                          * importance
-                          * POWER(0.5,
+                          (1.0 - (embedding <=> $2::vector)) * 0.6
+                          + importance * 0.3
+                          + POWER(0.5,
                                   EXTRACT(DAY FROM NOW() - created_at)
                                   / half_life_days
-                            ) AS weighted_score
+                            ) * 0.1 AS weighted_score
                    FROM agent_memories
                    WHERE user_id = $1 AND is_active = true
                    ORDER BY weighted_score DESC

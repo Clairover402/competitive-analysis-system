@@ -116,6 +116,7 @@ class AgentState(TypedDict):
     # ══════════════════════════════════════════════════════════════════════
 
     task_id: str
+    user_id: str
     """任务唯一 ID（UUID）。全链路透传，用于日志关联 + DB 查询筛选 + Checkpoint thread_id。
     
     【L4 工程】task_id 的三重身份
@@ -183,6 +184,13 @@ class AgentState(TypedDict):
       }
 
     Analyzer 写入 → Writer 消费 → 拼入报告。
+    """
+    
+    retrieved_memories: list[dict]
+    """长期记忆检索结果列表，由 node_analyze 调用 LongTermMemoryEngine.retrieve 写入。
+
+    格式: [{\"content\": \"...\", \"memory_type\": \"...\", \"importance\": 0.8, ...}]
+    注入 Analyzer 的 LLM prompt 作为 memory_context，辅助分析。
     """
 
     # ══════════════════════════════════════════════════════════════════════

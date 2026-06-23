@@ -1,7 +1,8 @@
 # AI驱动的竞品分析多Agent协作系统 — 阶段开发计划
 
-> **状态**: 理论设计完成 → 代码开发启动  
+> **状态**: Phase 0/1/2/3/4/4.5 ✅ 完成 → Phase 5A 待开发  
 > **日期**: 2026-06-14  
+> **最后更新**: 2026-06-22（Phase 4.5 验收通过）  
 > **开发方式**: Codex (ACP Harness) 逐阶段执行  
 > **项目路径**: `D:\AAAagent\projects\competitive-analysis-system\`
 
@@ -1345,6 +1346,32 @@ async def node_finalize(state: AgentState) -> dict:
 5. `MemoryForgetting.archive_old_memories()` 正确归档且不删决策类记忆
 6. Pipeline 集成：analyze 节点可检索长期记忆，finalize 节点可写入长期记忆
 
+### 实现状态：✅ 已完成（2026-06-22）
+
+**交付物**（全部通过 AST 验证）：
+| 文件 | 模块 | 行数 |
+|------|------|------|
+| `src/memory/__init__.py` | 包入口，导出 5 个类 | 25 |
+| `src/memory/summarizer.py` | MemorySummarizer（递增 + 全量合并） | ~140 |
+| `src/memory/long_term.py` | LongTermMemoryEngine（五步检索 + RRF 融合） | ~180 |
+| `src/memory/retrieval.py` | MemoryRetrievalStrategy（混合触发） | ~100 |
+| `src/memory/conflict.py` | MemoryConflictResolver（三级冲突） | ~120 |
+| `src/memory/forgetting.py` | MemoryForgetting（三层遗忘） | ~80 |
+
+**Pipeline 集成**（`src/pipeline/graph.py` 已更新）：
+- analyze 节点：检索长期记忆 → 格式化为 memory_context → 注入 Analyzer LLM Prompt
+- finalize 节点：LLM 提取 3-5 条关键决策/偏好/事实 → `engine.add_memory()` 写入 agent_memories
+- Summarizer 不在 Pipeline 集成（Pipeline 无对话轮次，留给 Phase 5A Supervisor ReAct 循环）
+
+**验收中修复的 Bug**：
+- 🔧 summarizer.py / retrieval.py / conflict.py 共 4 处 `\\n` 转义错误（Codex 写入时多转了一次）→ 全部改为 `\n`
+
+**实施时补充的设计决策**：
+- round_num 在 Pipeline 中无自然来源（最多 3 个 report_version，达不到全量合并阈值 10）→ Summarizer 跳过 Pipeline，留给 Supervisor
+- user_id 在 Pipeline 集成中暂用 `state.get("user_id", "default")` 兜底——待 AgentState 补 user_id 字段后消除兜底值
+- Finalize 节点的记忆提取用内联 prompt（非 `_KEY_DECISIONS_PROMPT` 常量），格式 `type|content`
+- 三个钩子中 Pipeline 只集成了两个（analyze + finalize），write 后摘要钩子不集成
+
 ### 注意事项
 - 长期记忆检索的 ORDER BY 在 SQL 层完成（一次查询，不返 Python 再排序）
 - 摘要记忆的 LLM Prompt 必须约束输出长度（<=500 字）——否则摘要比原文还长
@@ -1352,6 +1379,7 @@ async def node_finalize(state: AgentState) -> dict:
 - 遗忘策略不加 cron 调度（Phase 4.5 只写逻辑，调度由用户自行配置）
 - 所有记忆操作必须带 user_id——多用户隔离
 - embedding 向量用 BGE-M3 1024 维，和 RAG 检索共用同一模型（避免重复加载）
+- **Pipeline 只集成长记忆检索和写入两个钩子，Summarizer 留给 Phase 5A Supervisor**
 
 ---
 
@@ -2112,10 +2140,12 @@ async def test_rate_limit():
 
 ```
 Phase 0 ──→ Phase 1 ──→ Phase 3 ──→ Phase 4 ──→ Phase 4.5 ──→ Phase 6 ──→ Phase 7
-    │                      │              │
+    │   ✅       ✅         ✅         ✅          ✅
     └──→ Phase 2 ─────────┘              │
-                                          │
+          ✅                              │
                         Phase 5A ──→ Phase 5B ──┘
+
+✅ = 已完成    ⏳ = 进行中    ⬚ = 待开发
 ```
 
 - Phase 0（脚手架）是所有阶段的前置
@@ -2126,6 +2156,21 @@ Phase 0 ──→ Phase 1 ──→ Phase 3 ──→ Phase 4 ──→ Phase 4.
 - Phase 5B（Router+Harness）依赖 Phase 4 + Phase 5A
 - Phase 6（服务化）依赖 Phase 4 + Phase 5B
 - Phase 7（评估）依赖 Phase 6
+
+### 开发进度总览
+
+| Phase | 名称 | 状态 | 完成时间 | 审计报告 |
+|-------|------|:--:|---------|---------|
+| 0 | 项目脚手架 + 配置 | ✅ | 2026-06-20 | phase_report/phase0-audit_2026-06-20.md |
+| 1 | 数据库 Schema + DAO | ✅ | 2026-06-20 | phase_report/phase1-audit_2026-06-20.md |
+| 2 | MCP 工具层 | ✅ | 2026-06-20 | phase_report/phase2-audit_2026-06-20.md |
+| 3 | Agent 实现 | ✅ | 2026-06-21 | phase_report/phase3-audit_2026-06-21.md |
+| 4 | Pipeline 编排 | ✅ | 2026-06-22 | phase_report/phase4-audit_2026-06-22.md |
+| 4.5 | 记忆系统 | ✅ | 2026-06-22 | 本文档（内联验收） |
+| 5A | Supervisor + A2A | ⬚ | — | — |
+| 5B | IntentRouter + Harness | ⬚ | — | — |
+| 6 | 服务化 + 可观测性 | ⬚ | — | — |
+| 7 | 评估体系 + 集成测试 | ⬚ | — | — |
 
 ---
 
