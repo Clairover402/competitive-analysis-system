@@ -239,7 +239,7 @@ class A2ARouter:
         _mcp_server: MCP 工具服务器（透传给 handler）
     """
 
-    def __init__(self, mcp_server: MCPServer) -> None:
+    def __init__(self, mcp_server: MCPServer, harness: "HarnessGuard | None" = None) -> None:
         """初始化空注册表，绑定 MCP Server。
 
         MCP Server 在整个 A2A 链路中只创建一次，通过 A2ARouter 透传给所有 Agent。
@@ -249,6 +249,7 @@ class A2ARouter:
         self._handlers: dict[str, AgentHandler] = {}
         self._llms: dict[str, ChatDeepSeek] = {}
         self._mcp_server = mcp_server
+        self._harness = harness
 
     # ────────────────────────────────────────────────────────────────────────
     # 公开方法: register — 三合一绑定（卡片 + 函数 + LLM）
@@ -403,6 +404,22 @@ class A2ARouter:
             logger.error("A2A send_task 失败: agent=%s 注册不完整", task.agent_name)
             return task
 
+        # Step ②.5: Harness 五层安全检查（Phase 5B 集成）
+        if self._harness is not None:
+            guard_result = await self._harness.guard(
+                agent_name=task.agent_name,
+                action=task.action,
+                arguments=task.arguments,
+                schema=card.input_schema,
+                task_id=task.id,
+            )
+            if not guard_result["passed"]:
+                task.status = TaskStatus.FAILED
+                task.error = guard_result.get("error", "HARNESS_BLOCKED")
+                task.completed_at = time.time()
+                logger.warning("Harness ??: agent=%s, action=%s, error=%s",
+                               task.agent_name, task.action, task.error)
+                return task
         # Step ③: 标记执行中
         task.status = TaskStatus.RUNNING
         task.created_at = time.time()

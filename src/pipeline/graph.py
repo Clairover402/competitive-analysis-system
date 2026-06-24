@@ -560,7 +560,11 @@ async def build_pipeline_graph(
 # §4 入口函数
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def run_pipeline_task(task: dict) -> dict:
+async def run_pipeline_task(
+    task: dict,
+    mcp_server: "MCPServer | None" = None,
+    pool: "Pool | None" = None,
+) -> dict:
     """运行 Pipeline 模式竞品分析——外部调用入口。
 
     【L5 架构】这是系统的"一键执行"入口。
@@ -602,9 +606,10 @@ async def run_pipeline_task(task: dict) -> dict:
     Returns:
         {task_id, final_report, quality_score}
     """
-    settings = Settings()
-    mcp_server = create_mcp_server(settings)
-    pool = await create_pool(settings)
+    if mcp_server is None or pool is None:
+        settings = Settings()
+        mcp_server = create_mcp_server(settings)
+        pool = await create_pool(settings)
 
     try:
         graph = await build_pipeline_graph(mcp_server, pool)
@@ -614,7 +619,7 @@ async def run_pipeline_task(task: dict) -> dict:
         initial_state: AgentState = {
             "task_id": task["id"],
             "title": task["title"],
-            "user_id": user_id,
+            "user_id": task.get("user_id", "default"),
             "competitors": task["competitors"],
             "dimensions": task["dimensions"],
             "pipeline_mode": "pipeline",
