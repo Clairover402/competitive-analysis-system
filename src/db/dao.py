@@ -37,6 +37,7 @@ Quality 通过 AgentLogDAO 记录审计日志。
 
 from __future__ import annotations
 
+import json
 import logging
 from uuid import UUID
 
@@ -82,12 +83,15 @@ class TaskDAO:
         asyncpg 传 Python list 时默认映射为 PostgreSQL 的 TEXT[]，
         但我们的列是 JSONB 类型。不加 ::jsonb，PG 会报类型不匹配。
         """
+        # asyncpg 不支持 Python list 直传 $n::jsonb → 需 json.dumps 序列化
+        competitors_json = json.dumps(competitors, ensure_ascii=False)
+        dimensions_json = json.dumps(dimensions, ensure_ascii=False)
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO tasks (id, title, competitors, dimensions, pipeline_mode)
                    VALUES ($1, $2, $3::jsonb, $4::jsonb, $5)
                    RETURNING id""",
-                task_id, title, competitors, dimensions, pipeline_mode,
+                task_id, title, competitors_json, dimensions_json, pipeline_mode,
             )
             return str(row["id"])
 
@@ -96,12 +100,22 @@ class TaskDAO:
 
         返回 None 而非抛异常——让调用方自己决定"不存在"怎么处理。
         常见用法：task = await dao.get(tid); if task is None: raise HTTPException(404)
+
+        JSONB 字段（competitors/dimensions）自动反序列化为 Python list。
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM tasks WHERE id = $1", task_id
             )
-            return dict(row) if row else None
+            if row is None:
+                return None
+            result = dict(row)
+            # JSONB 字段反序列化（asyncpg 可能返回 str 或已解析的 list）
+            for field in ("competitors", "dimensions"):
+                val = result.get(field)
+                if isinstance(val, str):
+                    result[field] = json.loads(val)
+            return result
 
     async def update_status(self, task_id: str, status: str) -> None:
         """更新任务状态。

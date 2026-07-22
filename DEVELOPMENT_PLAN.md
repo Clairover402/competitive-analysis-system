@@ -1,8 +1,8 @@
-# AI驱动的竞品分析多Agent协作系统 — 阶段开发计划
+﻿# AI驱动的竞品分析多Agent协作系统 — 阶段开发计划
 
-> **状态**: Phase 0/1/2/3/4/4.5 ✅ 完成 → Phase 5A 待开发  
+> **状态**: Phase 0/1/2/3/4/4.5/5A ✅ 完成 → Phase 5B 待开发  
 > **日期**: 2026-06-14  
-> **最后更新**: 2026-06-22（Phase 4.5 验收通过）  
+> **最后更新**: 2026-06-23（Phase 5A 验收通过 + 缺陷修复）  
 > **开发方式**: Codex (ACP Harness) 逐阶段执行  
 > **项目路径**: `D:\AAAagent\projects\competitive-analysis-system\`
 
@@ -163,7 +163,7 @@ D:\AAAagent\projects\competitive-analysis-system\
 | Phase 3 | Agent 实现 | 1 | 1~2 会话 | Phase 1, Phase 2 |
 | Phase 4 | Pipeline 编排 | 1 | 1~2 会话 | Phase 3 |
 | Phase 4.5 | 记忆系统（Checkpoint+摘要+长期记忆+冲突/遗忘） | 1 | 1~2 会话 | Phase 4 |
-| Phase 5A | Supervisor + A2A 通信协议 | 1 | 1~2 会话 | Phase 3 |
+| Phase 5A | Supervisor + A2A 通信协议 | 1 | 1~2 会话 | Phase 3, Phase 4.5 |
 | Phase 5B | IntentRouter + Harness Engineering | 1 | 1 会话 | Phase 4, Phase 5A |
 | Phase 6 | 服务化 + 可观测性 | 1 | 1~2 会话 | Phase 4, Phase 5B |
 | Phase 7 | 评估体系 + 集成测试 | 1 | 1~2 会话 | Phase 6 |
@@ -1073,7 +1073,7 @@ async def run_pipeline_task(task: dict) -> dict:
 ### 交付物
 1. `src/memory/__init__.py`
 2. `src/memory/summarizer.py` — 摘要记忆（递增摘要 + 每 10 轮全量合并校准累积偏差）
-3. `src/memory/long_term.py` — 长期记忆检索引擎（五步流水线：Query 重写→混合检索→RRF 融合→元数据过滤→Reranker 精排；三因索排序：语义相似度 × 重要性 × 时间衰减）
+3. `src/memory/long_term.py` — 长期记忆检索引擎（五步流水线：Query 重写→混合检索→RRF 融合→元数据过滤→Reranker 精排；三因子加法排序：0.6×(1-cos)+0.3×importance+0.1×POWER(0.5,age/half_life)）
 4. `src/memory/retrieval.py` — 检索策略（混合触发：关键词预判覆盖 80% + LLM 兜底覆盖 20%；两阶段范式：粗排 k=60 → 精排 top_k=10）
 5. `src/memory/conflict.py` — 冲突解决（三级策略：事实更新→覆盖，偏好变化→保留历史+改标签，矛盾信息→双留+标记；软删除优于硬删除）
 6. `src/memory/forgetting.py` — 遗忘策略（自然衰减在 SQL ORDER BY 层、180 天归档、显式软删除；决策类不归档）
@@ -1309,7 +1309,7 @@ class MemoryForgetting:
 # node_analyze: retrieve long-term memory before analysis
 async def node_analyze(state: AgentState) -> dict:
     memories = await retrieval_strategy.retrieve_if_needed(
-        user_id=state.get('user_id', 'default'),
+        user_id=state['user_id'],  # AgentState 已含 user_id 字段（initial_state 传入）
         message=f"分析 {state['competitors']} 维度 {state['current_dimension']}",
         engine=long_term_engine
     )
@@ -1326,7 +1326,7 @@ async def after_write(state: AgentState) -> None:
 # node_finalize: persist key decisions to long-term memory
 async def node_finalize(state: AgentState) -> dict:
     await long_term_engine.add_memory(
-        user_id=state.get('user_id', 'default'),
+        user_id=state['user_id'],  # AgentState 已含 user_id 字段（initial_state 传入）
         content=f"竞品分析完成: {state['title']}, "
                 f"质检分 {state['quality_score']}, "
                 f"竞品 {state['competitors']}",
@@ -1368,8 +1368,8 @@ async def node_finalize(state: AgentState) -> dict:
 
 **实施时补充的设计决策**：
 - round_num 在 Pipeline 中无自然来源（最多 3 个 report_version，达不到全量合并阈值 10）→ Summarizer 跳过 Pipeline，留给 Supervisor
-- user_id 在 Pipeline 集成中暂用 `state.get("user_id", "default")` 兜底——待 AgentState 补 user_id 字段后消除兜底值
-- Finalize 节点的记忆提取用内联 prompt（非 `_KEY_DECISIONS_PROMPT` 常量），格式 `type|content`
+- user_id 从 task dict 传入 AgentState（`state["user_id"]`），无兜底值，已消除 `state.get("user_id", "default")`
+- Finalize 节点的记忆提取用内联 prompt（非 `_KEY_DECISIONS_PROMPT` 常量），格式 `type|content`（低严重度债务：建议 Phase 5A 统一为命名常量）
 - 三个钩子中 Pipeline 只集成了两个（analyze + finalize），write 后摘要钩子不集成
 
 ### 注意事项
@@ -1383,221 +1383,62 @@ async def node_finalize(state: AgentState) -> dict:
 
 ---
 
-## Phase 5A：Supervisor + A2A 通信协议
+## Phase 5A：Supervisor + A2A 通信协议（✅ 验收通过 2026-06-23）
 
-### 目标
-实现 Agent Card 定义、A2A 通信协议、Supervisor ReAct 循环。
+### 实现概要
 
-### 前置条件
-- Phase 3 已完成（Agent 函数可用）
-- Phase 4 不是硬依赖（Supervisor 独立使用 Agent 函数）
-- Phase 4.5 不是硬依赖（记忆系统可后续接入）
+实际实现超越计划中的 `while` 循环 + 类方法设计，升级为 **LangGraph StateGraph** 编排——与 Pipeline 的 `graph.py` 技术栈统一，并通过 `PostgresSaver` 获得 Checkpoint 断点续传能力。同时完整集成了 Phase 4.5 记忆系统。
+
+### 图结构
+
+```
+think → act → observe → route(条件边)
+  ^                        |
+  |---- "continue" --------|
+              |
+          "end" → END
+```
 
 ### 交付物
-1. `src/supervisor/a2a.py` — A2A 协议实现
-2. `src/supervisor/state.py` — SupervisorState
-3. `src/supervisor/supervisor.py` — Supervisor ReAct 循环
 
-### 提示词 (Phase 5A)
+| 文件 | 状态 | 说明 |
+|------|:--:|------|
+| `src/supervisor/a2a.py` | ✅ | AgentCard + A2ATask + A2ARouter + create_agent_cards |
+| `src/supervisor/state.py` | ✅ | SupervisorState 21 字段 + Annotated[list, operator.add] reducer |
+| `src/supervisor/supervisor.py` | ✅ | 闭包工厂（_make_node_think/act/observe）+ route_after_observe + build_supervisor_graph + run_supervisor_task |
+| `src/supervisor/__init__.py` | ✅ | 导出 build_supervisor_graph / run_supervisor_task |
 
-`	ext
-## 任务：竞品分析系统 — Supervisor + A2A 通信协议
+### 验收标准逐条
 
-### 背景
-四个 Agent 函数已实现。需要在 Pipeline 之外构建 Supervisor+ReAct 探索模式。
+1. ✅ `A2ARouter.register(card, handler, llm)` 注册 Agent Card + 执行函数 + 专用 LLM（比原计划多了 handler/llm 注入）
+2. ✅ `A2ARouter.send_task()` 完整生命周期：查卡片 → 查 handler → RUNNING → 调用 → COMPLETED/FAILED
+3. ✅ `_make_node_think` 闭包：构建进度描述 + 推理轨迹最近 3 条 + 长期记忆检索 → LLM 决策 → JSON 解析（最多 2 次重试，失败安全退出）
+4. ✅ `route_after_observe()` 双重终止条件：is_complete=True 或 current_round > max_rounds=10
+5. ✅ `reasoning_trace: Annotated[list, operator.add]` — think 追加决策 + observe 追加观察结果，全链路可追溯
 
-### A2A 协议说明
-A2A (Agent-to-Agent) 是 Google 提出的 Agent 通信协议。核心概念：
-- **Agent Card**：声明 Agent 的能力、输入输出 schema、URL
-- **Task**：send → pending → running → completed/failed 生命周期
-- 协议是 P2P 设计，但我们采用集中式（全走 Supervisor 中转）
+### 架构升级（计划外但正确）
 
-### 你的任务
+| 升级项 | 说明 |
+|--------|------|
+| while 循环 → StateGraph | 与 Pipeline 统一编排框架，自动 Checkpoint |
+| 类方法 → 闭包工厂 | `_make_node_think/act/observe` 闭包注入依赖（DI），无全局变量 |
+| pending_* 中间字段 | think→act 走 pending_decision，act→observe 走 pending_task_* |
+| PostgresSaver 持久化 | `build_supervisor_graph` 中 setup + compile，中断后同 thread_id 恢复 |
 
-#### 1. src/supervisor/a2a.py — A2A 协议
+### 记忆系统集成
 
-```python
-from dataclasses import dataclass, field
-from enum import Enum
-from uuid import uuid4
+| 集成点 | 代码位置 | 方法 |
+|--------|----------|------|
+| think 长期记忆检索 | `_make_node_think` | `retrieval_strategy.retrieve_if_needed()` |
+| observe 长期记忆提取 | `_make_node_observe` | `_extract_memory()` → `engine.add_memory()` |
+| observe 摘要递增合并 | `_make_node_observe` | `summarizer.summarize_round(task_id, msgs, round_num)` |
+| 每 10 轮全量合并 | `_make_node_observe` | `current_round % 10 == 0` → `summarizer.full_merge_summary()` |
 
-class TaskStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
+### 验收中修复的缺陷
 
-@dataclass
-class AgentCard:
-    """A2A Agent Card：声明 Agent 的能力"""
-    name: str
-    description: str
-    capabilities: list[str]  # ["collect", "web_search", "web_fetch"]
-    input_schema: dict       # JSON Schema
-    output_schema: dict      # JSON Schema
-    endpoint: str            # 逻辑端点（用于 A2A 路由）
-
-@dataclass  
-class A2ATask:
-    """A2A Task：一次 Agent 调用的生命周期"""
-    id: str = field(default_factory=lambda: str(uuid4()))
-    agent_name: str
-    action: str              # 调用的具体 action
-    arguments: dict = field(default_factory=dict)
-    status: TaskStatus = TaskStatus.PENDING
-    result: dict | None = None
-    error: str | None = None
-    created_at: float = 0.0
-    completed_at: float | None = None
-
-class A2ARouter:
-    """A2A 路由器：管理 Agent Card 注册和 Task 分发"""
-    
-    def __init__(self):
-        self._cards: dict[str, AgentCard] = {}
-    
-    def register(self, card: AgentCard):
-        """注册 Agent Card"""
-        self._cards[card.name] = card
-    
-    def get_card(self, agent_name: str) -> AgentCard | None:
-        """获取 Agent Card"""
-        return self._cards.get(agent_name)
-    
-    def list_agents(self) -> list[AgentCard]:
-        """列出所有可用 Agent"""
-        return list(self._cards.values())
-    
-    async def send_task(self, task: A2ATask) -> A2ATask:
-        """发送 Task 到目标 Agent 并等待结果
-        返回更新后的 Task（带 result）
-        """
-        # 1. 查找 AgentCard
-        # 2. 校验 arguments 符合 input_schema
-        # 3. 更新 task.status = RUNNING
-        # 4. 调用 Agent 函数
-        # 5. 更新 task.status = COMPLETED/FAILED, task.result
-        # 6. 返回 task
-```
-
-注册四个 Agent Card：
-- Collector: capabilities=["collect", "web_search", "web_fetch"]
-- Analyzer: capabilities=["analyze", "embed", "rerank"]
-- Writer: capabilities=["write", "compose_report"]
-- Quality: capabilities=["evaluate", "score_report"]
-
-#### 2. src/supervisor/state.py — SupervisorState
-
-```python
-class SupervisorState(TypedDict):
-    task_id: str
-    title: str
-    user_query: str  # 用户原始问题（开放性探索）
-    
-    # 探索结果
-    found_competitors: list[str]  # 探索发现的竞品
-    collected_data: dict
-    analysis_results: dict
-    report_content: str
-    
-    # 控制
-    current_round: int
-    max_rounds: int  # 10
-    last_action: str
-    reasoning_trace: list[dict]  # [{round, thought, action, args, observation}]
-    
-    # 终结状态
-    final_output: str
-    is_complete: bool
-```
-
-#### 3. src/supervisor/supervisor.py — Supervisor ReAct 循环
-
-```python
-class Supervisor:
-    """Supervisor Agent：LLM 动态决策的 ReAct 循环"""
-    
-    def __init__(self, llm: ChatDeepSeek, a2a_router: A2ARouter):
-        self.llm = llm
-        self.router = a2a_router
-    
-    async def _think(self, state: SupervisorState) -> dict:
-        """LLM 决策下一步行动
-        输出：{action, agent, arguments, reason}
-        """
-        # 1. 构建 Prompt（包含当前状态、历史 reasoning_trace）
-        # 2. LLM 输出下一步决策
-        # 3. 解析 JSON
-    
-    async def _act(self, action: dict) -> A2ATask:
-        """执行决策：通过 A2A 发 Task"""
-        task = A2ATask(
-            agent_name=action["agent"],
-            action=action["action"],
-            arguments=action["arguments"]
-        )
-        return await self.router.send_task(task)
-    
-    async def _observe(self, state: SupervisorState, task: A2ATask):
-        """观察结果，写入状态"""
-        # 根据 task.agent_name 将结果写入对应状态字段
-    
-    async def run(self, state: SupervisorState) -> str:
-        """ReAct 主循环
-        while state.current_round < state.max_rounds:
-            action = await self._think(state)
-            if action["action"] == "finish":
-                break
-            task = await self._act(action)
-            await self._observe(state, task)
-            state.current_round += 1
-        return state.final_output
-```
-
-**Supervisor System Prompt 核心要点**：
-```
-你是竞品分析协调者（Supervisor）。根据用户的问题和当前状态，决策下一步行动。
-
-可用 Agent：
-1. collector — 搜索并采集竞品信息
-2. analyzer — 分析竞品数据的特定维度
-3. writer — 撰写分析报告
-4. quality — 评估报告质量
-
-输出格式（JSON）：
-{
-  "thought": "当前情况分析...",
-  "action": "collect|analyze|write|quality|finish",
-  "agent": "collector|analyzer|writer|quality",
-  "arguments": {},
-  "reason": "为什么选择这一步"
-}
-
-规则：
-- collect 必须先于 analyze（没数据不能分析）
-- analyze 必须先于 write（没分析不能写报告）
-- 如果所有必要步骤已完成，action=finish
-- 每步都要有明确理由
-```
-
-```
-
-
-`
-
-### 验收标准
-1. A2ARouter.register() 可以注册 Agent Card
-2. A2ARouter.send_task() 正确路由到对应 Agent 函数
-3. Supervisor._think() 返回符合格式的 JSON 决策
-4. Supervisor.run() 的 ReAct 循环有 MAX_ROUNDS=10 硬上限
-5. 每个循环轮的 reasoning_trace 都有完整记录
-
-### 注意事项
-- A2A 的 send_task 要持有 Agent 函数引用（通过依赖注入）
-- Supervisor._think() 的 temperature=0.3（决策需要一定灵活性但不要太多创意）
-- reasoning_trace 是面试展示的重点——记录要详细
-- 如果 LLM 返回的 JSON 解析失败，记录错误并 finish
-```
+- 🐛 `summarizer._get_recent_messages` 传空字符串给 `get_by_round_range` → 全量合并路径死代码
+  - **修复**: DAO 新增 `get_recent_by_task(task_id, limit)` 按 created_at 倒序取最近 N 条
+  - 影响文件: `src/db/dao.py`（+1 方法）、`src/memory/summarizer.py`（调用替换）
 
 ---
 
@@ -2144,8 +1985,9 @@ Phase 0 ──→ Phase 1 ──→ Phase 3 ──→ Phase 4 ──→ Phase 4.
     └──→ Phase 2 ─────────┘              │
           ✅                              │
                         Phase 5A ──→ Phase 5B ──┘
+                          ✅
 
-✅ = 已完成    ⏳ = 进行中    ⬚ = 待开发
+✅ = 已完成    ⬚ = 待开发
 ```
 
 - Phase 0（脚手架）是所有阶段的前置
@@ -2167,7 +2009,7 @@ Phase 0 ──→ Phase 1 ──→ Phase 3 ──→ Phase 4 ──→ Phase 4.
 | 3 | Agent 实现 | ✅ | 2026-06-21 | phase_report/phase3-audit_2026-06-21.md |
 | 4 | Pipeline 编排 | ✅ | 2026-06-22 | phase_report/phase4-audit_2026-06-22.md |
 | 4.5 | 记忆系统 | ✅ | 2026-06-22 | 本文档（内联验收） |
-| 5A | Supervisor + A2A | ⬚ | — | — |
+| 5A | Supervisor + A2A | ✅ | 2026-06-23 | 本文档（内联验收） |
 | 5B | IntentRouter + Harness | ⬚ | — | — |
 | 6 | 服务化 + 可观测性 | ⬚ | — | — |
 | 7 | 评估体系 + 集成测试 | ⬚ | — | — |
