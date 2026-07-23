@@ -55,7 +55,7 @@ LangGraph 1.0 竞品分析系统。四个Agent（Collector/Analyzer/Writer/Quali
        5A → 5B ↗
 ```
 
-Phase 1∥2 · 4∥5A · 红线：不跳依赖、不跨阶段并行互依赖组件。
+Phase 3∥2 · 4∥5A · 红线：不跳依赖、不跨阶段并行互依赖组件。
 
 每个Phase开始前：读当前Phase提示词 → 确认前置交付物+验收通过 → 读 dao.py/mcp/server.py 确认签名。
 

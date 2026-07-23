@@ -1,4 +1,4 @@
-"""Harness Engineering — 五层安全检查壳（Phase 5B）。
+"""Harness Engineering — 五层安全检查壳（Phase 8）。
 
 ═══════════════════════════════════════════════════════════════════════════════
                     【L5 架构全景图】
@@ -44,7 +44,7 @@
     guard = HarnessGuard(pool)
     router = A2ARouter(mcp_server, harness=guard)
 
-  AuditLogger 也可独立使用（Phase 6 服务化时写其他审计事件）:
+  AuditLogger 也可独立使用（Phase 9 服务化时写其他审计事件）:
     audit = AuditLogger(pool)
     await audit.log({"task_id": "...", "agent_name": "...", ...})
     trail = await audit.get_task_trail(task_id)

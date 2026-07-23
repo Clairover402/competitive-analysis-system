@@ -24,7 +24,7 @@ web_search / web_fetch 是 Collector Agent 的两只"手"。
 → "会。DuckDuckGo 改版时正则匹配失效，需要维护。
   生产级方案是 Playwright MCP（浏览器自动化），
   但依赖重、速度慢。本项目用正则是最小可行方案，
-  在 DEVELOP_PLAN.md 的 Phase 5B 预留了 Playwright 升级路径。"
+  在 DEVELOP_PLAN.md 的 Phase 8 预留了 Playwright 升级路径。"
 
 【L5 项目对标】
 这两个工具通过 MCPServer 注册后，Collector Agent 通过

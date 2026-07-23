@@ -1,8 +1,8 @@
-# Phase 6 Codex 提示词 — FastAPI 服务化 + 可观测性
+# Phase 9 Codex 提示词 — FastAPI 服务化 + 可观测性
 
 **生成时间**: 2026-07-21
 **作者**: AI 工程师
-**根提示词来源**: DEVELOPMENT_PLAN.md Phase 6
+**根提示词来源**: DEVELOPMENT_PLAN.md Phase 9
 **基于实时代码审计**: router.py / graph.py / a2a.py / harness/ / schema.sql / dao.py / config.py / supervisor/
 
 ---
@@ -10,7 +10,7 @@
 ## 提示词（直接复制给 Codex）
 
 ````text
-## 任务：竞品分析系统 Phase 6 — FastAPI 服务化 + SSE 进度推送 + 三层限流 + 可观测性
+## 任务：竞品分析系统 Phase 9 — FastAPI 服务化 + SSE 进度推送 + 三层限流 + 可观测性
 
 ### 背景
 
@@ -25,7 +25,7 @@
 - **数据库** (`src/db/schema.sql`): 9 张表（tasks/reports/evidence_map/chunk_embeddings/agent_logs/memory_summaries/agent_memories/checkpoints/checkpoint_writes）
 - **DAO** (`src/db/dao.py`): TaskDAO / AgentLogDAO / AgentMemoryDAO 等完整数据访问层
 
-当前系统入口是 Python 脚本直接调用 `IntentRouter.route()`，**缺少 HTTP 服务封装**。Phase 6 目标是让系统对外暴露 REST API。
+当前系统入口是 Python 脚本直接调用 `IntentRouter.route()`，**缺少 HTTP 服务封装**。Phase 9 目标是让系统对外暴露 REST API。
 
 ### 你的任务：创建 5 个文件
 
@@ -435,7 +435,7 @@ ca_harness_blocks = Counter(
 
 ### 注意事项
 
-1. **不修改已有模块**：router.py / graph.py / a2a.py / harness/ / dao.py 保持不动。Phase 6 只是新增 HTTP 层包装。
+1. **不修改已有模块**：router.py / graph.py / a2a.py / harness/ / dao.py 保持不动。Phase 9 只是新增 HTTP 层包装。
 2. **数据库连接池**：通过 `app.state.pool` 管理，在 lifespan 中创建。routes.py 通过 `request.app.state.pool` 获取。
 3. **IntentRouter 实例**：在 lifespan 中创建一次（`Settings()` → `IntentRouter(settings)`），挂载到 `app.state.router`。
 4. **SSE 超时**：轮询最多 300 秒，超时发送 error 事件并断开。
@@ -461,7 +461,7 @@ ca_harness_blocks = Counter(
 
 ### 为什么这个提示词比 DEVELOPMENT_PLAN 中的版本更长？
 
-1. **DEVELOPMENT_PLAN 写于项目早期**（6/14），当时还没写任何代码。现在 Phase 0-5B 代码已存在，提示词必须反映真实代码结构。
+1. **DEVELOPMENT_PLAN 写于项目早期**（6/14），当时还没写任何代码。现在 Phase 1–8 代码已存在，提示词必须反映真实代码结构。
 2. **明确"不修改已有模块"**——这是 Codex 最容易踩的坑。它可能试图重构 router.py 或 graph.py，必须明确制止。
 3. **SSE 从 agent_logs 表轮询**——这是利用已有审计基础设施，不需要额外开发进度上报机制。
 4. **Layer 1 限流和 Harness 限流共存**——harness/guard.py 已有 TokenBucket（Agent 级），api/rate_limit.py 做 HTTP 入口级。两个不冲突，但要说明清楚。
@@ -472,4 +472,4 @@ ca_harness_blocks = Counter(
 
 ### 是否现在发送给 Codex？
 
-已保存到 `D:\AAAagent\projects\competitive-analysis-system\phase_report\phase6-codex-prompt_2026-07-21.md`。你可以直接复制提示词发给 Codex。
+已保存到 `D:\AAAagent\projects\competitive-analysis-system\phase_report\phase9-codex-prompt_2026-07-21.md`。你可以直接复制提示词发给 Codex。

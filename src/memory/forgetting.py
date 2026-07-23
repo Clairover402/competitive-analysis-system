@@ -38,7 +38,7 @@
 
 策略 2: 定期归档 — 180 天未访问记忆标记为不活跃
   ─────────────────────────────────────────
-  触发: cron 调度（Phase 6 实现），每天凌晨 3 点执行
+  触发: cron 调度（Phase 9 实现），每天凌晨 3 点执行
   执行: `UPDATE agent_memories SET is_active = false WHERE created_at < NOW() - 180 days`
   保护: `WHERE memory_type != 'decision'` — 关键决策永不过期
 
@@ -68,13 +68,13 @@
                【L5 架构 — 为什么不内置 cron 调度】
 ═══════════════════════════════════════════════════════════════════════════════
 
-Phase 4.5 只写逻辑，不写调度。原因:
+Phase 6 只写逻辑，不写调度。原因:
   1. 调度器选型不是记忆模块的事: APScheduler vs Celery vs cron 取决于整体架构
   2. 调度频率不硬编码: 归档 180 天、衰减 SQL 实时生效、删除人工触发——
      这三个时间维度完全不同，统一调度器反而复杂
-  3. 职责分离: MemoryForgetting 负责"怎么忘"→ Phase 6 服务层负责"什么时候忘"
+  3. 职责分离: MemoryForgetting 负责"怎么忘"→ Phase 9 服务层负责"什么时候忘"
 
-Phase 6 的集成方案（计划）:
+Phase 9 的集成方案（计划）:
   — APScheduler 每天凌晨 3 点调 archive_old_memories()
   — 自然衰减不需要调度（SQL ORDER BY 自动生效）
   — explicit_forget 走 HTTP DELETE /api/memories/{id} 手动触发
@@ -174,7 +174,7 @@ class MemoryForgetting:
             本次归档的记忆条数
 
         为什么用 affected_rows 作为返回值？
-          — 调用方（Phase 6 的 cron handler）需要知道"清理了 324 条记忆"
+          — 调用方（Phase 9 的 cron handler）需要知道"清理了 324 条记忆"
           — 如果某天只有 2 条 → 日志正常（2 条被归档）
           — 如果某天 0 条 → 日志正常（没有需要归档的记忆）
           — 如果某天 5000 条 → 日志告警（可能有历史数据一次性大量过期）
@@ -206,12 +206,12 @@ class MemoryForgetting:
         logger.info("软删除记忆: %s", memory_id)
 
     async def run_maintenance(self, days: int = 180) -> dict:
-        """定期维护入口（Phase 6 的 cron 可触发此方法）。
+        """定期维护入口（Phase 9 的 cron 可触发此方法）。
 
-        【L5 架构】这是 Phase 4.5 和 Phase 6 的接口约定
+        【L5 架构】这是 Phase 6 和 Phase 9 的接口约定
         ─────────────────────────────────────────────
-        Phase 4.5: 定义 run_maintenance() 和 archive_old_memories()
-        Phase 6: 注册 APScheduler 任务 →
+        Phase 6: 定义 run_maintenance() 和 archive_old_memories()
+        Phase 9: 注册 APScheduler 任务 →
           @scheduler.scheduled_job('cron', hour=3)
           async def nightly_forgetting():
               result = await forgetting.run_maintenance(days=180)

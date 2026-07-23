@@ -1,4 +1,4 @@
-# Phase 3 验收报告 — Agent 实现层
+# Phase 4 验收报告 — Agent 实现层
 
 **时间**: 2026-06-21
 **验收人**: AI工程师
@@ -90,9 +90,9 @@ passed = overall_score >= 70
 
 ---
 
-## 下一步: Phase 4 — 记忆系统
+## 下一步: Phase 5 — 记忆系统
 
-按开发计划，Phase 4 交付:
+按开发计划，Phase 5 交付:
 - `src/memory/__init__.py`
 - `src/memory/short_term.py`
 - `src/memory/long_term.py`

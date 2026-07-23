@@ -1,14 +1,14 @@
-# Phase 3 实现总结 — Agent 实现层
+# Phase 4 实现总结 — Agent 实现层
 
 **时间**: 2026-06-21
 **作者**: AI工程师
-**范围**: Phase 3（src/agents/）5 模块 + 4 Prompt 文件
+**范围**: Phase 4（src/agents/）5 模块 + 4 Prompt 文件
 
 ---
 
-## 一、Phase 3 是什么？
+## 一、Phase 4 是什么？
 
-Phase 3 实现了竞品分析系统的四个专精 Agent，每个 Agent 负责分析流程的一个环节：
+Phase 4 实现了竞品分析系统的四个专精 Agent，每个 Agent 负责分析流程的一个环节：
 
 ```
 用户输入 ──→ Collector ──→ Analyzer ──→ Writer ──→ Quality ──→ 最终报告
@@ -396,9 +396,9 @@ Phase 3 实现了竞品分析系统的四个专精 Agent，每个 Agent 负责�
 
 ---
 
-## 六、下一步：Phase 4 — 记忆系统
+## 六、下一步：Phase 5 — 记忆系统
 
-按 `DEVELOPMENT_PLAN.md`，Phase 4 交付:
+按 `DEVELOPMENT_PLAN.md`，Phase 5 交付:
 - `src/memory/__init__.py` — 模块导出
 - `src/memory/short_term.py` — 滑动窗口短期记忆
 - `src/memory/summarizer.py` — LLM 摘要压缩

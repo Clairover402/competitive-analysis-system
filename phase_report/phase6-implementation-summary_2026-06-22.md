@@ -1,17 +1,17 @@
-# Phase 4.5 实现总结 — 记忆系统
+# Phase 6 实现总结 — 记忆系统
 
 **时间**: 2026-06-22
 **作者**: AI 工程师
-**范围**: Phase 4.5（src/memory/）6 文件 + Pipeline 集成钩子
+**范围**: Phase 6（src/memory/）6 文件 + Pipeline 集成钩子
 
 ---
 
-## 一、Phase 4.5 是什么？
+## 一、Phase 6 是什么？
 
-在 Phase 4 的 Pipeline 编排骨架上挂载记忆系统，实现竞品分析系统的"长期知识积累"。每次分析任务产出的关键决策/偏好/事实会被提取并存储，后续分析任务自动检索并注入为分析上下文。
+在 Phase 5 的 Pipeline 编排骨架上挂载记忆系统，实现竞品分析系统的"长期知识积累"。每次分析任务产出的关键决策/偏好/事实会被提取并存储，后续分析任务自动检索并注入为分析上下文。
 
 ```
-                Phase 4 Pipeline                         Phase 4.5 记忆注入点
+                Phase 5 Pipeline                         Phase 6 记忆注入点
                 ════════════════════                     ════════════════════════
 
 Collector → Analyzer → Writer → Quality ──→ Finalize
@@ -19,7 +19,7 @@ Collector → Analyzer → Writer → Quality ──→ Finalize
          检索长期记忆     (跳过摘要)
               │                                    │
               │  LongTermMemoryEngine.retrieve()   │  MemorySummarizer
-              │  → 五步检索 → 注入 prompt          │  (留给 Phase 5A)
+              │  → 五步检索 → 注入 prompt          │  (留给 Phase 7)
               │                                    │
                                               ★ 提取关键决策
                                                  → add_memory()
@@ -32,7 +32,7 @@ Collector → Analyzer → Writer → Quality ──→ Finalize
 |------|------|------|
 | `__init__.py` | 包入口 | 导出 5 个公开类 |
 | `long_term.py` | LongTermMemoryEngine | 五步混合检索引擎（LLM 重写 → 双路检索 → RRF 融合 → 过滤 → 精排） |
-| `summarizer.py` | MemorySummarizer | 递增合并 / 全量合并摘要记忆（留给 Phase 5A Supervisor） |
+| `summarizer.py` | MemorySummarizer | 递增合并 / 全量合并摘要记忆（留给 Phase 7 Supervisor） |
 | `retrieval.py` | MemoryRetrievalStrategy | 检索触发策略（关键词预检 + 重要性判断） |
 | `conflict.py` | MemoryConflictResolver | 三级冲突策略（OVERWRITE / UPDATE / KEEP_BOTH） |
 | `forgetting.py` | MemoryForgetting | 三层遗忘（自然衰减 / 180 天归档 / 显式软删除） |
@@ -100,7 +100,7 @@ round_num 判断
       前次摘要 + 最后 5 条消息 → LLM 重新提取关键事实(≤500字)
 ```
 
-**为什么不集成 Pipeline**: Pipeline 最多 3 个 `report_version`（Writer 重写次数），没有对话轮次概念。递增/全量合并的阈值（10 轮）永远不会触发。留给 Phase 5A Supervisor 的 ReAct 循环——天然有 `think→act→observe` 对话轮次。
+**为什么不集成 Pipeline**: Pipeline 最多 3 个 `report_version`（Writer 重写次数），没有对话轮次概念。递增/全量合并的阈值（10 轮）永远不会触发。留给 Phase 7 Supervisor 的 ReAct 循环——天然有 `think→act→observe` 对话轮次。
 
 ---
 
@@ -128,7 +128,7 @@ round_num 判断
 
 **设计约束**: 不删除 `decision` 类型记忆（关键决策永久保留）。归档只设 `is_active=false`，数据不物理删除——可恢复。
 
-**不内置 cron**: Phase 4.5 只写逻辑，调度由 Phase 6 服务化时用 `APScheduler` 统一管理。
+**不内置 cron**: Phase 6 只写逻辑，调度由 Phase 9 服务化时用 `APScheduler` 统一管理。
 
 ---
 
@@ -176,7 +176,7 @@ for line in extracted.strip().split("\n"):
 
 ### 为什么不集成的钩子: write 后摘要
 
-Summarizer 不在 Pipeline 触发——Pipeline 无对话轮次，达不到合并阈值。留给 Phase 5A Supervisor。
+Summarizer 不在 Pipeline 触发——Pipeline 无对话轮次，达不到合并阈值。留给 Phase 7 Supervisor。
 
 ---
 
@@ -216,7 +216,7 @@ Summarizer 不在 Pipeline 触发——Pipeline 无对话轮次，达不到合�
 
 三层遗忘对应三种生命周期管理需求：
 - 自然衰减——自动的、无需代码触发的（SQL 表达式天然衰减）
-- 归档——定期的、大批量的（Phase 6 的 cron 调度）
+- 归档——定期的、大批量的（Phase 9 的 cron 调度）
 - 删除——手动的、精确的（用户操作）
 
 这三层之间互不干扰，各自独立演化。
@@ -290,7 +290,7 @@ RRF 解决三个问题：
 |------|------|---------|
 | `src/memory/__init__.py` | ~25 | 包导出 5 个公开类 |
 | `src/memory/long_term.py` | ~180 | 五步检索 + RRF 融合 + 三因子排序 + add_memory |
-| `src/memory/summarizer.py` | ~140 | 递增/全量合并摘要（留给 Phase 5A） |
+| `src/memory/summarizer.py` | ~140 | 递增/全量合并摘要（留给 Phase 7） |
 | `src/memory/retrieval.py` | ~100 | 检索触发 + 关键词预检 |
 | `src/memory/conflict.py` | ~120 | 三级冲突策略 |
 | `src/memory/forgetting.py` | ~80 | 三层遗忘 |
@@ -299,7 +299,7 @@ RRF 解决三个问题：
 
 ## 十、下一步
 
-Phase 5A 将实现 Supervisor + A2A 通信协议，届时：
+Phase 7 将实现 Supervisor + A2A 通信协议，届时：
 
 - **Summarizer 激活** — Supervisor 的 ReAct 循环提供对话轮次，摘要在每 5 轮后触发递增合并
 - **检索触发增加轮次条件** — 不只是关键词判断，还考虑"距上次检索的轮次间隔"

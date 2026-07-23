@@ -1,7 +1,7 @@
-# Phase 5B Codex 修复提示词
+# Phase 8 Codex 修复提示词
 
 **生成时间**: 2026-06-24 15:15
-**基于**: Phase 5B 验收报告，3 个缺陷
+**基于**: Phase 8 验收报告，3 个缺陷
 
 ---
 
@@ -26,15 +26,15 @@ router = A2ARouter(mcp_server)  # ← harness 参数 None
 
 #### 步骤 2：`a2a.py` — 修正 `send_task()` 的 Step 编号
 
-当前注释写的是 `# Step ?.5: Harness ????Phase 5B?`（乱码），改为正确的步骤编号。参照前面的 Step ①~⑥ 顺序，Harness 检查应放在 Step ② 和 Step ③ 之间（查完注册信息后、标记 RUNNING 前），改为 Step ②.5。
+当前注释写的是 `# Step ?.5: Harness ????Phase 8?`（乱码），改为正确的步骤编号。参照前面的 Step ①~⑥ 顺序，Harness 检查应放在 Step ② 和 Step ③ 之间（查完注册信息后、标记 RUNNING 前），改为 Step ②.5。
 
 具体改动行：
 ```python
 # 改前:
-# Step ?.5: Harness ????Phase 5B?
+# Step ?.5: Harness ????Phase 8?
 
 # 改后:
-# Step ②.5: Harness 五层安全检查（Phase 5B 集成）
+# Step ②.5: Harness 五层安全检查（Phase 8 集成）
 ```
 
 #### 步骤 3：验证 Harness 在 send_task 中的 3 步逻辑正确
@@ -86,7 +86,7 @@ if not competitors or len(competitors) == 0:
 
 ### 修复方案（低优先级，本次不做）
 
-将来引入 AppContext 统一管理：`IntentRouter` 构造时接收一个 `AppContext`，`_setup_dependencies()` 改为读 ctx 的预创建实例。本次不修，Phase 6 服务化时一并处理。
+将来引入 AppContext 统一管理：`IntentRouter` 构造时接收一个 `AppContext`，`_setup_dependencies()` 改为读 ctx 的预创建实例。本次不修，Phase 9 服务化时一并处理。
 
 ---
 

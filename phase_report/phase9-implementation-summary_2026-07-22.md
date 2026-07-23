@@ -1,15 +1,15 @@
-# Phase 6 实现总结 — FastAPI 服务化 + SSE 推送 + 三层限流 + 可观测性
+# Phase 9 实现总结 — FastAPI 服务化 + SSE 推送 + 三层限流 + 可观测性
 
 **时间**: 2026-07-22
 **作者**: AI 工程师
-**范围**: Phase 6（src/api/ + src/observability/）7 源文件 + 1 集成测试
+**范围**: Phase 9（src/api/ + src/observability/）7 源文件 + 1 集成测试
 **架构**: FastAPI 应用 + ASGI lifespan + 三层限流壳 + SSE 轮询推送 + Prometheus 指标
 
 ---
 
-## 一、Phase 6 是什么？
+## 一、Phase 9 是什么？
 
-Phase 6 给竞品分析系统装上了**网络外壳**——把 Phase 0-5B 的所有引擎（Pipeline/ Supervisor/ IntentRouter/ HarnessGuard/ 记忆系统）包进 FastAPI HTTP 服务，对外暴露 REST API + SSE 实时推送，用三层限流保护后端资源，用结构化日志 + Prometheus 指标建立可观测能力。
+Phase 9 给竞品分析系统装上了**网络外壳**——把 Phase 1–8 的所有引擎（Pipeline/ Supervisor/ IntentRouter/ HarnessGuard/ 记忆系统）包进 FastAPI HTTP 服务，对外暴露 REST API + SSE 实时推送，用三层限流保护后端资源，用结构化日志 + Prometheus 指标建立可观测能力。
 
 ```
                      HTTP Request
@@ -299,7 +299,7 @@ Agent 执行可能需要几十秒甚至几分钟，HTTP 请求-响应模型不�
 
 ## 五、2 分钟面试答题模板
 
-> "Phase 6 把竞品分析系统包装成了 HTTP 服务。FastAPI 暴露 6 个端点——健康检查、Prometheus 指标、创建任务、查询任务、SSE 进度推送、报告查询。
+> "Phase 9 把竞品分析系统包装成了 HTTP 服务。FastAPI 暴露 6 个端点——健康检查、Prometheus 指标、创建任务、查询任务、SSE 进度推送、报告查询。
 >
 > 核心设计有三点。第一，POST 创建任务返回 202 Accepted + task_id，Agent 用 asyncio.create_task 后台异步执行，客户端通过 SSE 轮询 agent_logs 表获取增量进度——不用 WebSocket 因为 SSE 单向够用，轮询 DB 不用内存事件总线因为多进程安全、重启不丢消息。
 >
@@ -345,7 +345,7 @@ Agent 执行一轮 Think→Act→Observe 需要 3-10 秒（LLM 调用延迟）�
 
 ## 七、与上下 Phase 接口约定
 
-### 上游依赖（Phase 0-5B）
+### 上游依赖（Phase 1–8）
 
 | 模块 | 路径 | 用途 |
 |------|------|------|
@@ -353,23 +353,23 @@ Agent 执行一轮 Think→Act→Observe 需要 3-10 秒（LLM 调用延迟）�
 | `src.db.connection` | `src/db/connection.py` | asyncpg 连接池（create_pool/close_pool） |
 | `src.db.dao` | `src/db/dao.py` | TaskDAO（任务 CRUD）+ ReportDAO |
 | `src.supervisor.router` | `src/supervisor/router.py` | IntentRouter.route(parsed) → 分流执行 |
-| `src.harness.guard` | `src/harness/guard.py` | 五层安全检查（Phase 5B，A2ARouter 内集成） |
+| `src.harness.guard` | `src/harness/guard.py` | 五层安全检查（Phase 8，A2ARouter 内集成） |
 | `src.harness.audit` | `src/harness/audit.py` | 审计日志写入 agent_logs |
 
-### 下游输出（供 Phase 7 消费）
+### 下游输出（供 Phase 10 消费）
 
 | 输出 | 格式 | 消费者 |
 |------|------|--------|
-| HTTP API（6 端点） | REST JSON | Phase 7 E2E 测试框架 |
-| agent_logs 表 | PostgreSQL | Phase 7 评估系统（Golden Dataset 对比） |
-| Prometheus /metrics | text/plain | Phase 7 性能基准采集 |
+| HTTP API（6 端点） | REST JSON | Phase 10 E2E 测试框架 |
+| agent_logs 表 | PostgreSQL | Phase 10 评估系统（Golden Dataset 对比） |
+| Prometheus /metrics | text/plain | Phase 10 性能基准采集 |
 
 ### 接口约定
 
 - **POST /api/tasks** 无论 Pipeline 还是 Supervisor 模式，统一返回 `{task_id, status: "pending"}`
 - **SSE 事件格式**：`event: log|heartbeat|done`, `data: {JSON字符串}`
-- **限流配置由 Settings 传入**（不硬编码），Phase 7 可通过环境变量调整 TokenBucket 参数做压测
-- **可观测性**：所有 Counter/Histogram 由 `record_*` 函数记录，Phase 7 评估系统可直接导入使用
+- **限流配置由 Settings 传入**（不硬编码），Phase 10 可通过环境变量调整 TokenBucket 参数做压测
+- **可观测性**：所有 Counter/Histogram 由 `record_*` 函数记录，Phase 10 评估系统可直接导入使用
 
 ---
 
@@ -403,7 +403,7 @@ Agent 执行一轮 Think→Act→Observe 需要 3-10 秒（LLM 调用延迟）�
 |------|:--:|------|
 | uvicorn 真机启动验证 | ⚠️ 待做 | ASGI transport 测试通过，但未启动 `uvicorn src.api.routes:app --port 8080` 真机验证 |
 | SSE 端到端验证 | ⚠️ 待做 | 需要真实 Agent 执行生成 agent_logs 后测试 SSE 推送 |
-| TokenBucket 压测调优 | ⚠️ 待做 | 容量 100 + refill 10/s 为初始值，Phase 7 用 locust 压测后调整 |
+| TokenBucket 压测调优 | ⚠️ 待做 | 容量 100 + refill 10/s 为初始值，Phase 10 用 locust 压测后调整 |
 | structlog 替代 | 已决策不用 | 标准 logging + BoundLogger 实现完全替代，零外部依赖 |
 
 ### 代码统计
@@ -416,26 +416,26 @@ Agent 执行一轮 Think→Act→Observe 需要 3-10 秒（LLM 调用延迟）�
 
 ---
 
-## 附录：Phase 6 代码结构
+## 附录：Phase 9 代码结构
 
 ```
 src/
-├── api/                          # Phase 6 新增
+├── api/                          # Phase 9 新增
 │   ├── __init__.py               # 导出 app
 │   ├── routes.py                 # FastAPI 应用（6 端点 + lifespan + Pydantic 模型）
 │   ├── sse.py                    # SSE 推送（1s 轮询 agent_logs）
 │   └── rate_limit.py             # 三层限流（TokenBucket + Semaphore + LLMRateLimiter）
-├── observability/                # Phase 6 新增
+├── observability/                # Phase 9 新增
 │   ├── __init__.py               # 导出 + 自动初始化
 │   ├── logging.py                # BoundLogger（structlog 语义，标准 logging 实现）
 │   └── metrics.py                # Prometheus 7 指标 + 装饰器封装
-├── db/                           # Phase 0（修改：dao.py json 序列化修复）
-├── agents/                       # Phase 3
-├── pipeline/                     # Phase 4
-├── memory/                       # Phase 4.5
-├── supervisor/                   # Phase 5A
-├── harness/                      # Phase 5B
-└── config.py                     # Phase 0
+├── db/                           # Phase 1（修改：dao.py json 序列化修复）
+├── agents/                       # Phase 4
+├── pipeline/                     # Phase 5
+├── memory/                       # Phase 6
+├── supervisor/                   # Phase 7
+├── harness/                      # Phase 8
+└── config.py                     # Phase 1
 
-test_phase6.py                    # Phase 6 集成测试（9/9 通过）
+test_phase6.py                    # Phase 9 集成测试（9/9 通过）
 ```

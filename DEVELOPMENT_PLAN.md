@@ -1,8 +1,8 @@
 ﻿# AI驱动的竞品分析多Agent协作系统 — 阶段开发计划
 
-> **状态**: Phase 0/1/2/3/4/4.5/5A ✅ 完成 → Phase 5B 待开发  
+> **状态**: Phase 1/1/2/3/4/4.5/5A ✅ 完成 → Phase 8 待开发  
 > **日期**: 2026-06-14  
-> **最后更新**: 2026-06-23（Phase 5A 验收通过 + 缺陷修复）  
+> **最后更新**: 2026-06-23（Phase 7 验收通过 + 缺陷修复）  
 > **开发方式**: Codex (ACP Harness) 逐阶段执行  
 > **项目路径**: `D:\AAAagent\projects\competitive-analysis-system\`
 
@@ -157,23 +157,23 @@ D:\AAAagent\projects\competitive-analysis-system\
 
 | 阶段 | 名称 | Codex 任务数 | 预估工期 | 前置依赖 |
 |------|------|-------------|---------|---------|
-| Phase 0 | 项目脚手架 + 配置 | 1 | 1 会话 | 无 |
-| Phase 1 | 数据库 Schema + DAO | 1 | 1 会话 | Phase 0 |
-| Phase 2 | MCP 工具层 | 1 | 1~2 会话 | Phase 0 |
-| Phase 3 | Agent 实现 | 1 | 1~2 会话 | Phase 1, Phase 2 |
-| Phase 4 | Pipeline 编排 | 1 | 1~2 会话 | Phase 3 |
-| Phase 4.5 | 记忆系统（Checkpoint+摘要+长期记忆+冲突/遗忘） | 1 | 1~2 会话 | Phase 4 |
-| Phase 5A | Supervisor + A2A 通信协议 | 1 | 1~2 会话 | Phase 3, Phase 4.5 |
-| Phase 5B | IntentRouter + Harness Engineering | 1 | 1 会话 | Phase 4, Phase 5A |
-| Phase 6 | 服务化 + 可观测性 | 1 | 1~2 会话 | Phase 4, Phase 5B |
-| Phase 7 | 评估体系 + 集成测试 | 1 | 1~2 会话 | Phase 6 |
+| Phase 1 | 项目脚手架 + 配置 | 1 | 1 会话 | 无 |
+| Phase 2 | 数据库 Schema + DAO | 1 | 1 会话 | Phase 1 |
+| Phase 3 | MCP 工具层 | 1 | 1~2 会话 | Phase 1 |
+| Phase 4 | Agent 实现 | 1 | 1~2 会话 | Phase 2, Phase 3 |
+| Phase 5 | Pipeline 编排 | 1 | 1~2 会话 | Phase 4 |
+| Phase 6 | 记忆系统（Checkpoint+摘要+长期记忆+冲突/遗忘） | 1 | 1~2 会话 | Phase 5 |
+| Phase 7 | Supervisor + A2A 通信协议 | 1 | 1~2 会话 | Phase 4, Phase 6 |
+| Phase 8 | IntentRouter + Harness Engineering | 1 | 1 会话 | Phase 5, Phase 7 |
+| Phase 9 | 服务化 + 可观测性 | 1 | 1~2 会话 | Phase 5, Phase 8 |
+| Phase 10 | 评估体系 + 集成测试 | 1 | 1~2 会话 | Phase 9 |
 
 > **总计**: 10 个 Codex 任务，预估 10~17 个 Codex 会话  
 > **原则**: 每个阶段完成后验证再进入下一阶段，不跨阶段并行
 
 ---
 
-## Phase 0：项目脚手架 + 配置
+## Phase 1：项目脚手架 + 配置
 
 ### 目标
 创建项目目录结构、依赖配置、环境变量管理、数据库连接池基础代码。
@@ -189,7 +189,7 @@ D:\AAAagent\projects\competitive-analysis-system\
 5. `src/db/connection.py` — asyncpg 连接池
 6. `README.md` — 项目说明
 
-### 提示词 (Phase 0)
+### 提示词 (Phase 1)
 
 `	ext
 ## 任务：创建竞品分析多Agent协作系统 — 项目脚手架
@@ -300,13 +300,13 @@ TOKEN_BUCKET_CAPACITY=100
 
 ---
 
-## Phase 1：数据库 Schema + DAO
+## Phase 2：数据库 Schema + DAO
 
 ### 目标
 创建 PostgreSQL + pgvector 表结构、数据库初始化脚本、数据访问层（DAO）。
 
 ### 前置条件
-- Phase 0 已完成
+- Phase 1 已完成
 - PostgreSQL 已安装并运行（用户自行确认）
 
 ### 交付物
@@ -314,7 +314,7 @@ TOKEN_BUCKET_CAPACITY=100
 2. `src/db/dao.py` — asyncpg 数据访问层
 3. 更新 `src/db/__init__.py`
 
-### 提示词 (Phase 1)
+### 提示词 (Phase 2)
 
 `	ext
 ## 任务：竞品分析系统 — 数据库 Schema 与 DAO 层
@@ -486,13 +486,13 @@ TOKEN_BUCKET_CAPACITY=100
 
 ---
 
-## Phase 2：MCP 工具层
+## Phase 3：MCP 工具层
 
 ### 目标
 实现 MCP Server（tools/list + tools/call 协议）、Web 搜索采集工具、向量嵌入与重排工具。
 
 ### 前置条件
-- Phase 0 已完成（有 config.py 即可）
+- Phase 1 已完成（有 config.py 即可）
 
 ### 交付物
 1. `src/mcp/server.py` — MCP 协议实现
@@ -500,7 +500,7 @@ TOKEN_BUCKET_CAPACITY=100
 3. `src/mcp/tools_rag.py` — embed, rerank
 4. `src/mcp/__init__.py`
 
-### 提示词 (Phase 2)
+### 提示词 (Phase 3)
 
 `	ext
 ## 任务：竞品分析系统 — MCP 工具层
@@ -642,14 +642,14 @@ class MCPServer:
 
 ---
 
-## Phase 3：Agent 实现
+## Phase 4：Agent 实现
 
 ### 目标
 实现四个专职 Agent：Collector（采集）、Analyzer（分析+ RAG）、Writer（撰写）、Quality（质检）。每个 Agent 通过 MCP Server 调用工具。
 
 ### 前置条件
-- Phase 1 已完成（DAO）
-- Phase 2 已完成（MCP Server + 工具）
+- Phase 2 已完成（DAO）
+- Phase 3 已完成（MCP Server + 工具）
 
 ### 交付物
 1. `src/agents/prompts/collector.md` — Collector System Prompt
@@ -662,7 +662,7 @@ class MCPServer:
 8. `src/agents/quality.py`
 9. `src/agents/__init__.py`
 
-### 提示词 (Phase 3)
+### 提示词 (Phase 4)
 
 `	ext
 ## 任务：竞品分析系统 — 四个 Agent 实现
@@ -682,7 +682,7 @@ class MCPServer:
 | Quality | 五维质检评分 | task + 报告 | {score, details, passed} | 无（LLM-as-Judge） |
 
 ### 核心设计决策
-- 每个 Agent 是一个 async 函数，不是 LangGraph 节点（节点在 Phase 4 中定义）
+- 每个 Agent 是一个 async 函数，不是 LangGraph 节点（节点在 Phase 5 中定义）
 - Agent 接收 MCP Server 实例通过依赖注入
 - 所有 LLM 调用走 langchain_deepseek.ChatDeepSeek
 - 每个维度独立 try/except fail-fast——一个维度超时不拖垮其他
@@ -861,20 +861,20 @@ async def collector_agent(
 
 ---
 
-## Phase 4：Pipeline 编排
+## Phase 5：Pipeline 编排
 
 ### 目标
 用 LangGraph StateGraph 实现 Pipeline 主干编排，包含质检回退循环和 PostgreSQL Checkpoint 持久化。
 
 ### 前置条件
-- Phase 3 已完成（四个 Agent 函数可用）
+- Phase 4 已完成（四个 Agent 函数可用）
 
 ### 交付物
 1. `src/pipeline/state.py` — AgentState TypedDict
 2. `src/pipeline/graph.py` — LangGraph 图定义（Pipeline 主干）
 3. `src/pipeline/checkpoint.py` — PostgreSQL Checkpoint 存储
 
-### 提示词 (Phase 4)
+### 提示词 (Phase 5)
 
 `	ext
 ## 任务：竞品分析系统 — Pipeline 编排（LangGraph）
@@ -1060,14 +1060,14 @@ async def run_pipeline_task(task: dict) -> dict:
 
 ---
 
-## Phase 4.5：记忆系统（Checkpoint + 摘要 + 长期记忆 + 冲突/遗忘）
+## Phase 6：记忆系统（Checkpoint + 摘要 + 长期记忆 + 冲突/遗忘）
 
 ### 目标
-实现 Agent 三层记忆体系，覆盖短期（Checkpoint，Phase 4 已落地）、摘要记忆（分层压缩）、长期记忆（五步检索引擎 + 时间衰减 + 重要性评分）、冲突解决和遗忘策略。
+实现 Agent 三层记忆体系，覆盖短期（Checkpoint，Phase 5 已落地）、摘要记忆（分层压缩）、长期记忆（五步检索引擎 + 时间衰减 + 重要性评分）、冲突解决和遗忘策略。
 
 ### 前置条件
-- Phase 4 已完成（Checkpoint + DAO 可用）
-- Phase 1 的 agent_memories / memory_summaries 表已创建
+- Phase 5 已完成（Checkpoint + DAO 可用）
+- Phase 2 的 agent_memories / memory_summaries 表已创建
 - MCP 工具层的 embed_query / embed_texts / rerank 可用
 
 ### 交付物
@@ -1079,15 +1079,15 @@ async def run_pipeline_task(task: dict) -> dict:
 6. `src/memory/forgetting.py` — 遗忘策略（自然衰减在 SQL ORDER BY 层、180 天归档、显式软删除；决策类不归档）
 7. 更新 `src/pipeline/graph.py` — 集成记忆钩子到 Pipeline 节点
 
-### 提示词 (Phase 4.5)
+### 提示词 (Phase 6)
 
 ```text
 ## 任务：竞品分析系统 — Agent 记忆系统
 
 ### 背景
 项目在 `D:\AAAagent\projects\competitive-analysis-system\`，已有：
-- Phase 1: agent_memories / memory_summaries 表（含 pgvector 向量索引）
-- Phase 4: LangGraph Pipeline + PostgreSQL Checkpoint（短期记忆已落地）
+- Phase 2: agent_memories / memory_summaries 表（含 pgvector 向量索引）
+- Phase 5: LangGraph Pipeline + PostgreSQL Checkpoint（短期记忆已落地）
 - MCP 工具层：embed_query, embed_texts, rerank 可用
 - DAO 层：MemorySummaryDAO, AgentMemoryDAO, ChunkEmbeddingDAO 可用
 
@@ -1361,7 +1361,7 @@ async def node_finalize(state: AgentState) -> dict:
 **Pipeline 集成**（`src/pipeline/graph.py` 已更新）：
 - analyze 节点：检索长期记忆 → 格式化为 memory_context → 注入 Analyzer LLM Prompt
 - finalize 节点：LLM 提取 3-5 条关键决策/偏好/事实 → `engine.add_memory()` 写入 agent_memories
-- Summarizer 不在 Pipeline 集成（Pipeline 无对话轮次，留给 Phase 5A Supervisor ReAct 循环）
+- Summarizer 不在 Pipeline 集成（Pipeline 无对话轮次，留给 Phase 7 Supervisor ReAct 循环）
 
 **验收中修复的 Bug**：
 - 🔧 summarizer.py / retrieval.py / conflict.py 共 4 处 `\\n` 转义错误（Codex 写入时多转了一次）→ 全部改为 `\n`
@@ -1369,25 +1369,25 @@ async def node_finalize(state: AgentState) -> dict:
 **实施时补充的设计决策**：
 - round_num 在 Pipeline 中无自然来源（最多 3 个 report_version，达不到全量合并阈值 10）→ Summarizer 跳过 Pipeline，留给 Supervisor
 - user_id 从 task dict 传入 AgentState（`state["user_id"]`），无兜底值，已消除 `state.get("user_id", "default")`
-- Finalize 节点的记忆提取用内联 prompt（非 `_KEY_DECISIONS_PROMPT` 常量），格式 `type|content`（低严重度债务：建议 Phase 5A 统一为命名常量）
+- Finalize 节点的记忆提取用内联 prompt（非 `_KEY_DECISIONS_PROMPT` 常量），格式 `type|content`（低严重度债务：建议 Phase 7 统一为命名常量）
 - 三个钩子中 Pipeline 只集成了两个（analyze + finalize），write 后摘要钩子不集成
 
 ### 注意事项
 - 长期记忆检索的 ORDER BY 在 SQL 层完成（一次查询，不返 Python 再排序）
 - 摘要记忆的 LLM Prompt 必须约束输出长度（<=500 字）——否则摘要比原文还长
 - 冲突检测的语义相似度阈值 0.85 可调——太高导致漏检，太低导致误报
-- 遗忘策略不加 cron 调度（Phase 4.5 只写逻辑，调度由用户自行配置）
+- 遗忘策略不加 cron 调度（Phase 6 只写逻辑，调度由用户自行配置）
 - 所有记忆操作必须带 user_id——多用户隔离
 - embedding 向量用 BGE-M3 1024 维，和 RAG 检索共用同一模型（避免重复加载）
-- **Pipeline 只集成长记忆检索和写入两个钩子，Summarizer 留给 Phase 5A Supervisor**
+- **Pipeline 只集成长记忆检索和写入两个钩子，Summarizer 留给 Phase 7 Supervisor**
 
 ---
 
-## Phase 5A：Supervisor + A2A 通信协议（✅ 验收通过 2026-06-23）
+## Phase 7：Supervisor + A2A 通信协议（✅ 验收通过 2026-06-23）
 
 ### 实现概要
 
-实际实现超越计划中的 `while` 循环 + 类方法设计，升级为 **LangGraph StateGraph** 编排——与 Pipeline 的 `graph.py` 技术栈统一，并通过 `PostgresSaver` 获得 Checkpoint 断点续传能力。同时完整集成了 Phase 4.5 记忆系统。
+实际实现超越计划中的 `while` 循环 + 类方法设计，升级为 **LangGraph StateGraph** 编排——与 Pipeline 的 `graph.py` 技术栈统一，并通过 `PostgresSaver` 获得 Checkpoint 断点续传能力。同时完整集成了 Phase 6 记忆系统。
 
 ### 图结构
 
@@ -1442,21 +1442,21 @@ think → act → observe → route(条件边)
 
 ---
 
-## Phase 5B：IntentRouter + Harness Engineering
+## Phase 8：IntentRouter + Harness Engineering
 
 ### 目标
 实现 LLM 实体提取后的代码路由和 Harness 五层安全检查。
 
 ### 前置条件
-- Phase 4 已完成（Pipeline graph）
-- Phase 5A 已完成（Supervisor + A2A）
+- Phase 5 已完成（Pipeline graph）
+- Phase 7 已完成（Supervisor + A2A）
 
 ### 交付物
 1. `src/supervisor/router.py` — 代码路由决策
 2. `src/harness/guard.py` — 五层安全检查
 3. `src/harness/audit.py` — 审计日志
 
-### 提示词 (Phase 5B)
+### 提示词 (Phase 8)
 
 `	ext
 ## 任务：竞品分析系统 — IntentRouter + Harness Engineering
@@ -1657,13 +1657,13 @@ class AuditLogger:
 
 ---
 
-## Phase 6：服务化 + 可观测性
+## Phase 9：服务化 + 可观测性
 
 ### 目标
 FastAPI 服务 + SSE 进度推送 + 三层限流 + Prometheus 指标 + 结构化日志。
 
 ### 前置条件
-- Phase 4 + Phase 5B 已完成
+- Phase 5 + Phase 8 已完成
 
 ### 交付物
 1. `src/api/routes.py` — FastAPI 路由
@@ -1672,7 +1672,7 @@ FastAPI 服务 + SSE 进度推送 + 三层限流 + Prometheus 指标 + 结构化
 4. `src/observability/logging.py` — 结构化日志
 5. `src/observability/metrics.py` — Prometheus 指标
 
-### 提示词 (Phase 6)
+### 提示词 (Phase 9)
 
 `	ext
 ## 任务：竞品分析系统 — FastAPI 服务化 + 可观测性
@@ -1840,13 +1840,13 @@ logger = structlog.get_logger()
 
 ---
 
-## Phase 7：评估体系 + 集成测试
+## Phase 10：评估体系 + 集成测试
 
 ### 目标
 Golden Dataset + RAGAS 评估 + LLM-as-Judge 离轨评估 + 回归测试 + E2E 测试。
 
 ### 前置条件
-- Phase 6 已完成
+- Phase 9 已完成
 
 ### 交付物
 1. `src/evaluation/golden_dataset.py`
@@ -1854,7 +1854,7 @@ Golden Dataset + RAGAS 评估 + LLM-as-Judge 离轨评估 + 回归测试 + E2E �
 3. `src/evaluation/judge_eval.py`
 4. `tests/test_e2e.py` — 端到端测试
 
-### 提示词 (Phase 7)
+### 提示词 (Phase 10)
 
 `	ext
 ## 任务：竞品分析系统 — 评估体系 + 集成测试
@@ -1980,34 +1980,34 @@ async def test_rate_limit():
 ## 开发顺序与依赖图
 
 ```
-Phase 0 ──→ Phase 1 ──→ Phase 3 ──→ Phase 4 ──→ Phase 4.5 ──→ Phase 6 ──→ Phase 7
+Phase 1 ──→ Phase 2 ──→ Phase 4 ──→ Phase 5 ──→ Phase 6 ──→ Phase 9 ──→ Phase 10
     │   ✅       ✅         ✅         ✅          ✅
-    └──→ Phase 2 ─────────┘              │
+    └──→ Phase 3 ─────────┘              │
           ✅                              │
-                        Phase 5A ──→ Phase 5B ──┘
+                        Phase 7 ──→ Phase 8 ──┘
                           ✅
 
 ✅ = 已完成    ⬚ = 待开发
 ```
 
-- Phase 0（脚手架）是所有阶段的前置
-- Phase 1（数据库）和 Phase 2（MCP工具）可并行
-- Phase 3（Agent）依赖 Phase 1 + Phase 2
-- Phase 4（Pipeline）→ Phase 4.5（记忆系统）依赖 Phase 4
-- Phase 5A（Supervisor）依赖 Phase 3
-- Phase 5B（Router+Harness）依赖 Phase 4 + Phase 5A
-- Phase 6（服务化）依赖 Phase 4 + Phase 5B
-- Phase 7（评估）依赖 Phase 6
+- Phase 1（脚手架）是所有阶段的前置
+- Phase 2（数据库）和 Phase 3（MCP工具）可并行
+- Phase 4（Agent）依赖 Phase 2 + Phase 3
+- Phase 5（Pipeline）→ Phase 6（记忆系统）依赖 Phase 5
+- Phase 7（Supervisor）依赖 Phase 4
+- Phase 8（Router+Harness）依赖 Phase 5 + Phase 7
+- Phase 9（服务化）依赖 Phase 5 + Phase 8
+- Phase 10（评估）依赖 Phase 9
 
 ### 开发进度总览
 
 | Phase | 名称 | 状态 | 完成时间 | 审计报告 |
 |-------|------|:--:|---------|---------|
-| 0 | 项目脚手架 + 配置 | ✅ | 2026-06-20 | phase_report/phase0-audit_2026-06-20.md |
-| 1 | 数据库 Schema + DAO | ✅ | 2026-06-20 | phase_report/phase1-audit_2026-06-20.md |
-| 2 | MCP 工具层 | ✅ | 2026-06-20 | phase_report/phase2-audit_2026-06-20.md |
-| 3 | Agent 实现 | ✅ | 2026-06-21 | phase_report/phase3-audit_2026-06-21.md |
-| 4 | Pipeline 编排 | ✅ | 2026-06-22 | phase_report/phase4-audit_2026-06-22.md |
+| 0 | 项目脚手架 + 配置 | ✅ | 2026-06-20 | phase_report/phase1-audit_2026-06-20.md |
+| 1 | 数据库 Schema + DAO | ✅ | 2026-06-20 | phase_report/phase2-audit_2026-06-20.md |
+| 2 | MCP 工具层 | ✅ | 2026-06-20 | phase_report/phase3-audit_2026-06-20.md |
+| 3 | Agent 实现 | ✅ | 2026-06-21 | phase_report/phase4-audit_2026-06-21.md |
+| 4 | Pipeline 编排 | ✅ | 2026-06-22 | phase_report/phase5-audit_2026-06-22.md |
 | 4.5 | 记忆系统 | ✅ | 2026-06-22 | 本文档（内联验收） |
 | 5A | Supervisor + A2A | ✅ | 2026-06-23 | 本文档（内联验收） |
 | 5B | IntentRouter + Harness | ⬚ | — | — |

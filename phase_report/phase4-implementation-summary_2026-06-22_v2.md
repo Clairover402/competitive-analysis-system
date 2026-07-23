@@ -1,14 +1,14 @@
-# Phase 3 实现总结 — Agent 实现层（面试导向版）
+# Phase 4 实现总结 — Agent 实现层（面试导向版）
 
 **时间**: 2026-06-22（优化版，基于 2026-06-21 原版）
 **作者**: AI 工程师
-**范围**: Phase 3（src/agents/）5 模块 + 4 Prompt 文件
+**范围**: Phase 4（src/agents/）5 模块 + 4 Prompt 文件
 
 ---
 
-## 一、Phase 3 是什么？
+## 一、Phase 4 是什么？
 
-Phase 3 实现了竞品分析系统的**四个专精 Agent**，每个 Agent 负责分析流程的一个环节。这四个 Agent 被 Phase 4 的 Pipeline 编排层串联成自动化流水线。
+Phase 4 实现了竞品分析系统的**四个专精 Agent**，每个 Agent 负责分析流程的一个环节。这四个 Agent 被 Phase 5 的 Pipeline 编排层串联成自动化流水线。
 
 ```
 用户 task ──→ Collector ──→ Analyzer ──→ Writer ──→ Quality ──→ 最终报告
@@ -361,23 +361,23 @@ Quality 不通过时，`rewrite_suggestions` 回传给 Writer 重写，最多 2 
 
 ---
 
-## 七、与 Phase 4 Pipeline 的接口约定
+## 七、与 Phase 5 Pipeline 的接口约定
 
-Phase 3 的四个 Agent 共享统一签名，这是它们被 Phase 4 Pipeline 串起来的基础：
+Phase 4 的四个 Agent 共享统一签名，这是它们被 Phase 5 Pipeline 串起来的基础：
 
 ```python
 # 所有 Agent 的入口签名
 async def xxx_agent(task: dict, mcp_server: MCPServer, llm: ChatDeepSeek) -> dict:
 ```
 
-| Agent | 消费的 task key | 产出的 state key（Phase 4 写入 AgentState） |
+| Agent | 消费的 task key | 产出的 state key（Phase 5 写入 AgentState） |
 |-------|----------------|------------------------------------------|
 | Collector | id, title, competitors, dimensions | collected_data |
 | Analyzer | id, title, competitors, dimensions | analysis_results |
 | Writer | analysis_results, rewrite_suggestions | report_content, report_version |
 | Quality | report_content | quality_score, quality_passed, rewrite_suggestions |
 
-Phase 4 的 `graph.py` 通过闭包工厂函数 `_make_node_xxx()` 将每个 Agent 包装为 LangGraph 节点，节点返回的 dict 被 LangGraph 自动 merge 入 AgentState。
+Phase 5 的 `graph.py` 通过闭包工厂函数 `_make_node_xxx()` 将每个 Agent 包装为 LangGraph 节点，节点返回的 dict 被 LangGraph 自动 merge 入 AgentState。
 
 ---
 

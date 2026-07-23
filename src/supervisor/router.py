@@ -21,7 +21,7 @@
               │    │ _setup_deps() │  ← 共享依赖创建一次
               │    │ mcp_server    │
               │    │ pool          │
-              │    │ HarnessGuard  │  ← Phase 5B：注入 A2ARouter
+              │    │ HarnessGuard  │  ← Phase 8：注入 A2ARouter
               │    │ A2ARouter     │
               │    │ llm_supervisor│
               │    └───────────────┘
@@ -56,7 +56,7 @@
   ──────────────────────────────  ────────────────────────  ──────────────
   llm_parsed (●读)                LLM 实体提取阶段（图外）   classify()
   route_type (●读)                classify() 返回            route() 分支
-  route_history (★累加)           route() 每轮追加            Phase 6 Dashboard
+  route_history (★累加)           route() 每轮追加            Phase 9 Dashboard
   enriched_task (▲写)             route() 构造               run_*_task()
   mcp_server / pool / router (▲写) _setup_dependencies()    run_*_task()
   HarnessGuard (▲写)              _setup_dependencies()     注入 A2ARouter
@@ -123,7 +123,7 @@ class IntentRouter:
         """
         self.settings = settings or Settings()
         # 【L4 工程】route_history 是内存列表，每 route() 追加一条
-        # Phase 6 可改为写入 agent_logs 表（AuditLogger 已有写能力）
+        # Phase 9 可改为写入 agent_logs 表（AuditLogger 已有写能力）
         self.route_history: list[dict] = []
 
     # ── classify() — 纯函数路由决策 ──
@@ -189,7 +189,7 @@ class IntentRouter:
         |:--:|------|------|
         | 1 | `create_mcp_server(settings)` | MCP Server 承载工具能力（web_search 等） |
         | 2 | `await create_pool(settings)` | 异步连接池，复用给 Pipeline/Supervisor |
-        | 3 | `HarnessGuard(pool)` 创建安全壳 | Phase 5B：所有 Agent 调用必经五层检查 |
+        | 3 | `HarnessGuard(pool)` 创建安全壳 | Phase 8：所有 Agent 调用必经五层检查 |
         | 4 | `A2ARouter(mcp_server, harness=guard)` | 注入 HarnessGuard，send_task 自动拦截 |
         | 5 | 注册 4 个 AgentCard + handler + 专属温度 LLM | 温度按角色语义：搜索 0.3、分析 0.1、评分 0.0 |
         | 6 | 创建 `llm_supervisor(t=0.3)` | Supervisor 自身决策需要一定多样性 |
@@ -206,7 +206,7 @@ class IntentRouter:
         pool = await create_pool(self.settings)
 
         # ─── 创建 A2ARouter + 注入 HarnessGuard ───
-        # Phase 5B: 注入 HarnessGuard（白名单+参数校验+频控+PII+审计）
+        # Phase 8: 注入 HarnessGuard（白名单+参数校验+频控+PII+审计）
         from src.harness import HarnessGuard
         guard = HarnessGuard(pool)
         router = A2ARouter(mcp_server, harness=guard)
@@ -284,7 +284,7 @@ class IntentRouter:
 
         # ─── 记录路由历史 ───
         # 【L4 工程】每条 route 记录追加到内存列表
-        # Phase 6 改为写入 agent_logs，Dashboard 展示 80/20 分流比
+        # Phase 9 改为写入 agent_logs，Dashboard 展示 80/20 分流比
         history_entry = {
             "task_id": task.get("id", ""),
             "route": route_type,

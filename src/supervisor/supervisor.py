@@ -5,7 +5,7 @@
 ═══════════════════════════════════════════════════════════════════════════════
 
 Supervisor 是竞品分析系统的"探索模式控制器"。
-纯 Python while 循环重构为 LangGraph StateGraph，与 Pipeline（Phase 4）技术栈统一。
+纯 Python while 循环重构为 LangGraph StateGraph，与 Pipeline（Phase 5）技术栈统一。
 
   图结构:  think ──→ act ──→ observe ──→ route(条件边)
              ^                              |
@@ -34,7 +34,7 @@ Supervisor 是竞品分析系统的"探索模式控制器"。
   │          │ 【L3】add_conditional_edges 条件路由                      │
   └──────────┴──────────────────────────────────────────────────────────┘
 
-  与 Pipeline（Phase 4）的技术栈统一:
+  与 Pipeline（Phase 5）的技术栈统一:
   ┌──────────────────┬─────────────────────┬─────────────────────┐
   │ 维度             │ Pipeline            │ Supervisor          │
   ├──────────────────┼─────────────────────┼─────────────────────┤

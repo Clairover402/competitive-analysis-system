@@ -1,4 +1,4 @@
-# Phase 4 验收报告 — Pipeline 编排
+# Phase 5 验收报告 — Pipeline 编排
 
 **验收时间**: 2026-06-22
 **验收人**: AI 工程师

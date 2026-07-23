@@ -43,7 +43,7 @@ Pipeline 模式（当前）:
   原因: Pipeline 中的 analyze 必然需要检索——每次分析任务一定需要历史记忆。
   所以策略层在 Pipeline 中不生效——这是特例不是 Bug。
 
-Supervisor 模式（Phase 5A）:
+Supervisor 模式（Phase 7）:
   用户每轮对话不一定需要查记忆。Supervisor 需要 before 调用前判断:
     should, query = await strategy.should_retrieve(user_message)
     if should:

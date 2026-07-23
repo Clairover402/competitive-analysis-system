@@ -1,24 +1,24 @@
-# Phase 4 & 4.5 实现总结 — Pipeline 编排 + 记忆系统
+# Phase 5 & 4.5 实现总结 — Pipeline 编排 + 记忆系统
 
 **时间**: 2026-06-22
 **作者**: AI 工程师
-**范围**: Phase 4（src/pipeline/）4 文件 + Phase 4.5（src/memory/）6 文件
+**范围**: Phase 5（src/pipeline/）4 文件 + Phase 6（src/memory/）6 文件
 
 ---
 
-## 一、Phase 4 & 4.5 是什么？
+## 一、Phase 5 & 4.5 是什么？
 
-Phase 4 用 LangGraph StateGraph 把四个 Agent 串联成自动化流水线，Phase 4.5 在流水线上增加了三层记忆体系。两者一起构成竞品分析系统的**编排骨架 + 记忆底座**。
+Phase 5 用 LangGraph StateGraph 把四个 Agent 串联成自动化流水线，Phase 6 在流水线上增加了三层记忆体系。两者一起构成竞品分析系统的**编排骨架 + 记忆底座**。
 
 ```
-Phase 4 Pipeline 编排                          Phase 4.5 记忆系统注入点
+Phase 5 Pipeline 编排                          Phase 6 记忆系统注入点
 ═════════════════════════                       ════════════════════════════
 
 Collector → Analyzer → Writer → Quality ─┐        ┌─ analyze 节点注入记忆上下文
    ■          ★ ④       ■       ■ ②      │        │    (LongTermMemoryEngine.retrieve)
           检索长期记忆   写入摘要  评分    │        │
                         (跳过)           │        ├─ write 节点后无摘要钩子
-                                     ┌───┘        │    (Summarizer 留给 Phase 5A)
+                                     ┌───┘        │    (Summarizer 留给 Phase 7)
                                      │            │
                                      ▼            └─ finalize 节点提取关键决策
                                score≥70?  YES        (LLM → add_memory → agent_memories)
@@ -34,15 +34,15 @@ Collector → Analyzer → Writer → Quality ─┐        ┌─ analyze 节�
 
 | 阶段 | 文件数 | 核心模块 | 行数 |
 |------|:--:|------|------|
-| Phase 4 | 4 | State 定义 + 5 节点 StateGraph + PostgresSaver + 条件路由 | ~700 |
-| Phase 4.5 | 6 | 长期记忆引擎 + 摘要记忆 + 冲突解决 + 遗忘策略 + 检索触发 + 包入口 | ~645 |
+| Phase 5 | 4 | State 定义 + 5 节点 StateGraph + PostgresSaver + 条件路由 | ~700 |
+| Phase 6 | 6 | 长期记忆引擎 + 摘要记忆 + 冲突解决 + 遗忘策略 + 检索触发 + 包入口 | ~645 |
 | **合计** | **10** | | **~1345** |
 
 ---
 
 ## 二、核心模块详解
 
-### 2.1 Phase 4: Pipeline 编排
+### 2.1 Phase 5: Pipeline 编排
 
 #### `state.py` — AgentState 共享状态（17 字段）
 
@@ -116,7 +116,7 @@ class PostgresSaver(BaseCheckpointSaver):
 
 ---
 
-### 2.2 Phase 4.5: 记忆系统
+### 2.2 Phase 6: 记忆系统
 
 #### `long_term.py` — LongTermMemoryEngine（五步检索引擎）
 
@@ -153,7 +153,7 @@ ORDER BY (
             └── ≥10 轮 → 全量合并（前次摘要 + 最后 5 条消息 → LLM 重写）
 ```
 
-**不集成 Pipeline 的原因**: Pipeline 最多 3 个 `report_version`，达不到全量合并阈值 10。留给 Phase 5A Supervisor（ReAct 循环有对话轮次概念）。
+**不集成 Pipeline 的原因**: Pipeline 最多 3 个 `report_version`，达不到全量合并阈值 10。留给 Phase 7 Supervisor（ReAct 循环有对话轮次概念）。
 
 #### `conflict.py` — MemoryConflictResolver（三级策略）
 
@@ -267,7 +267,7 @@ LangGraph 自带的 `AsyncPostgresSaver` 需要安装 `langgraph-checkpoint-post
 
 ### Q5: 为什么 Summarizer 不集成 Pipeline？
 
-Summarizer 的 `round_num` 判断全量合并阈值（10 轮）依赖"对话轮次"概念。Pipeline 中最多只有 3 个 `report_version`（Writer 重写次数），达不到阈值——Summarizer 会永远运行在增量模式下，全量合并路径永远不会触发。Phase 5A Supervisor 有 ReAct 循环（`_think→_act→_observe`），天然有对话轮次，是 Summarizer 的正确归属。
+Summarizer 的 `round_num` 判断全量合并阈值（10 轮）依赖"对话轮次"概念。Pipeline 中最多只有 3 个 `report_version`（Writer 重写次数），达不到阈值——Summarizer 会永远运行在增量模式下，全量合并路径永远不会触发。Phase 7 Supervisor 有 ReAct 循环（`_think→_act→_observe`），天然有对话轮次，是 Summarizer 的正确归属。
 
 ### Q6: remaining_steps 为什么在 write 节点递减而不在 collect？
 
@@ -277,7 +277,7 @@ Summarizer 的 `round_num` 判断全量合并阈值（10 轮）依赖"对话轮�
 
 ## 七、验收标准对照
 
-### Phase 4 验收
+### Phase 5 验收
 
 | # | 标准 | 结果 |
 |---|------|:--:|
@@ -289,7 +289,7 @@ Summarizer 的 `round_num` 判断全量合并阈值（10 轮）依赖"对话轮�
 | 6 | 4 个不同温度 LLM 实例闭包创建 | ✅ |
 | 7 | AST 解析通过 | ✅ |
 
-### Phase 4.5 验收
+### Phase 6 验收
 
 | # | 标准 | 结果 |
 |---|------|:--:|
@@ -315,7 +315,7 @@ Summarizer 的 `round_num` 判断全量合并阈值（10 轮）依赖"对话轮�
 | `src/pipeline/checkpoint.py` | ~95 | PostgresSaver 自建实现 |
 | `src/memory/__init__.py` | ~25 | 记忆包导出（5 个类） |
 | `src/memory/long_term.py` | ~180 | 五步检索 + RRF 融合 + 三因子排序 |
-| `src/memory/summarizer.py` | ~140 | 递增/全量摘要合并（留给 Phase 5A） |
+| `src/memory/summarizer.py` | ~140 | 递增/全量摘要合并（留给 Phase 7） |
 | `src/memory/retrieval.py` | ~100 | 检索触发策略（关键词预检 + LLM 重写） |
 | `src/memory/conflict.py` | ~120 | 三级冲突策略（OVERWRITE/UPDATE/KEEP_BOTH） |
 | `src/memory/forgetting.py` | ~80 | 三层遗忘（衰减/归档/软删除） |
@@ -326,7 +326,7 @@ Summarizer 的 `round_num` 判断全量合并阈值（10 轮）依赖"对话轮�
 
 | Phase | 内容 | 前置 | 状态 |
 |-------|------|------|:--:|
-| Phase 5A | Supervisor + A2A 通信协议 | Phase 3 ✅ | ⬚ 待开发 |
-| Phase 5B | IntentRouter + Harness Engineering | Phase 4 + 5A | ⬚ 待开发 |
-| Phase 6 | FastAPI 服务化 + 可观测性 | Phase 4 + 5B | ⬚ 待开发 |
-| Phase 7 | 评估体系 + 集成测试 | Phase 6 | ⬚ 待开发 |
+| Phase 7 | Supervisor + A2A 通信协议 | Phase 4 ✅ | ⬚ 待开发 |
+| Phase 8 | IntentRouter + Harness Engineering | Phase 5 + 5A | ⬚ 待开发 |
+| Phase 9 | FastAPI 服务化 + 可观测性 | Phase 5 + 5B | ⬚ 待开发 |
+| Phase 10 | 评估体系 + 集成测试 | Phase 9 | ⬚ 待开发 |

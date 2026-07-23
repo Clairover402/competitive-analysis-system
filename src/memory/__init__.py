@@ -62,7 +62,7 @@
     analyze 节点: LongTermMemoryEngine.retrieve() → 检索历史记忆 → 注入 prompt
     finalize 节点: LongTermMemoryEngine.add_memory() → 提取本次关键决策 → 持久化
 
-  层面2（Phase 5A）: Supervisor 集成
+  层面2（Phase 7）: Supervisor 集成
     MemorySummarizer 激活 — ReAct 循环提供对话轮次
     MemoryRetrievalStrategy 扩能 — 增加轮次间隔条件
     MemoryConflictResolver 前移 — 从任务结束后批处理 → 实时检测
@@ -70,7 +70,7 @@
 当前代码的两层设计:
   — Summarizer 已写但不集成（留给 Supervisor）
   — ConflictResolver 已写但只在 add_memory 触发（不是每轮都检查）
-  — Forgetting 已写但不自动调度（留给 Phase 6 cron）
+  — Forgetting 已写但不自动调度（留给 Phase 9 cron）
 
 这种"先写逻辑、后接调度"的策略叫 Staged Integration（分阶段集成）——
 每层逻辑独立可用，集成只加钩子，不改逻辑。

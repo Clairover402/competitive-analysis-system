@@ -1,14 +1,14 @@
-# Phase 4 实现总结 — Pipeline 编排层
+# Phase 5 实现总结 — Pipeline 编排层
 
 **时间**: 2026-06-22
 **作者**: AI 工程师
-**范围**: Phase 4（src/pipeline/）4 模块 — StateGraph 编排 + PostgreSQL Checkpoint
+**范围**: Phase 5（src/pipeline/）4 模块 — StateGraph 编排 + PostgreSQL Checkpoint
 
 ---
 
-## 一、Phase 4 是什么？
+## 一、Phase 5 是什么？
 
-Phase 4 实现了竞品分析系统的 **Pipeline 编排层**——把 Phase 3 的 4 个独立 Agent（Collector/Analyzer/Writer/Quality）串成一条自动化流水线，加上重写回退循环、Checkpoint 持久化、温度差异化配置。
+Phase 5 实现了竞品分析系统的 **Pipeline 编排层**——把 Phase 4 的 4 个独立 Agent（Collector/Analyzer/Writer/Quality）串成一条自动化流水线，加上重写回退循环、Checkpoint 持久化、温度差异化配置。
 
 ```
 用户 task ──→ run_pipeline_task() ──→ build_pipeline_graph() ──→ graph.ainvoke()
@@ -376,9 +376,9 @@ run_pipeline_task(task)
 
 ## 五、面试快速答题模板（2 分钟版）
 
-> 问：Phase 4 Pipeline 编排是怎么实现的？
+> 问：Phase 5 Pipeline 编排是怎么实现的？
 
-**答**：用 LangGraph 的 StateGraph 把 Phase 3 的 4 个 Agent 串成流水线。
+**答**：用 LangGraph 的 StateGraph 把 Phase 4 的 4 个 Agent 串成流水线。
 
 **状态设计**：一个 TypedDict `AgentState` 包含 16 个字段，按 Collector → Analyzer → Writer → Quality → Finalize 五个阶段分组，每个节点返回 dict 部分更新，LangGraph 自动合并。
 

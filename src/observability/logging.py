@@ -5,7 +5,7 @@
 ═══════════════════════════════════════════════════════════════════════════════
 
 为什么不用 structlog？
-  — Phase 6 环境 .venv 没有 pip，structlog 安装失败
+  — Phase 9 环境 .venv 没有 pip，structlog 安装失败
   — 标准 logging 可完成同样功能（Filter + Formatter）
   — 无外部依赖，省去 1 次 install
 

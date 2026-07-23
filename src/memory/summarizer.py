@@ -50,14 +50,14 @@ Pipeline 没有对话轮次概念:
   Summarizer 在 Pipeline 中会永远运行在递增模式下，全量合并路径永不到达。
 
 正确的归属:
-  Phase 5A Supervisor 有 ReAct 循环（_think → _act → _observe → _think → ...）。
+  Phase 7 Supervisor 有 ReAct 循环（_think → _act → _observe → _think → ...）。
   每轮 think 就是一次 LLM 推理，天然有对话轮次。
   摘要在第 5/10/15 轮触发全量合并，在中间轮次触发递增合并。
 
 当前文件的角色:
   写好了完整逻辑但不集成——Staged Integration 策略（先写再挂）。
   Pipeline 的 graph.py 中有注释标记:
-    "write 后的摘要钩子跳过——Summarizer 留给 Phase 5A Supervisor"
+    "write 后的摘要钩子跳过——Summarizer 留给 Phase 7 Supervisor"
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ class MemorySummarizer:
     【L5 架构】Pipeline 不集成此类
     ─────────────────────────────
     Pipeline 无对话轮次（最多 3 个 report_version），
-    Summarizer 留给 Phase 5A Supervisor 的 ReAct 循环激活。
+    Summarizer 留给 Phase 7 Supervisor 的 ReAct 循环激活。
     """
 
     # 【L4 工程】全量合并间隔 — 10 轮触发一次
@@ -305,7 +305,7 @@ class MemorySummarizer:
           比查自家的 memory_summaries 表复杂得多。
           摘要表已经存了每轮的摘要文本——对全量合并来说足够。
 
-        【L4 工程】Phase 5A 修复：不再传空字符串给 get_by_round_range
+        【L4 工程】Phase 7 修复：不再传空字符串给 get_by_round_range
         ──────────────────────────────────────────────────────────
           旧实现: dao.get_by_round_range(task_id, "") → 空字符串不匹配任何记录
           新实现: dao.get_recent_by_task(task_id, count) → 按 created_at 倒序取

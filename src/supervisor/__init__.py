@@ -1,7 +1,7 @@
 """Supervisor - ReAct 循环 + A2A 通信协议 + 代码路由。
 
-Phase 5A: LangGraph StateGraph: think -> act -> observe -> route(条件边)。
-Phase 5B: IntentRouter 代码路由（Pipeline vs Supervisor 分流）。
+Phase 7: LangGraph StateGraph: think -> act -> observe -> route(条件边)。
+Phase 8: IntentRouter 代码路由（Pipeline vs Supervisor 分流）。
 """
 
 from __future__ import annotations

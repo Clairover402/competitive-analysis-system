@@ -1,15 +1,15 @@
-# Phase 5B 实现总结 — IntentRouter 代码路由 + Harness 五层安全检查 + 审计日志
+# Phase 8 实现总结 — IntentRouter 代码路由 + Harness 五层安全检查 + 审计日志
 
 **时间**: 2026-06-24
 **作者**: AI 工程师
-**范围**: Phase 5B（4 文件）— 代码路由分流 + 五层安全壳 + 审计日志
+**范围**: Phase 8（4 文件）— 代码路由分流 + 五层安全壳 + 审计日志
 **架构**: 确定性代码路由 + 短路安全检查链 + fire-and-forget 审计
 
 ---
 
-## 一、Phase 5B 是什么？
+## 一、Phase 8 是什么？
 
-Phase 5B 是竞品分析系统的**入口分流器 + 安全壳**——用户请求到达后，LLM 提取实体（competitors/dimensions/intent_is_clear），IntentRouter 读这些结构化数据做纯代码路由决策（pipeline 还是 supervisor），然后所有 Agent 间调用经过 HarnessGuard 五层安全检查，全部过程写入审计日志。
+Phase 8 是竞品分析系统的**入口分流器 + 安全壳**——用户请求到达后，LLM 提取实体（competitors/dimensions/intent_is_clear），IntentRouter 读这些结构化数据做纯代码路由决策（pipeline 还是 supervisor），然后所有 Agent 间调用经过 HarnessGuard 五层安全检查，全部过程写入审计日志。
 
 ```
                     用户 query
@@ -17,12 +17,12 @@ Phase 5B 是竞品分析系统的**入口分流器 + 安全壳**——用户请�
                         ▼
               ┌─────────────────────┐
               │   LLM 实体提取       │  ← 提取 {competitors, dimensions, intent_is_clear}
-              │   （Phase 3 已有）   │
+              │   （Phase 4 已有）   │
               └──────────┬──────────┘
                          │
                          ▼
               ┌─────────────────────┐
-              │   IntentRouter      │  ← Phase 5B: 代码路由决策
+              │   IntentRouter      │  ← Phase 8: 代码路由决策
               │   classify(parsed)  │
               └──────┬──────┬───────┘
                      │      │
@@ -34,7 +34,7 @@ Phase 5B 是竞品分析系统的**入口分流器 + 安全壳**——用户请�
               │   send_task()       │
               │                     │
               │   ┌───────────────┐ │
-              │   │ Step ②.5     │ │  ← Phase 5B 集成点
+              │   │ Step ②.5     │ │  ← Phase 8 集成点
               │   │ HarnessGuard  │ │
               │   │ 五层检查      │ │
               │   └───────┬───────┘ │
@@ -49,7 +49,7 @@ Phase 5B 是竞品分析系统的**入口分流器 + 安全壳**——用户请�
               └─────────────────────┘
 ```
 
-**与 Phase 5A（Supervisor）的关系**：Phase 5A 是执行引擎，Phase 5B 是入口 + 安全壳。5B 不改变 5A 的图结构和 ReAct 循环，只在 5A 的 A2ARouter.send_task() 中间插入五层检查。
+**与 Phase 7（Supervisor）的关系**：Phase 7 是执行引擎，Phase 8 是入口 + 安全壳。5B 不改变 5A 的图结构和 ReAct 循环，只在 5A 的 A2ARouter.send_task() 中间插入五层检查。
 
 | 5A 提供 | 5B 消费 |
 |---------|---------|
@@ -116,7 +116,7 @@ LLM 已输出结构化数据 {competitors, dimensions, intent_is_clear}
 # _setup_dependencies() 中
 pool = await create_pool(self.settings)
 from src.harness import HarnessGuard
-guard = HarnessGuard(pool)                                    # ← Phase 5B 注入
+guard = HarnessGuard(pool)                                    # ← Phase 8 注入
 router = A2ARouter(mcp_server, harness=guard)                 # ← Harness 绑定到 A2ARouter
 ```
 
@@ -134,7 +134,7 @@ history_entry = {
 self.route_history.append(history_entry)
 ```
 
-内存记录，供监控用——当前 Phase 不持久化，Phase 6 服务化时可接入 agent_logs。
+内存记录，供监控用——当前 Phase 不持久化，Phase 9 服务化时可接入 agent_logs。
 
 ---
 
@@ -322,7 +322,7 @@ card = self._cards.get(task.agent_name)
 handler = self._handlers.get(task.agent_name)
 llm = self._llms.get(task.agent_name)
 
-# Step ②.5: Harness 五层安全检查（Phase 5B 集成）
+# Step ②.5: Harness 五层安全检查（Phase 8 集成）
 if self._harness is not None:
     guard_result = await self._harness.guard(
         agent_name=task.agent_name,
@@ -403,7 +403,7 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
 ```
 用户 query: "帮我分析飞书和钉钉的功能差异"
   │
-  ├── LLM 实体提取（Phase 3）
+  ├── LLM 实体提取（Phase 4）
   │     └── {competitors: ["飞书","钉钉"], dimensions: ["功能"], intent_is_clear: true}
   │
   └── IntentRouter.route(task, llm_parsed)
@@ -424,7 +424,7 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
         ├── Step 4: _setup_dependencies()
         │     ├── mcp_server = create_mcp_server(settings)
         │     ├── pool = await create_pool(settings)
-        │     ├── guard = HarnessGuard(pool)           ← Phase 5B 依赖注入
+        │     ├── guard = HarnessGuard(pool)           ← Phase 8 依赖注入
         │     ├── router = A2ARouter(mcp_server, harness=guard)
         │     ├── register 4 AgentCards + handlers + LLMs
         │     └── → (mcp_server, pool, router, llm_supervisor)
@@ -438,7 +438,7 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
               │     │
               │     ├── Step ①: 查 AgentCard/handler/LLM
               │     │
-              │     ├── Step ②.5: HarnessGuard.guard()  ← Phase 5B 拦截点
+              │     ├── Step ②.5: HarnessGuard.guard()  ← Phase 8 拦截点
               │     │     ├── Layer 1: check_whitelist("collector", "web_search")
               │     │     │     └── "web_search" in ["collect","web_search","web_fetch"] → ✅
               │     │     ├── Layer 2: validate_params("web_search", {...}, schema)
@@ -468,7 +468,7 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
 
 ## 五、2 分钟面试答题模板
 
-> 问：Phase 5B IntentRouter + Harness 是怎么做的？
+> 问：Phase 8 IntentRouter + Harness 是怎么做的？
 
 **答**：入口分流 + 五层安全壳 + 审计日志，三个模块一把梭。
 
@@ -502,33 +502,33 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
 
 ### 追问 5："route_history 存在内存里，重启丢了怎么办？"
 
-**答**：当前 Phase 不持久化——route_history 只是监控辅助数据，丢了不影响主业务。Phase 6 服务化时可以改存 agent_logs 表（AuditLogger 已有 write 能力），或者在 IntentRouter 初始化时也注入 pool，每次 route 后调 DAO 落库。改动量不超过 20 行。
+**答**：当前 Phase 不持久化——route_history 只是监控辅助数据，丢了不影响主业务。Phase 9 服务化时可以改存 agent_logs 表（AuditLogger 已有 write 能力），或者在 IntentRouter 初始化时也注入 pool，每次 route 后调 DAO 落库。改动量不超过 20 行。
 
 ### 追问 6："Harness 五层检查能跳层吗？比如只想做白名单 + 审计，跳过中间三层？"
 
-**答**：当前 guard() 是短路检查链——任一层失败即返回。但五层是硬编码顺序，没有跳层开关。如果需要跳过中间层，可以在 guard() 加参数 `checks: list[str] = ["whitelist","param","rate","pii","audit"]`——传入 `["whitelist","audit"]` 就只执行两层。这是 Phase 6 的可配置化方向。
+**答**：当前 guard() 是短路检查链——任一层失败即返回。但五层是硬编码顺序，没有跳层开关。如果需要跳过中间层，可以在 guard() 加参数 `checks: list[str] = ["whitelist","param","rate","pii","audit"]`——传入 `["whitelist","audit"]` 就只执行两层。这是 Phase 9 的可配置化方向。
 
 ---
 
 ## 七、与上下 Phase 接口约定
 
-### 上游接口：Phase 5A（Supervisor）
+### 上游接口：Phase 7（Supervisor）
 
-| Phase 5A 提供 | Phase 5B 使用方式 |
+| Phase 7 提供 | Phase 8 使用方式 |
 |---------------|-------------------|
 | `run_supervisor_task(task, mcp_server, pool, router, llm)` | `IntentRouter.route()` 的 supervisor 分支 |
 | `A2ARouter(mcp_server, harness=guard)` | HarnessGuard 注入 A2ARouter 构造函数 |
 | `run_pipeline_task(task, mcp_server, pool)` | `IntentRouter.route()` 的 pipeline 分支 |
 
-### 下游接口：Phase 6（服务化 + 可观测性）
+### 下游接口：Phase 9（服务化 + 可观测性）
 
-| Phase 5B 提供 | Phase 6 消费方式 |
+| Phase 8 提供 | Phase 9 消费方式 |
 |---------------|------------------|
 | `IntentRouter.route(task, llm_parsed)` | FastAPI endpoint：`@app.post("/analyze")` → 调 LLM 提取 → 调 route() |
-| `HarnessGuard.guard()` | A2ARouter 执行路径不变，Phase 6 只加可观测性（Prometheus metrics 打点） |
-| `AuditLogger.log()` | Phase 6 可扩展：采样策略（10% 通过日志）、脱敏、异步批量写入 |
-| `route_history` | Phase 6 可持久化到 agent_logs 表，Dashboard 展示 80/20 分流比 |
-| `agent_logs` 表 | Phase 6 监控 agent_logs 表大小、清理策略、Dashboard 展示调用链 |
+| `HarnessGuard.guard()` | A2ARouter 执行路径不变，Phase 9 只加可观测性（Prometheus metrics 打点） |
+| `AuditLogger.log()` | Phase 9 可扩展：采样策略（10% 通过日志）、脱敏、异步批量写入 |
+| `route_history` | Phase 9 可持久化到 agent_logs 表，Dashboard 展示 80/20 分流比 |
+| `agent_logs` 表 | Phase 9 监控 agent_logs 表大小、清理策略、Dashboard 展示调用链 |
 
 ---
 
@@ -561,7 +561,7 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
 |---|------|:------:|------|
 | 1 | `router.py` `_setup_dependencies()` 中 `A2ARouter` 未注入 HarnessGuard（`harness=None`），五层检查全链路死代码 | 🔴 阻断 | `from src.harness import HarnessGuard; guard = HarnessGuard(pool); router = A2ARouter(mcp_server, harness=guard)` |
 | 2 | `classify()` 中 `len(competitors) < 2` 与验收标准矛盾（单竞品应走 pipeline） | 🟡 功能 | `len(competitors) < 2` → `len(competitors) == 0` |
-| 3 | `a2a.py` Step 注释乱码（`Step ?.5: Harness ???????Phase 5B ???`） | 🟢 文档 | → `Step ②.5: Harness 五层安全检查（Phase 5B 集成）` |
+| 3 | `a2a.py` Step 注释乱码（`Step ?.5: Harness ???????Phase 8 ???`） | 🟢 文档 | → `Step ②.5: Harness 五层安全检查（Phase 8 集成）` |
 | 4 | `router.py` 文件头架构图 `competitors>=2` 过时 | 🟢 文档 | → `competitors>=1` |
 | 5 | `router.py` 两处中文注释乱码 | 🟢 文档 | → 修复为正常中文 |
 
@@ -571,7 +571,7 @@ Pipeline 和 Supervisor 都不感知 Harness——它们只管调 `router.send_t
 |------|:--:|------|
 | 功能完整性 | 10/10 | 6 条验收标准 100% 满足 |
 | Harness 集成 | 10/10 | A2ARouter send_task 第 ②.5 步无缝注入，Pipeline/Supervisor 零感知 |
-| 架构一致性 | 9/10 | 与 5A 接口匹配，缺 AppContext 统一依赖管理（留 Phase 6） |
+| 架构一致性 | 9/10 | 与 5A 接口匹配，缺 AppContext 统一依赖管理（留 Phase 9） |
 | 代码质量 | 9/10 | 纯函数 classify、短路检查链、fire-and-forget 审计，缺 route_history 持久化 |
 | 面试展示力 | 10/10 | 五层检查逐层可讲、TokenBucket 内存实现可展开、PII 告警不阻断可追问 |
 | **总评** | **✅ 48/50 通过** |

@@ -1,15 +1,15 @@
-# Phase 5A 实现总结 — LangGraph StateGraph 版 Supervisor + A2A + 三层记忆集成
+# Phase 7 实现总结 — LangGraph StateGraph 版 Supervisor + A2A + 三层记忆集成
 
 **时间**: 2026-06-23（v2 更新：LangGraph StateGraph 重构版）
 **作者**: AI 工程师
-**范围**: Phase 5A（src/supervisor/）4 文件 — Supervisor ReAct 循环 + A2A 协议 + 三层记忆
+**范围**: Phase 7（src/supervisor/）4 文件 — Supervisor ReAct 循环 + A2A 协议 + 三层记忆
 **架构**: LangGraph StateGraph + 闭包工厂 + PostgresSaver Checkpoint
 
 ---
 
-## 一、Phase 5A 是什么？
+## 一、Phase 7 是什么？
 
-Phase 5A 实现了竞品分析系统的**探索模式控制器**——当用户没说清楚竞品是谁，系统通过 ReAct 循环动态搜索、分析、写作。核心是 `think → act → observe → route` 四个 LangGraph 节点形成的闭环，通过 PostgresSaver 自动持久化每轮 Checkpoint，集成三层记忆（短期持久化 + 增量摘要 + 全量合并校准 + 长期记忆检索/提取），最多 10 轮自收敛。
+Phase 7 实现了竞品分析系统的**探索模式控制器**——当用户没说清楚竞品是谁，系统通过 ReAct 循环动态搜索、分析、写作。核心是 `think → act → observe → route` 四个 LangGraph 节点形成的闭环，通过 PostgresSaver 自动持久化每轮 Checkpoint，集成三层记忆（短期持久化 + 增量摘要 + 全量合并校准 + 长期记忆检索/提取），最多 10 轮自收敛。
 
 ```
 think ──→ act ──→ observe ──→ route(条件边)
@@ -19,13 +19,13 @@ think ──→ act ──→ observe ──→ route(条件边)
           "end" → END
 ```
 
-**与 Pipeline（Phase 4）的关系**：互补，非替代。
+**与 Pipeline（Phase 5）的关系**：互补，非替代。
 - Pipeline = 确定性流程（用户指定了竞品），一条路走到底
 - Supervisor = 开放性探索（用户没指定竞品），搜索 + 分析 + 写作闭环
-- 二者的分流由 IntentRouter（Phase 5B）处理
+- 二者的分流由 IntentRouter（Phase 8）处理
 
 ```
-用户 query ──→ IntentRouter（Phase 5B：LLM 提取实体 + 代码路由）
+用户 query ──→ IntentRouter（Phase 8：LLM 提取实体 + 代码路由）
                 ├── 参数充足 → Pipeline（StateGraph 直线执行）
                 └── 参数不足/意图模糊 → Supervisor（ReAct 循环探索）
                                            │
@@ -151,7 +151,7 @@ Pipeline 不需要这种字段（analyze 的输出 analysis_results 本身就是
 
 **概念公式**: A2A = AgentCard（名片）+ A2ATask（任务单）+ A2ARouter（调度台，卡片+函数+温度三合一绑定）
 
-**与 MCP 的区别**: MCP 是 Agent ↔ 工具（Phase 2），A2A 是 Agent ↔ Agent（Phase 5A）。Supervisor 通过 A2A 调度 4 个 Agent，Agent 通过 MCP 调用 web_search 等工具。**A2A 不是 Supervisor 专属通道**——它是 P2P 协议，本系统采用集中式拓扑（全走 Supervisor 中转）是为了架构简化。
+**与 MCP 的区别**: MCP 是 Agent ↔ 工具（Phase 3），A2A 是 Agent ↔ Agent（Phase 7）。Supervisor 通过 A2A 调度 4 个 Agent，Agent 通过 MCP 调用 web_search 等工具。**A2A 不是 Supervisor 专属通道**——它是 P2P 协议，本系统采用集中式拓扑（全走 Supervisor 中转）是为了架构简化。
 
 #### 2.2.1 AgentCard — Agent 名片
 
@@ -558,7 +558,7 @@ run_supervisor_task(task, mcp_server, pool, router, llm_supervisor,
 
 ## 五、2 分钟面试答题模板
 
-> 问：Phase 5A Supervisor 是怎么实现的？
+> 问：Phase 7 Supervisor 是怎么实现的？
 
 **答**：用 LangGraph StateGraph 做 ReAct 循环探索，通过 A2A 协议调度 4 个 Agent，集成三层记忆。
 
@@ -568,7 +568,7 @@ run_supervisor_task(task, mcp_server, pool, router, llm_supervisor,
 
 **三层记忆**：短期用 PostgresSaver——`graph.compile(checkpointer=saver)` 后每个节点自动持久化，`thread_id` 相同可断点续传。摘要用 MemorySummarizer，每轮递增摘要 + 每 10 轮全量合并校准语义漂移。长期记忆 think 前注入 Top 5（不让 LLM 决定查不查，假阴代价大于假阳），observe 后按 Agent 类型分级写入。
 
-**与 Pipeline 的关系**：Pipeline 是确定性流程（用户指定竞品），Supervisor 是开放性探索。由 IntentRouter（Phase 5B）分流——LLM 提取实体 + 代码判断参数完整性，参数足走 Pipeline，不足走 Supervisor。两者共用同一 PostgresSaver、同一张 checkpoints 表，thread_id 前缀分区。
+**与 Pipeline 的关系**：Pipeline 是确定性流程（用户指定竞品），Supervisor 是开放性探索。由 IntentRouter（Phase 8）分流——LLM 提取实体 + 代码判断参数完整性，参数足走 Pipeline，不足走 Supervisor。两者共用同一 PostgresSaver、同一张 checkpoints 表，thread_id 前缀分区。
 
 ---
 
@@ -621,7 +621,7 @@ A2A（Agent-to-Agent）是 Agent ↔ Agent——Supervisor 通过 A2ARouter 调�
 
 ## 七、与上下 Phase 接口约定
 
-### 上游接口：Phase 3（Agent 函数）
+### 上游接口：Phase 4（Agent 函数）
 
 四 Agent 统一签名：`async def xxx_agent(task: dict, mcp_server: MCPServer, llm: ChatDeepSeek) -> dict`
 
@@ -632,18 +632,18 @@ A2A（Agent-to-Agent）是 Agent ↔ Agent——Supervisor 通过 A2ARouter 调�
 | writer | title, analysis_results | `{report_markdown}` |
 | quality | report_markdown | `{overall_score, passed, rewrite_suggestions}` |
 
-### 下游接口：Phase 5B（IntentRouter + Harness）
+### 下游接口：Phase 8（IntentRouter + Harness）
 
-| Phase 5A 提供 | Phase 5B 消费 |
+| Phase 7 提供 | Phase 8 消费 |
 |---------------|---------------|
 | `build_supervisor_graph(...)` | `router.py` 调用构建 Supervisor 图 |
 | `run_supervisor_task(task, ...)` | `router.py` 作为"参数不足"分支入口 |
 | `A2ARouter` 注册表 | `router.py` 初始化时注册 4 Agent + Harness 包装 |
 | `thread_id` 前缀 `supervisor-{task_id}` | 与 `pipeline-{task_id}` 共享 checkpoints 表但隔离 |
 
-### 下游接口：Phase 6（服务化 + 可观测性）
+### 下游接口：Phase 9（服务化 + 可观测性）
 
-| Phase 5A 提供 | Phase 6 消费 |
+| Phase 7 提供 | Phase 9 消费 |
 |---------------|---------------|
 | `reasoning_trace` 结构化轨迹 | 作为 Dashboard 展示（时间线 + 每轮决策+结果） |
 | `graph.ainvoke(initial_state, config)` 异步 | FastAPI `async def` endpoint 包装 |

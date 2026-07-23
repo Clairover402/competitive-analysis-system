@@ -203,8 +203,8 @@ def _make_task_dict(
 ) -> dict:
     """将 Pydantic 请求体转换为 task dict（兼容现有模块的 dict 接口）。
 
-    【L4 工程】user_id 硬编码为 "default" — 已知技术债务，Phase 6 后需补齐。
-    详见 DEVELOPMENT_PLAN.md Phase 6 的多用户隔离裂缝说明。
+    【L4 工程】user_id 硬编码为 "default" — 已知技术债务，Phase 9 后需补齐。
+    详见 DEVELOPMENT_PLAN.md Phase 9 的多用户隔离裂缝说明。
     """
     return {
         "id": str(task_id),

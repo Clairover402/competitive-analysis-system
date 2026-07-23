@@ -18,7 +18,7 @@
        │                                            request, response, error,
        │                                            duration_ms)
        │
-       └── Phase 6 Dashboard 查询
+       └── Phase 9 Dashboard 查询
               └── AuditLogger.get_task_trail(task_id)
                     └── SELECT * FROM agent_logs WHERE task_id=$1 ORDER BY created_at ASC
                           → 完整的 Agent 调用时间线（每一步谁做了什么、花了多久、出没出错）
@@ -155,7 +155,7 @@ class AuditLogger:
     async def get_task_trail(self, task_id: str) -> list[dict]:
         """查询完整调用链日志（按时间升序）。
 
-        【L4 工程】Phase 6 可观测性展示：
+        【L4 工程】Phase 9 可观测性展示：
         — Dashboard 用此方法画 Agent 调用时间线
         — 质检 Agent 复盘："哪一步花了最长时间？哪一步出错？"
         — 故障排查："collector 为什么被拦截了？" → 查 agent_logs.error

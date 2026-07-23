@@ -404,7 +404,7 @@ class A2ARouter:
             logger.error("A2A send_task 失败: agent=%s 注册不完整", task.agent_name)
             return task
 
-        # Step ②.5: Harness 五层安全检查（Phase 5B 集成）
+        # Step ②.5: Harness 五层安全检查（Phase 8 集成）
         if self._harness is not None:
             guard_result = await self._harness.guard(
                 agent_name=task.agent_name,
