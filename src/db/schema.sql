@@ -54,6 +54,24 @@ $$;
 
 
 -- ============================================================
+-- 0. users — 用户表（L2 鉴权基础）
+-- ============================================================
+-- 【L4 工程】user_id 贯穿全系统——tasks 关联 user、agent_memories
+-- 按 user_id 分区、API 层通过 JWT 注入当前用户。
+-- password_hash 存储 bcrypt $2b$ 格式哈希，绝不存明文。
+CREATE TABLE IF NOT EXISTS users (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username      VARCHAR(50) NOT NULL UNIQUE,
+    password_hash VARCHAR(128) NOT NULL,   -- bcrypt $2b$...
+    email         VARCHAR(200) UNIQUE,     -- UNIQUE 但允许 NULL（NULL≠NULL 不冲突）
+    is_active     BOOLEAN NOT NULL DEFAULT true,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+
+-- ============================================================
 -- 1. tasks — 分析任务（系统主干表）
 -- ============================================================
 -- 【L3 架构】tasks 是整个数据模型的"根"——所有其他表都通过
@@ -69,6 +87,7 @@ $$;
 --   不需要参照完整性。这是"半结构化数据存 JSONB"的经典场景。
 CREATE TABLE IF NOT EXISTS tasks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     VARCHAR(100) NOT NULL,      -- 所属用户（JWT 注入，多用户隔离）
     title       VARCHAR(500) NOT NULL,      -- 任务名称，如"协同办公软件竞品分析"
     competitors JSONB NOT NULL,              -- 竞品列表 ["飞书","钉钉","Notion"]
     dimensions  JSONB NOT NULL,              -- 分析维度 ["功能","定价","市场"]
@@ -81,8 +100,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 -- 【L4 工程】索引设计——按查询频率建索引
+-- user_id: 按用户过滤任务列表（多用户隔离的核心索引）
 -- status: 看"有哪些任务在运行"（监控面板）
 -- created_at: 看"最近创建了哪些任务"（列表按时间排序）
+CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks (user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at);
 

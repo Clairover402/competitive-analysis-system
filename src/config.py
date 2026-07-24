@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # ---- Reranker: BGE-reranker-v2-m3 ----
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
+    # ---- Auth: JWT ----
+    jwt_secret: str = "competitive-analysis-jwt-secret-change-in-production"
+    jwt_expire_hours: int = 24
+
     # ---- Limits ----
     max_concurrent_collectors: int = 3
     max_rounds_supervisor: int = 10

@@ -64,6 +64,7 @@ class TaskDAO:
     async def create(
         self,
         task_id: str,
+        user_id: str,
         title: str,
         competitors: list[str],
         dimensions: list[str],
@@ -88,10 +89,10 @@ class TaskDAO:
         dimensions_json = json.dumps(dimensions, ensure_ascii=False)
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                """INSERT INTO tasks (id, title, competitors, dimensions, pipeline_mode)
-                   VALUES ($1, $2, $3::jsonb, $4::jsonb, $5)
+                """INSERT INTO tasks (id, user_id, title, competitors, dimensions, pipeline_mode)
+                   VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6)
                    RETURNING id""",
-                task_id, title, competitors_json, dimensions_json, pipeline_mode,
+                task_id, user_id, title, competitors_json, dimensions_json, pipeline_mode,
             )
             return str(row["id"])
 
@@ -843,3 +844,89 @@ class AgentLogDAO:
                 task_id, limit,
             )
             return [dict(r) for r in rows]
+
+
+
+class UserDAO:
+    """用户数据访问。
+
+    【L2 鉴权】users 表是认证体系的"根"——注册时写入，登录时比对。
+    user_id 贯穿全系统：tasks 关联 user、agent_memories 按 user_id 分区。
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def create(
+        self,
+        username: str,
+        password_hash: str,
+        email: str | None = None,
+    ) -> dict | None:
+        """注册新用户。
+
+        先查后插——username 和 email（若提供）都要检查是否已存在。
+        不能靠 UNIQUE 异常兜底：无法区分"用户名冲突"和"邮箱冲突"，
+        错误信息不够精确。
+
+        Returns:
+            用户 dict 或 None（用户名/邮箱已存在）
+        """
+        async with self._pool.acquire() as conn:
+            # ── 1. 检查 username 是否已存在 ──
+            existing = await conn.fetchval(
+                "SELECT 1 FROM users WHERE username = $1", username,
+            )
+            if existing:
+                return None  # 用户名冲突
+
+            # ── 2. 检查 email 是否已存在（仅当提供了 email）──
+            if email:
+                existing = await conn.fetchval(
+                    "SELECT 1 FROM users WHERE email = $1", email,
+                )
+                if existing:
+                    return None  # 邮箱冲突
+
+            # ── 3. 写入 ──
+            row = await conn.fetchrow(
+                """INSERT INTO users (username, password_hash, email)
+                   VALUES ($1, $2, $3)
+                   RETURNING id, username, email, created_at""",
+                username, password_hash, email,
+            )
+            return dict(row) if row else None
+
+    async def get_by_username(self, username: str) -> dict | None:
+        """按用户名查用户（登录比对哈希）。"""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, username, password_hash, email, is_active, created_at
+                   FROM users WHERE username = $1""",
+                username,
+            )
+            return dict(row) if row else None
+
+    async def get_by_id(self, user_id: str) -> dict | None:
+        """按 ID 查用户。"""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, username, email, is_active, created_at
+                   FROM users WHERE id = $1""",
+                user_id,
+            )
+            return dict(row) if row else None
+
+    async def get_by_email(self, email: str) -> dict | None:
+        """按邮箱查用户（注册去重用）。
+
+        email 是 UNIQUE 约束——两用户不能共用同一邮箱。
+        NULL 邮箱不冲突（SQL 标准：NULL ≠ NULL，UNIQUE 允许多个 NULL）。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, username, email, is_active, created_at
+                   FROM users WHERE email = $1""",
+                email,
+            )
+            return dict(row) if row else None

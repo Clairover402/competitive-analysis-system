@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -53,6 +53,8 @@ from src.observability.metrics import (
 )
 from src.api.rate_limit import AgentSemaphore, LLMRateLimiter, TokenBucket
 from src.api.sse import event_generator
+from src.api.auth_routes import router as auth_router
+from src.auth.dependencies import CurrentUser, get_current_user
 
 if TYPE_CHECKING:
     from asyncpg import Pool
@@ -170,6 +172,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── 注册认证路由（公开，无需 JWT）──
+app.include_router(auth_router)
+
+# ── 静态文件（登录页）──
+from fastapi.staticfiles import StaticFiles
+import os
+_static_dir = os.path.join(os.path.dirname(__file__), "..", "..", "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # §4 辅助函数
@@ -200,18 +212,18 @@ def _get_router(request: Request):
 def _make_task_dict(
     task_id: UUID,
     request_body: TaskRequest,
+    user_id: str,
 ) -> dict:
     """将 Pydantic 请求体转换为 task dict（兼容现有模块的 dict 接口）。
 
-    【L4 工程】user_id 硬编码为 "default" — 已知技术债务，Phase 9 后需补齐。
-    详见 DEVELOPMENT_PLAN.md Phase 9 的多用户隔离裂缝说明。
+    user_id 由 JWT 鉴权注入，不再硬编码 "default"。
     """
     return {
         "id": str(task_id),
         "title": request_body.title,
         "competitors": request_body.competitors or [],
         "dimensions": request_body.dimensions or [],
-        "user_id": "default",
+        "user_id": user_id,
     }
 
 
@@ -285,6 +297,7 @@ async def _execute_task(
 async def create_task(
     body: TaskRequest,
     request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> JSONResponse:
     """创建竞品分析任务（异步后台执行）。
 
@@ -321,10 +334,11 @@ async def create_task(
     pool = _get_pool(request)
     task_dao = TaskDAO(pool)
     task_id = UUID(uuid4().hex)
-    task = _make_task_dict(task_id, body)
+    task = _make_task_dict(task_id, body, current_user.user_id)
 
     await task_dao.create(
         task_id=str(task_id),
+        user_id=current_user.user_id,
         title=body.title,
         competitors=task["competitors"],
         dimensions=task["dimensions"],
@@ -349,6 +363,7 @@ async def create_task(
 async def get_task(
     task_id: str,
     request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> TaskResponse:
     """查询任务状态。
 
@@ -383,6 +398,7 @@ async def get_task(
 async def stream_task(
     task_id: str,
     request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """SSE 进度推送。
 
@@ -416,6 +432,7 @@ async def stream_task(
 async def get_reports(
     task_id: str,
     request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> list[ReportResponse]:
     """获取任务报告列表（按版本降序）。
 

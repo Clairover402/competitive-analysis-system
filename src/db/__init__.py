@@ -29,6 +29,7 @@ from src.db.dao import (
     MemorySummaryDAO,
     AgentMemoryDAO,
     AgentLogDAO,
+    UserDAO,
 )
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "MemorySummaryDAO",
     "AgentMemoryDAO",
     "AgentLogDAO",
+    "UserDAO",
 ]
