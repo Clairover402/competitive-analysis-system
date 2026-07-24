@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
     # ---- Auth: JWT ----
-    jwt_secret: str = "competitive-analysis-jwt-secret-change-in-production"
+    jwt_secret: str = ""  # 必须通过 .env 或环境变量设置，不给默认值
     jwt_expire_hours: int = 24
 
     # ---- Limits ----

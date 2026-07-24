@@ -123,9 +123,14 @@ D:\AAAagent\projects\competitive-analysis-system\
 │   │   ├── guard.py        # 五层检查中间件
 │   │   └── audit.py        # 审计日志
 │   │
+│   ├── auth/
+│   │   ├── __init__.py
+│   │   ├── security.py     # bcrypt 哈希 + JWT 令牌签发/解码
+│   │   └── dependencies.py # FastAPI 依赖注入 get_current_user
 │   ├── api/
 │   │   ├── __init__.py
-│   │   ├── routes.py       # FastAPI 路由
+│   │   ├── routes.py       # FastAPI 路由（任务管理 + 鉴权端点）
+│   │   ├── auth_routes.py  # 认证路由（register/login/me）
 │   │   ├── sse.py          # SSE 推流
 │   │   └── rate_limit.py   # 三层限流
 │   │
@@ -2003,16 +2008,16 @@ Phase 1 ──→ Phase 2 ──→ Phase 4 ──→ Phase 5 ──→ Phase 6 
 
 | Phase | 名称 | 状态 | 完成时间 | 审计报告 |
 |-------|------|:--:|---------|---------|
-| 0 | 项目脚手架 + 配置 | ✅ | 2026-06-20 | phase_report/phase1-audit_2026-06-20.md |
-| 1 | 数据库 Schema + DAO | ✅ | 2026-06-20 | phase_report/phase2-audit_2026-06-20.md |
-| 2 | MCP 工具层 | ✅ | 2026-06-20 | phase_report/phase3-audit_2026-06-20.md |
-| 3 | Agent 实现 | ✅ | 2026-06-21 | phase_report/phase4-audit_2026-06-21.md |
-| 4 | Pipeline 编排 | ✅ | 2026-06-22 | phase_report/phase5-audit_2026-06-22.md |
-| 4.5 | 记忆系统 | ✅ | 2026-06-22 | 本文档（内联验收） |
-| 5A | Supervisor + A2A | ✅ | 2026-06-23 | 本文档（内联验收） |
-| 5B | IntentRouter + Harness | ⬚ | — | — |
-| 6 | 服务化 + 可观测性 | ⬚ | — | — |
-| 7 | 评估体系 + 集成测试 | ⬚ | — | — |
+| Phase 1 | 项目脚手架 + 配置 | ✅ | 2026-06-20 | phase_report/phase1-3-implementation-summary_2026-07-23.md |
+| Phase 2 | 数据库 Schema + DAO | ✅ | 2026-06-20 | phase_report/phase1-3-implementation-summary_2026-07-23.md |
+| Phase 3 | MCP 工具层 | ✅ | 2026-06-20 | phase_report/phase1-3-implementation-summary_2026-07-23.md |
+| Phase 4 | Agent 实现 | ✅ | 2026-06-21 | phase_report/phase4-implementation-summary_2026-06-22_v2.md |
+| Phase 5 | Pipeline 编排 + Checkpoint | ✅ | 2026-06-22 | phase_report/phase5-implementation-summary_2026-06-22.md |
+| Phase 6 | 记忆系统（短期+摘要+长期+冲突+遗忘） | ✅ | 2026-06-22 | phase_report/phase6-implementation-summary_2026-06-22.md |
+| Phase 7 | Supervisor + A2A | ✅ | 2026-06-23 | phase_report/phase7-implementation-summary_2026-06-23.md |
+| Phase 8 | IntentRouter + Harness | ✅ | 2026-06-24 | phase_report/phase8-implementation-summary_2026-06-24.md |
+| Phase 9 | 服务化 + 可观测性（FastAPI/SSE/限流/日志/指标） | ✅ | 2026-07-22 | phase_report/phase9-implementation-summary_2026-07-22.md |
+| Phase 10 | 评估体系 + 集成测试 | ✅ | 2026-07-22 | phase_report/phase10-implementation-summary_2026-07-22.md |
 
 ---
 

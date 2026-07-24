@@ -97,8 +97,7 @@ class TaskResponse(BaseModel):
     pipeline_mode: str
     created_at: str
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class ReportResponse(BaseModel):
