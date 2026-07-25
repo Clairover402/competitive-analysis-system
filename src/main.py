@@ -15,12 +15,21 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 import uvicorn
 
 
 def main() -> None:
+    # 【L4 工程】全局日志配置——INFO 级别才能看到 Pipeline 节点日志
+    # 默认 WARNING 过滤掉所有 INFO，导致中间节点静默执行
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
     parser = argparse.ArgumentParser(
         description="竞品分析多Agent协作系统",
     )

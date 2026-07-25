@@ -89,11 +89,11 @@ _QUALITY_PROMPT = """你是报告质量评审专家。对以下竞品分析报�
 }
 
 评分标准：
-- 完整性(30%): 所有维度和竞品是否覆盖，是否有漏分析
-- 准确性(30%): 数据是否有来源引用，是否无编造信息
-- 可追溯性(20%): 结论是否附带 source_url，引用是否可验证
-- 可读性(10%): Markdown 结构是否清晰、表格是否完整
-- 客观性(10%): 是否无明显倾向性语言、无主观臆断
+- 完整性(30%%): 所有维度和竞品是否覆盖，是否有漏分析
+- 准确性(30%%): 数据是否有来源引用，是否无编造信息
+- 可追溯性(20%%): 结论是否附带 source_url，引用是否可验证
+- 可读性(10%%): Markdown 结构是否清晰、表格是否完整
+- 客观性(10%%): 是否无明显倾向性语言、无主观臆断
 
 通过阈值: overall_score >= 70
 不通过必须提供至少 2 条 rewrite_suggestions。
@@ -208,6 +208,7 @@ async def quality_agent(
         content=report,
         quality_score=overall_score,
         quality_details=dim_scores,
+        version=task.get("version", 1),
     )
 
     duration_ms = (time.perf_counter() - t0) * 1000

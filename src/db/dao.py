@@ -46,6 +46,34 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 向量格式转换工具
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _vector_str(embedding: list[float]) -> str:
+    """将 Python list[float] 转为 pgvector 字符串格式。
+
+    asyncpg 不认识 pgvector 的类型，无法自动将 list[float] 编码为 vector。
+    需要先转成字符串 "[0.1,0.2,...]"，再配合 SQL 中的 ::vector cast
+    让 PostgreSQL 解析。
+
+    等价于: "[" + ",".join(str(x) for x in embedding) + "]"
+
+    Args:
+        embedding: 浮点数列表（如 BGE-M3 的 1024 维向量）
+
+    Returns:
+        字符串 "[0.01,0.02,...]"，可直接作为 $1::vector 查询参数
+    """
+    return "[" + ",".join(str(float(x)) for x in embedding) + "]"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TaskDAO
+# ═══════════════════════════════════════════════════════════════════════════
+
+
 class TaskDAO:
     """分析任务数据访问。
 
@@ -169,7 +197,9 @@ class ReportDAO:
                                         quality_details, version)
                    VALUES ($1, $2, $3, $4::jsonb, $5)
                    RETURNING id""",
-                task_id, content, quality_score, quality_details, version,
+                task_id, content, quality_score,
+                json.dumps(quality_details, ensure_ascii=False) if quality_details else None,
+                version,
             )
             return str(row["id"])
 
@@ -354,7 +384,7 @@ class ChunkEmbeddingDAO:
                         c["chunk_text"],
                         c["chunk_index"],
                         c["source_url"],
-                        c["embedding"],
+                        _vector_str(c["embedding"]),
                     )
                     for c in chunks
                 ],
@@ -397,7 +427,7 @@ class ChunkEmbeddingDAO:
                    WHERE task_id = $1
                    ORDER BY embedding <=> $2::vector
                    LIMIT $3""",
-                task_id, query_embedding, top_k,
+                task_id, _vector_str(query_embedding), top_k,
             )
             return [dict(r) for r in rows]
 
@@ -611,7 +641,7 @@ class AgentMemoryDAO:
                    VALUES ($1, $2, $3, $4, $5::vector, $6, $7)
                    RETURNING id""",
                 user_id, memory_type, content, importance,
-                embedding, source_task_id, half_life_days,
+                _vector_str(embedding) if embedding else None, source_task_id, half_life_days,
             )
             return str(row["id"])
 
@@ -648,7 +678,7 @@ class AgentMemoryDAO:
                    WHERE user_id = $1 AND is_active = true
                    ORDER BY weighted_score DESC
                    LIMIT $3""",
-                user_id, query_embedding, top_k,
+                user_id, _vector_str(query_embedding), top_k,
             )
             return [dict(r) for r in rows]
 
@@ -758,7 +788,7 @@ class AgentMemoryDAO:
                      AND embedding IS NOT NULL
                      AND (1.0 - (embedding <=> $2::vector)) >= $3
                    ORDER BY similarity DESC""",
-                user_id, content_embedding, threshold,
+                user_id, _vector_str(content_embedding), threshold,
             )
             return [dict(r) for r in rows]
 
@@ -808,8 +838,10 @@ class AgentLogDAO:
                                            request, response, error,
                                            duration_ms)
                    VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)""",
-                task_id, agent_name, action, request,
-                response, error, duration_ms,
+                task_id, agent_name, action,
+                json.dumps(request, ensure_ascii=False) if request else None,
+                json.dumps(response, ensure_ascii=False) if response else None,
+                error, duration_ms,
             )
 
     async def get_by_task(self, task_id: str) -> list[dict]:

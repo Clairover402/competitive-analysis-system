@@ -234,8 +234,12 @@ def _extract_json(text: str) -> dict | None:
         try:
             # L2: JSON 解析
             return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass  # 格式错误 → 返回 None，由调用方重试
+        except json.JSONDecodeError as e:
+            # JSON 格式错误 → 记录警告，返回 None 由调用方重试
+            logger = logging.getLogger(__name__)
+            logger.warning("LLM 响应 JSON 解析失败，等待重试。原始响应前100字符: %s",
+                           text[:100])
+            pass
     return None
 
 

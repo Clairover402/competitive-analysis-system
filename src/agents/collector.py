@@ -76,6 +76,23 @@ _KEYWORD_PROMPT = """你是一个搜索专家。根据竞品名称和分析维�
 输出: ["query1", "query2", ...]"""
 
 
+# 【L4 工程】错误信息提取——降级日志只打根因，不打完整堆栈
+# exc_info=True 的堆栈会刷屏，用 traceback 手动提取最后一行作为摘要
+import traceback as _traceback
+
+def _extract_error_root_cause() -> str:
+    """提取当前异常的最后一帧信息作为根因摘要。"""
+    tb = _traceback.format_exc()
+    lines = tb.strip().split("\n")
+    # 找最后一行非空的 traceback 文本（通常是异常类名 + 信息）
+    for line in reversed(lines):
+        line = line.strip()
+        if line:
+            # 截断到 120 字符，避免超长错误信息
+            return line[:120]
+    return "unknown error"
+
+
 async def _generate_keywords(
     competitor: str,
     dimensions: list[str],
@@ -109,21 +126,47 @@ async def _generate_keywords(
     prompt = _KEYWORD_PROMPT % (competitor, dims_str)
     try:
         resp = await llm.ainvoke(prompt)
-        text = resp.content.strip()
+        text = (resp.content or "").strip()
+        # 【L4 工程】防御空响应：LLM 有时返回空内容（rate limit / 上下文溢出）
+        if not text:
+            logger.warning("日志：LLM返回空内容，competitor=%r，使用模板兜底", competitor)
+            raise ValueError("LLM returned empty response")
         # 清理可能的 markdown 代码块包裹（模型输出防御）
         # 【L4 工程】模型不一定严格遵守"只输出 JSON"的指令，
         # 有时会给 ```json\n...\n```，所以统一预处理
         if text.startswith("```"):
-            text = text.split("`", 2)[2].split("```", 1)[0].strip()
+            parts = text.split("`", 2)
+            if len(parts) > 2:
+                text = parts[2].split("```", 1)[0].strip()
+            else:
+                text = text.strip("`").strip()
+        # 【L4 工程】防御非 JSON 输出（LLM 返回自然语言兜底文本）
+        # 尝试从文本中提取 JSON 列表部分，解决"前面解释+后面 JSON"的格式
+        if not text.startswith("["):
+            # 找到第一个 '[' 作为 JSON 起点
+            bracket_idx = text.find("[")
+            if bracket_idx >= 0:
+                text = text[bracket_idx:]
+                # 找到最后一个 ']' 作为 JSON 终点
+                bracket_end = text.rfind("]")
+                if bracket_end >= 0:
+                    text = text[:bracket_end + 1]
+        # 二次空值防御：提取后可能是空字符串（LLM 只返回了解释文字）
+        if not text or not text.strip():
+            raise ValueError("LLM output became empty after extraction")
         keywords = json.loads(text)
         if isinstance(keywords, list) and len(keywords) > 0:
-            logger.info("日志：LLM为 %r 生成了 %d 个关键词", len(keywords), competitor)
+            logger.info("日志：LLM为 %r 生成了 %d 个关键词", competitor, len(keywords))
             return keywords
+        else:
+            logger.warning("日志：LLM返回非列表或空列表，competitor=%r", competitor)
+            raise ValueError("LLM returned non-list keywords")
     except Exception:
+        # 【L4 工程】exc_info=False —— 降级到模板是正常路径，不需要打堆栈
         logger.warning(
-            "日志：为 %r 生成关键词失败，将使用模板兜底",
+            "日志：为 %r 生成关键词失败，将使用模板兜底（原因: %s）",
             competitor,
-            exc_info=True,
+            _extract_error_root_cause(),
         )
     # 兜底：模板拼接 {竞品} {维度}
     # 【L4 工程】这是设计契约的最低保证——无论如何不会返回空列表
@@ -304,7 +347,9 @@ async def collector_agent(
             try:
                 results = json.loads(resp["content"][0]["text"])
                 return (competitor, results)
-            except Exception:
+            except Exception as e:
+                logger.warning("搜索结果 JSON 解析失败 competitor=%s query=%s: %s",
+                                competitor, query[:50], e)
                 return (competitor, [])
 
     search_tasks = [_search_one(c, d, q) for (c, d, q) in all_queries]
@@ -313,18 +358,36 @@ async def collector_agent(
     # ──────────── 搜索结果去重 + 分组 ────────────
     # 【L4 工程】URL 全局去重：不同 query 可能返回相同的 URL
     # 如果不去重，会重复抓取同一个页面——浪费带宽 + 被目标站点视为爬虫攻击
+    # 【L4 工程】反爬域名黑名单——这些站纯 HTTP 请求必然返回 403/JS Challenge
+    # 直接过滤避免浪费带宽 + 报错噪音（httpx 无 TLS fingerprint 伪装能力）
+    _ANTI_SCRAPE_DOMAINS = {
+        "baike.baidu.com",  # 百度百科——双重反爬（TLS fingerprint + cookie）
+    }
+
     seen_urls: set[str] = set()
     competitor_urls: dict[str, list[dict]] = {c: [] for c in competitors}
+    skipped_baike: int = 0  # 跳过的反爬域名计数
     for competitor, results in search_results:
         for r in results:
             url = r.get("url", "")
             if url and url not in seen_urls:
+                # 反爬域名：跳过抓取，保留 title/snippet 作为摘要信息
+                try:
+                    from urllib.parse import urlparse
+                    host = urlparse(url).hostname or ""
+                except Exception:
+                    host = ""
+                if host in _ANTI_SCRAPE_DOMAINS:
+                    skipped_baike += 1
+                    continue
                 seen_urls.add(url)
                 competitor_urls[competitor].append({
                     "url": url,
                     "title": r.get("title", ""),
                     "snippet": r.get("snippet", ""),
                 })
+    if skipped_baike:
+        logger.info("日志：跳过 %d 个反爬域名的URL（baike.baidu.com等）", skipped_baike)
 
     # ──────────── 步骤3: 并发抓取网页内容 ────────────
     # 【L4 工程】每个竞品最多抓取 5 条 URL（urls[:5]）

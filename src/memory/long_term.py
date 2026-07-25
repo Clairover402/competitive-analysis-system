@@ -409,8 +409,9 @@ class LongTermMemoryEngine:
             if len(rewritten) > 3:          # 重写结果至少 3 个字符才有效
                 logger.debug("Query 重写: %r → %r", query, rewritten)
                 return rewritten
-        except Exception:
-            logger.debug("Query 重写失败: %r", query)
+        except Exception as e:
+            logger.warning("Query 重写失败 query=%r error=%s", query, e,
+                            exc_info=True)
         return query  # fallback: 用原始 query
 
     # ══════════════════════════════════════════════════════════════════════

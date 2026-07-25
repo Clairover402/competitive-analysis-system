@@ -80,8 +80,14 @@ class TaskRequest(BaseModel):
     query: str | None = Field(None, description="自然语言查询（Supervisor 模式入口）")
 
     def model_post_init(self, _context) -> None:
-        """校验：competitors+dimensions 和 query 至少传一组。"""
-        has_structured = self.competitors and self.dimensions
+        """校验：competitors+dimensions 和 query 至少传一组。
+
+        【L4 工程】关键区分：
+          — competitors=[] + dimensions=["功能"] → Supervisor 探索（传了但空）
+          — competitors=None → 字段未传（跟空列表语义不同）
+          — 用 `is not None` 而非 falsy 判断，避免空列表被误判为"未传"
+        """
+        has_structured = (self.competitors is not None and self.dimensions is not None)
         has_query = bool(self.query and self.query.strip())
         if not has_structured and not has_query:
             raise ValueError("请提供 competitors+dimensions 或 query")
@@ -101,13 +107,19 @@ class TaskResponse(BaseModel):
 
 
 class ReportResponse(BaseModel):
-    """报告查询响应。"""
+    """报告查询响应。
+
+    is_latest=True 的是最终交付版本（版本号最高的那份）。
+    前端可直接 filter(r => r.is_latest) 或取 reports[0]。
+    """
     report_id: str
     task_id: str
     content: str | None
     quality_score: float | None
     quality_details: dict | None
     version: int
+    is_latest: bool = False
+    """最新版本标识。改写循环产生多版本，只有版本号最高的为 True。"""
     created_at: str
 
 
@@ -115,6 +127,24 @@ class HealthResponse(BaseModel):
     """健康检查响应。"""
     status: str
     db_connected: bool
+
+
+def _parse_jsonb(value: object) -> dict | None:
+    """解析 asyncpg JSONB 字段 — 兼容字符串和 dict 两种返回格式。
+
+    【L4 工程】asyncpg 的 JSONB 行为与版本有关：
+    — 旧版（带 codec）返回 dict
+    — 新版直接返回 JSON 字符串
+    — 如果是 None，返回 None（Pydantic Optional[dict] 接受）
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        import json
+        return json.loads(value)
+    return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -257,7 +287,22 @@ async def _execute_task(
         # ── 2. 执行路由 + 引擎 ──
         result = await router.route(task, llm_parsed)
 
-        # ── 3. 标记 completed ──
+        # ── 3. 检查执行结果 ──
+        # IntentRouter.route() 即使失败也返回 dict（含 "error" 字段），
+        # 不抛异常。必须检查 error 字段，否则静默标 completed。
+        if "error" in result:
+            await task_dao.update_status(task_id_str, "failed")
+            elapsed = time.monotonic() - started_at
+            record_task_failed()
+            request.app.state.log.bind(
+                task_id=task_id_str[:8]
+            ).error("任务执行失败", extra={
+                "error": result["error"],
+                "elapsed_ms": int(elapsed * 1000),
+            })
+            return
+
+        # ── 4. 标记 completed ──
         await task_dao.update_status(task_id_str, "completed")
         elapsed = time.monotonic() - started_at
         route = result.get("route", "pipeline")
@@ -275,17 +320,18 @@ async def _execute_task(
         try:
             task_dao = TaskDAO(pool)
             await task_dao.update_status(task_id_str, "failed")
-        except Exception:
-            pass  # 连 DB 更新都失败则不记录到 tasks 表
+        except Exception as db_err:
+            logger = logging.getLogger(__name__)
+            logger.exception(
+                "标记失败状态时 DB 写入也失败了 task_id=%s", task_id_str[:8],
+                exc_info=True,
+            )
 
         record_task_failed()
         elapsed = time.monotonic() - started_at
-        request.app.state.log.bind(
-            task_id=task_id_str[:8]
-        ).error("任务失败", extra={
-            "error": str(e),
-            "elapsed_ms": int(elapsed * 1000),
-        })
+        logger = logging.getLogger(__name__)
+        logger.exception("任务失败 task_id=%s elapsed=%.0fms",
+                          task_id_str[:8], elapsed * 1000)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -447,6 +493,7 @@ async def get_reports(
     if not reports:
         raise HTTPException(404, f"任务无报告: {task_id}")
 
+    max_version = max((r.get("version", 1) for r in reports), default=1)
     return [
         ReportResponse(
             report_id=str(r["id"]),
@@ -457,8 +504,9 @@ async def get_reports(
                 if r.get("quality_score") is not None
                 else None
             ),
-            quality_details=r.get("quality_details"),
+            quality_details=_parse_jsonb(r.get("quality_details")),
             version=r.get("version", 1),
+            is_latest=r.get("version", 1) == max_version,
             created_at=str(r.get("created_at", "")),
         )
         for r in reports
@@ -482,7 +530,9 @@ async def health_check(request: Request) -> HealthResponse:
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT 1 AS ok")
             db_ok = bool(row and row["ok"] == 1)
-    except Exception:
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning("健康检查 DB 连接失败: %s", e)
         db_ok = False
 
     return HealthResponse(

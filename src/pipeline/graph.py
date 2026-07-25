@@ -296,6 +296,7 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
             "competitors": state["competitors"],
             "dimensions": state["dimensions"],
             "report_markdown": state["report_content"],
+            "version": state.get("report_version", 1),
         }
         logger.info("【Pipeline】quality 开始, task=%s", state["task_id"])
         result = await quality_agent(task, mcp_server, llm)

@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(__import__("pathlib").Path(__file__).resolve().parent.parent / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

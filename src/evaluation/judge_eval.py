@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -216,8 +218,11 @@ async def evaluate_with_judge(
             max_tokens=500,
         )
         content = response.choices[0].message.content or "{}"
-    except Exception:
+    except Exception as e:
         # 无法调用 LLM 时返回启发式评分
+        logger = logging.getLogger(__name__)
+        logger.warning("LLM-as-Judge 调用失败，降级为启发式评分 task_id=%s: %s",
+                        task_id, e)
         content = _heuristic_judge(task, report_text)
 
     # 4. 解析评分
@@ -259,8 +264,10 @@ def _parse_judge_response(content: str) -> JudgeScores:
             可读性=int(obj.get("可读性", 0)),
             客观性=int(obj.get("客观性", 0)),
         )
-    except (json.JSONDecodeError, ValueError):
-        pass
+    except (json.JSONDecodeError, ValueError) as e:
+        logger = logging.getLogger(__name__)
+        logger.warning("JSON 解析失败，降级为正则提取 content=%s error=%s",
+                       content[:200], e)
 
     # 兜底：正则逐字段提取
     try:

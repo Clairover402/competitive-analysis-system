@@ -317,6 +317,8 @@ class MemorySummarizer:
             for r in records:
                 if isinstance(r.get("summary_text"), str):
                     messages.append({"role": "summary", "content": r["summary_text"]})
-        except Exception:
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.exception("full_merge 摘要查询失败 task_id=%s count=%s", task_id, count)
             pass
         return messages

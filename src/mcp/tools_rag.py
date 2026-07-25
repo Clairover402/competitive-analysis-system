@@ -119,6 +119,14 @@ def _get_reranker_model(settings: Settings | None = None):
       - 每个 token 可以注意对方的每个 token → 全注意力
       - 相似度更准，但必须逐对计算 → 无法建索引 → 只适合精排 top_k
       - 速度 O(k)  where k = top_k (通常 10-60)
+
+    【L4 工程】为什么用 sentence_transformers 不用 FlagEmbedding.FlagReranker？
+    ------------------------------------------------------------
+    FlagEmbedding 1.4.0 与 transformers 5.12+ 不兼容：
+    XLMRobertaTokenizer.prepare_for_model() 在 transformers 5.x 中被移除，
+    导致 FlagReranker.compute_score() 运行时 AttributeError。
+    sentence_transformers.CrossEncoder 内部做了兼容层处理，
+    且是 HuggingFace 官方推荐的 cross-encoder 接口，API 更稳定。
     """
     global _reranker_model
 
@@ -128,12 +136,16 @@ def _get_reranker_model(settings: Settings | None = None):
     if settings is None:
         settings = Settings()
 
-    from FlagEmbedding import FlagReranker
+    from sentence_transformers import CrossEncoder
 
-    logger.info("Loading reranker model: %s", settings.reranker_model)
-    _reranker_model = FlagReranker(
+    logger.info(
+        "Loading reranker model (CrossEncoder): %s",
         settings.reranker_model,
-        use_fp16=settings.reranker_model != "cpu",
+    )
+    _reranker_model = CrossEncoder(
+        settings.reranker_model,
+        trust_remote_code=True,
+        device=settings.embedding_device,
     )
     return _reranker_model
 
@@ -249,13 +261,19 @@ async def rerank(
 
     try:
         model = _get_reranker_model(settings)
-        # Cross-encoder 输入格式：[query, doc] 逐一配对
         pairs = [[query, doc] for doc in documents]
-        scores = model.compute_score(pairs, normalize=True)
 
-        # scores 格式兼容：单个时是 float，多个时是 list[float]
-        if not isinstance(scores, list):
-            scores = [scores]
+        # CrossEncoder.predict() 返回原始 logits → sigmoid 归一化到 [0, 1]
+        # 【L4 工程】sigmoid 替代 normalize=True
+        # FlagReranker 旧版 normalize=True 内部做 sigmoid，
+        # CrossEncoder 需要手动做——效果完全等价
+        import numpy as np
+        raw_scores = model.predict(
+            pairs,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        scores = 1.0 / (1.0 + np.exp(-raw_scores))  # sigmoid → [0, 1]
 
         # 构建带排名的结果
         ranked = [

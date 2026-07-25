@@ -10,21 +10,14 @@ web_search / web_fetch 是 Collector Agent 的两只"手"。
 
 整个采集管线 = search → fetch → chunk → embed → index。
 
-【L4 工程考量】为什么选 DuckDuckGo 不用 Google/Bing API？
+【L4 工程考量】为什么选 cn.bing.com 不用 DuckDuckGo？
 ------------------------------------------------------------
-1) 零 API Key：不需要注册、不需要付费、不需要配额管理
-2) 无依赖：直接用 httpx 发 GET 请求 + 正则解析 HTML，不需要 SDK
-3) 稳定性：Google Custom Search API 有严格日配额限制 (100次/天免费)
-4) 隐私：DuckDuckGo 不追踪用户，对竞品分析场景无利益冲突
+1) 国内直连：cn.bing.com 在国内无需代理，零额外配置
+2) 零 API Key：HTML 抓取 + 正则解析，不需要注册、不需要配额管理
+3) 结果质量：Bing 中文搜索结果优于 DuckDuckGo
+4) 稳定性：微软中国站 CNB 解析规则稳定
 
-缺点：结果质量不如 Google，HTML 结构可能变化导致解析失败。
-     但这是"够用"方案——竞品分析不需要毫秒级新闻结果。
-
-面试官："HTML 解析用正则不怕崩溃？" 
-→ "会。DuckDuckGo 改版时正则匹配失效，需要维护。
-  生产级方案是 Playwright MCP（浏览器自动化），
-  但依赖重、速度慢。本项目用正则是最小可行方案，
-  在 DEVELOP_PLAN.md 的 Phase 8 预留了 Playwright 升级路径。"
+缺点：HTML 结构可能变化导致正则失效。生产级方案是 Playwright MCP。
 
 【L5 项目对标】
 这两个工具通过 MCPServer 注册后，Collector Agent 通过
@@ -34,6 +27,7 @@ Agent 不知道工具内部实现，只知道 schema。
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 
@@ -86,12 +80,15 @@ async def web_search(
         # httpx.AsyncClient 作为上下文管理，自动关闭连接
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query},
-                headers={"User-Agent": _BROWSER_UA},
+                "https://cn.bing.com/search",
+                params={"q": query, "ensearch": "0"},
+                headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                },
             )
             resp.raise_for_status()  # 4xx/5xx → HTTPStatusError
-            results = _parse_duckduckgo(resp.text, max_results)
+            results = _parse_bing(resp.text, max_results)
             logger.info("web_search: query=%r results=%d", query, len(results))
             return results
     except Exception:
@@ -141,9 +138,20 @@ async def web_fetch(
     }
 
     try:
+        # 【L4 工程】反反爬策略——不同域名使用不同的请求头
+        # - 百度百科 (baike.baidu.com)：要求 Referer 否则 403
+        # - 知乎/CSDN 等：需要 Accept-Language 否则可能返回移动端乱码
+        headers = {
+            "User-Agent": _BROWSER_UA,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        # 百度系域名必须带 Referer，否则直接拒绝访问（403 Forbidden）
+        if "baidu.com" in url or "baike.baidu.com" in url:
+            headers["Referer"] = "https://www.baidu.com/"
+
         async with httpx.AsyncClient(
             timeout=20.0,
-            headers={"User-Agent": _BROWSER_UA},
+            headers=headers,
             follow_redirects=True,   # 自动跟随重定向（301/302）
         ) as client:
             resp = await client.get(url)
@@ -165,12 +173,15 @@ async def web_fetch(
 
     except httpx.HTTPStatusError as e:
         # HTTP 错误（4xx/5xx）—— 返回状态码 + 描述
+        logger.warning("HTTP 错误 url=%s status=%s", url, e.response.status_code)
         result["error"] = f"HTTP {e.response.status_code}"
     except httpx.TimeoutException:
         # 超时 —— 单独标记，方便上游决策是否重试
+        logger.warning("请求超时 url=%s", url)
         result["error"] = "timeout"
     except Exception as e:
         # 其他异常（DNS 解析失败、连接重置等）
+        logger.warning("请求失败 url=%s error=%s", url, e)
         result["error"] = str(e)
 
     return result
@@ -181,38 +192,32 @@ async def web_fetch(
 # 选正则不用 BS4 —— 原因见上方 docstring 的【L4 工程】注释
 # ============================================================
 
-def _parse_duckduckgo(html: str, max_results: int) -> list[dict]:
-    """从 DuckDuckGo HTML 结果页提取搜索结果。
+def _parse_bing(html: str, max_results: int) -> list[dict]:
+    """从 cn.bing.com 搜索结果页提取搜索结果。
 
-    DuckDuckGo 的 HTML 版返回结构相对稳定：
-    每条结果包裹在 class="result results_links" 的 div 里，
-    内含 class="result__a"(标题链接) + class="result__snippet"(摘要)。
+    Bing 搜索结果结构（2025年7月）：
+    每条结果包裹在 class="b_algo" 的 li 标签内，
+    内含 <h2><a href="...">标题</a></h2> + <p class="b_lineclamp2">摘要</p>。
 
-    ⚠️ DuckDuckGo 改版时此解析可能失效——届时需更新正则。
-    但 DuckDuckGo HTML 版自 2018 年以来结构变化极小。
+    ⚠️ Bing 改版时此解析可能失效——届时需更新正则。
     """
     results: list[dict] = []
-    # 按 class="result results_links" 切分每条结果
-    blocks = re.split(r'class="result results_links', html)[1:]
+    blocks = re.split(r'class="b_algo"', html)[1:]
     for block in blocks[:max_results]:
-        # 分别提取标题、URL、摘要
-        title_m = re.search(
-            r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', block, re.S
-        )
-        url_m = re.search(r'class="result__url"[^>]*>(.*?)</', block)
-        snippet_m = re.search(
-            r'class="result__snippet"[^>]*>(.*?)</', block, re.S
-        )
+        # 提取标题链接 <h2>...<a href="URL">TITLE</a>...</h2>
+        h2_block = re.search(r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        # 提取摘要 <p class="b_lineclamp2">SNIPPET</p>
+        snippet_m = re.search(r'class="b_lineclamp\d*"[^>]*>(.*?)</p>', block, re.S)
 
-        title = _clean_html(title_m.group(1)) if title_m else ""
-        url_clean = _clean_html(url_m.group(1)) if url_m else ""
+        url = h2_block.group(1) if h2_block else ""
+        title = _clean_html(h2_block.group(2)) if h2_block else ""
         snippet = _clean_html(snippet_m.group(1)) if snippet_m else ""
 
-        # 至少有标题或 URL 才收录（过滤噪声）
-        if title or url_clean:
+        # 至少有标题或 URL 才收录
+        if title or url:
             results.append({
                 "title": title.strip(),
-                "url": url_clean.strip(),
+                "url": url.strip(),
                 "snippet": snippet.strip(),
             })
 
@@ -235,6 +240,7 @@ def _clean_html(text: str) -> str:
     text = text.replace("&gt;", ">")
     text = text.replace("&quot;", '"')
     text = text.replace("&#x27;", "'")
+    text = html.unescape(text)  # 解码 &#x738B; → 王 等 Unicode 实体
     return re.sub(r"\s+", " ", text)
 
 

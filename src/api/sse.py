@@ -87,6 +87,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -166,7 +167,7 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
     # 为什么不选 UUID → agent_logs 表 id 是 UUID，不保证插入顺序，
     #   后插入的 UUID 字典序可能更小，用 id > last_id 会漏日志
     # created_at 是 timestamptz，严格按物理时间递增 → 不会漏
-    last_created_at = "1970-01-01T00:00:00+00:00"
+    last_created_at = datetime(1970, 1, 1, tzinfo=timezone.utc)
     # 记录轮询开始时间——用于超时保护和 elapsed_ms 上报
     start_time = asyncio.get_running_loop().time()
 
@@ -213,7 +214,7 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
             for row in rows:
                 # 更新阅读位置到本条日志的时间戳
                 # 因为 ORDER BY created_at ASC，最后一条就是新的阅读位置
-                last_created_at = str(row["created_at"])
+                last_created_at = row["created_at"]
 
                 agent = row["agent_name"] or "unknown"
                 action = row["action"] or ""
@@ -257,7 +258,8 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
                     task_row = await conn.fetchrow(
                         "SELECT status FROM tasks WHERE id = $1", task_id
                     )
-            except Exception:
+            except Exception as e:
+                logger.warning("SSE 状态查询失败 task_id=%s: %s", task_id, e)
                 task_row = None
 
             if task_row:
@@ -276,7 +278,8 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
                                    LIMIT 1""",
                                 task_id,
                             )
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("SSE 报告查询失败 task_id=%s: %s", task_id, e)
                         report = None
 
                     data = {

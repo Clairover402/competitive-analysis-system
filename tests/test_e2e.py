@@ -61,6 +61,8 @@ except ImportError:
 # ═════════════════════════════════════════════════════════════════════════════
 
 _API_ONLINE: bool | None = None  # 缓存探测结果，避免每个用例都发一次请求
+_TOKEN: str | None = None  # 缓存 JWT token，避免每次注册
+_token_lock = asyncio.Lock()  # 防止并行测试同时注册，打爆频控
 
 
 async def _check_api_online() -> bool:
@@ -78,6 +80,56 @@ async def _check_api_online() -> bool:
     except Exception:
         _API_ONLINE = False
         return False
+
+
+async def _get_token() -> str:
+    """获取 JWT token。注册测试用户 + 登录，结果缓存。加锁防止并行测试打爆频控。"""
+    global _TOKEN
+    if _TOKEN is not None:
+        return _TOKEN
+
+    async with _token_lock:
+        # 双重检查：锁内可能已被其他协程填充
+        if _TOKEN is not None:
+            return _TOKEN
+
+        async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=10.0) as client:
+            # 先注册（可能已注册过 → 409 可接受，429 需重试）
+            for attempt in range(5):
+                resp = await client.post("/api/auth/register", json={
+                    "username": "e2e_test_user",
+                    "password": "E2eTest123!",
+                    "email": "e2e@test.local",
+                })
+                if resp.status_code == 429:
+                    await asyncio.sleep(2)  # 频控等待
+                    continue
+                break
+
+            # 登录获取 token（429 也重试）
+            for attempt in range(5):
+                resp = await client.post("/api/auth/login", json={
+                    "username": "e2e_test_user",
+                    "password": "E2eTest123!",
+                })
+                if resp.status_code == 429:
+                    await asyncio.sleep(2)
+                    continue
+                data = resp.json()
+                _TOKEN = data["token"]
+                return _TOKEN
+
+        raise RuntimeError("无法获取 JWT token（频控或 auth 服务异常）")
+
+
+async def _auth_client() -> httpx.AsyncClient:
+    """创建带 Authorization header 的 httpx 客户端。"""
+    token = await _get_token()
+    return httpx.AsyncClient(
+        base_url="http://localhost:8000",
+        timeout=10.0,
+        headers={"Authorization": f"Bearer {token}"},
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -113,7 +165,7 @@ async def test_create_task_validation():
     """E2E-3: 参数校验——空 body 返回 422。"""
     if not await _check_api_online():
         pytest.skip("API 服务未启动")
-    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=10.0) as client:
+    async with await _auth_client() as client:
         resp = await client.post("/api/tasks", json={})
         assert resp.status_code == 422
 
@@ -123,7 +175,7 @@ async def test_create_task_pipeline():
     """E2E-4: Pipeline 模式——创建有竞品的任务，返回 202。"""
     if not await _check_api_online():
         pytest.skip("API 服务未启动")
-    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=10.0) as client:
+    async with await _auth_client() as client:
         resp = await client.post("/api/tasks", json={
             "title": "E2E 测试 — 飞书 vs 钉钉",
             "competitors": ["飞书", "钉钉"],
@@ -140,7 +192,7 @@ async def test_create_task_supervisor():
     """E2E-5: Supervisor 探索模式——无竞品走 IntentRouter Supervisor 路径。"""
     if not await _check_api_online():
         pytest.skip("API 服务未启动")
-    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=10.0) as client:
+    async with await _auth_client() as client:
         resp = await client.post("/api/tasks", json={
             "title": "E2E 测试 — 协同办公领域有哪些产品？",
             "competitors": [],
@@ -157,7 +209,7 @@ async def test_get_nonexistent_task():
     """E2E-6: 查询不存在的任务返回 404。"""
     if not await _check_api_online():
         pytest.skip("API 服务未启动")
-    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=10.0) as client:
+    async with await _auth_client() as client:
         resp = await client.get("/api/tasks/00000000-0000-0000-0000-000000000000")
         assert resp.status_code == 404
 
