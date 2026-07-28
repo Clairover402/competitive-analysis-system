@@ -1,0 +1,14 @@
+{
+  "name": "competitive-analysis-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "竞品分析系统前端 — 8-bit 像素风格 SPA",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

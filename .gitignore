@@ -20,3 +20,9 @@ CACHEDIR.TAG
 .lock
 .DS_Store
 Thumbs.db
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/_vite_err.txt
+frontend/_vite_out.txt
