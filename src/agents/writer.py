@@ -146,6 +146,19 @@ async def writer_agent(
 
     t0 = time.perf_counter()
 
+    # ── ✏️ 输入日志 ──
+    analysis_snippet = {}
+    for dim_name, comp_data in analysis_results.items():
+        analysis_snippet[dim_name] = {
+            k: f"{len(str(v))}字符" for k, v in comp_data.items()
+        }
+    logger.info(
+        "【Writer】开始 task=%s 标题=%r 竞品=%s 维度=%s rewrite=%s 分析数据=%s",
+        task_id, title,
+        ",".join(competitors), ",".join(dimensions),
+        bool(rewrite_suggestions), analysis_snippet,
+    )
+
     # 格式化分析结果为 JSON 字符串
     # 【L4 工程】ensure_ascii=False + indent=2
     # 让中文原样输出（不入为 \\u-escape），带缩进方便 LLM 理解结构
@@ -156,7 +169,32 @@ async def writer_agent(
     # 这样初写报告和改写报告用的是同一套 prompt，避免了维护两套模板
     suggestions_str = ""
     if rewrite_suggestions:
-        suggestions_str = "改写作要求:\n" + "\n".join(f"- {s}" for s in rewrite_suggestions)
+        # ── 构建完整的改写指引 ──
+        # 【2026-07-27 修复】之前的 prompt 只有 rewrite_suggestions
+        # （LLM 随口说的"补引用""精简概述"），Writer 不知道具体哪里扣了分。
+        # 现在把 Quality 的维度级评分+评语一起传给 Writer，
+        # 让它知道：完整性 42 分（漏了维度X）、可追溯性 30 分（3处缺source_url）。
+        prev_quality = task.get("previous_quality", {})
+        prev_score = prev_quality.get("overall_score", 0)
+        prev_dims = prev_quality.get("dimensions", {})
+
+        lines = []
+        lines.append("## ⚠️ 上一版质量评分: %.0f/100（不通过，阈值 70）" % prev_score)
+        lines.append("")
+        lines.append("### 各维度评分明细（请针对性修正）：")
+        for dim_name in ("完整性", "准确性", "可追溯性", "可读性", "客观性"):
+            info = prev_dims.get(dim_name, {})
+            score = info.get("score", "?")
+            comment = info.get("comment", "")
+            lines.append(f"- {dim_name}: {score}/100 — {comment}")
+        lines.append("")
+        lines.append("### 修正要求：")
+        for s in rewrite_suggestions:
+            lines.append(f"- {s}")
+        lines.append("")
+        lines.append("请针对以上每个维度的问题逐一修正，确保修正后 overall_score >= 70。")
+
+        suggestions_str = "\n".join(lines)
 
     prompt = _WRITER_PROMPT % (
         title,
@@ -176,16 +214,21 @@ async def writer_agent(
         action="generate_report",
         request={
             "title": title,
-            "rewrite": bool(rewrite_suggestions),  # 标记是否为改写
+            "rewrite": bool(rewrite_suggestions),
         },
-        response={"report_length": len(report)},
+        response={
+            "report_length": len(report),
+            "rewrite": bool(rewrite_suggestions),
+        },
         duration_ms=round(duration_ms, 1),
     )
 
+    # ── ✏️ 输出日志 ──
     logger.info(
-        "Writer done: %d chars in %.0fms%s",
+        "【Writer】完成 task=%s report=%d字符 耗时%.0fms%s",
+        task_id,
         len(report),
         duration_ms,
-        " (rewrite)" if rewrite_suggestions else "",
+        " (改写)" if rewrite_suggestions else "",
     )
     return {"report_markdown": report}

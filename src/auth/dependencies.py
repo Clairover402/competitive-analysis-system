@@ -49,10 +49,13 @@ async def get_current_user(
 ) -> CurrentUser:
     """从请求中提取 JWT 并解析当前用户。
 
-    鉴权链：
-      1. 检查 Authorization header → 缺失 → 401
-      2. 解码 JWT → 过期/签名错误 → 401
-      3. 提取 user_id + username → 注入 CurrentUser
+    鉴权链（按优先级）：
+      1. Authorization: Bearer <token> header → 标准 HTTP 鉴权
+      2. ?token=xxx URL query parameter → SSE 场景的降级方案
+         （EventSource API 不支持自定义 HTTP Header，只能走 URL 传 token）
+      3. 都没有 → 401
+
+    然后：解码 JWT → 过期/签名错误 → 401 → 提取 user_id + username
 
     【L4 工程】鉴权失败统一返回 401：
       — 不区分"token 缺失"和"token 过期"（避免信息泄露）
@@ -61,14 +64,22 @@ async def get_current_user(
     Raises:
         HTTPException 401: 未认证
     """
-    if credentials is None:
+    # ── 优先 Authorization header，降级 URL query token（SSE）──
+    token: str | None = None
+    if credentials is not None:
+        token = credentials.credentials
+    else:
+        # EventSource 不支持自定义 header，token 走 URL query
+        token = request.query_params.get("token")
+
+    if not token:
         raise HTTPException(status_code=401, detail="未提供认证令牌")
 
     settings: Settings = request.app.state.settings
 
     try:
         payload = jwt.decode(
-            credentials.credentials,
+            token,
             settings.jwt_secret,
             algorithms=["HS256"],
         )

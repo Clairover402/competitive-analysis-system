@@ -308,6 +308,14 @@ async def analyzer_agent(
 
     t0 = time.perf_counter()
 
+    # ── ✏️ 输入日志 ──
+    logger.info(
+        "【Analyzer】开始 task=%s 竞品=%d个(%s) 维度=%d个(%s)",
+        task_id,
+        len(competitors), ",".join(competitors),
+        len(dimensions), ",".join(dimensions),
+    )
+
     # ─── 所有维度并行分析 ───
     # 【L4 工程】asyncio.gather(*tasks, return_exceptions=True)
     # 关键参数 return_exceptions=True：
@@ -334,46 +342,51 @@ async def analyzer_agent(
             logger.exception("Dimension %r raised exception", dim)
             analysis_results[dim] = {c: f"[分析失败] {result}" for c in competitors}
         elif isinstance(result, dict) and "error" in result:
-            analysis_results[dim] = {c: f"[分析失败] {result["error"]}" for c in competitors}
+            analysis_results[dim] = {c: f"[分析失败] {result['error']}" for c in competitors}
         elif isinstance(result, dict):
             analysis_results[dim] = result
         else:
             analysis_results[dim] = {c: "[分析失败] 未知错误" for c in competitors}
 
     duration_ms = (time.perf_counter() - t0) * 1000
+    # ── 构建 per-dimension 详情（与控制台日志对齐）──
+    per_dimension = {}
+    for dim_name, comp_analyses in analysis_results.items():
+        analyzed_comps = [c for c, text in comp_analyses.items() if not str(text).startswith("[分析失败]") and not str(text).startswith("[数据不足]")]
+        per_dimension[dim_name] = {
+            "competitors_analyzed": len(analyzed_comps),
+            "has_data": len(analyzed_comps) > 0,
+        }
     await log_dao.log(
         task_id=task_id,
         agent_name="analyzer",
         action="multi_dimension_analysis",
         request={"competitors": competitors, "dimensions": dimensions},
-        response={"dimensions_analyzed": list(analysis_results.keys())},
+        response={
+            "dimensions_analyzed": list(analysis_results.keys()),
+            "dimensions_count": len(dimensions),
+            "dimension_names": dimensions,
+            "per_dimension": per_dimension,
+        },
         duration_ms=round(duration_ms, 1),
     )
 
-    logger.info("Analyzer done: %d dimensions in %.0fms", len(dimensions), duration_ms)
-
-
-    """
-    analysis_results 输出格式：
-    
-    {
-      "定价策略": {
-        "飞书": "企业版¥200/人/月，商业版¥50/人/月，2025年Q1降至¥180/人/月（来源: https://feishu.cn/pricing）",
-        "钉钉": "专业版¥180/人/年，专属版¥9800/年（来源: https://dingtalk.com/price）",
-        "企业微信": "基础功能免费，高级功能按需付费，具体价格未公开[待验证]（来源: https://work.weixin.qq.com）",
-        "Teams": "$4/用户/月，含OneDrive 1TB（来源: https://microsoft.com/teams/pricing）",
-        "Slack": "$7.25/用户/月（来源: https://slack.com/pricing）"
-      },
-      "功能对比": {
-        "飞书": "支持500人视频会议+无限云空间+多维表格...",
-        "钉钉": "...",
-        ...
-      },
-      "技术架构": {
-        ...
-      }
-    }
-
-    """
+    # ── ✏️ 输出日志：每个维度的分析长度 ──
+    output_lines = []
+    for dim_name, comp_analyses in analysis_results.items():
+        snippet = {}
+        for c, text in comp_analyses.items():
+            # LLM 返回的值可能是字符串、dict 或非字符串
+            # 统一转为 str 再截取，避免切片 dict 引发的 KeyError
+            text_str = str(text)
+            snippet[c] = f"{len(text_str)}字符 / 前30字: {text_str[:30]}..."
+        output_lines.append(f"  {dim_name}: {snippet}")
+    logger.info(
+        "【Analyzer】完成 task=%s %d维度 耗时%.0fms\n%s",
+        task_id,
+        len(dimensions),
+        duration_ms,
+        "\n".join(output_lines),
+    )
 
     return analysis_results

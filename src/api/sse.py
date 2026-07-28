@@ -219,7 +219,8 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
                 agent = row["agent_name"] or "unknown"
                 action = row["action"] or ""
                 error_msg = row["error"]
-                response = row["response"]
+                response = _normalize_response(row["response"])
+                duration_ms = row["duration_ms"]
 
                 if error_msg:
                     # ── 错误日志 → 带 error=true 的 progress 事件 ──
@@ -233,12 +234,13 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
                             "action": action,
                             "message": message,
                             "progress_pct": progress,
+                            "duration_ms": duration_ms,
                             "error": True,
                         }, ensure_ascii=False),
                     }
                 else:
                     # ── 正常日志 → 标准 progress 事件 ──
-                    message = _format_progress_message(agent, action, response)
+                    message = _format_progress_message(agent, action, response, duration_ms)
                     progress = _estimate_progress(agent)
                     yield {
                         "event": "progress",
@@ -247,6 +249,7 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
                             "action": action,
                             "message": message,
                             "progress_pct": progress,
+                            "duration_ms": duration_ms,
                         }, ensure_ascii=False),
                     }
 
@@ -329,73 +332,154 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
         return
 
 
-def _format_progress_message(agent: str, action: str, response: dict | None) -> str:
-    """根据 agent + action 构造可读的中文进度消息。
+def _normalize_response(raw: object) -> dict | None:
+    """将 asyncpg 返回的 response 字段统一转为 dict。
 
-    【映射逻辑 — agent + action → 用户可见消息】
+    asyncpg 的 JSONB 行为因 codec 版本而异：
+    — 有 codec → 直接返回 dict
+    — 无 codec → 返回 JSON 字符串
+    — NULL → None
 
-    ┌──────────────┬─────────────────────┬──────────────────────────┐
-    │ agent        │ action               │ 消息文本                   │
-    ├──────────────┼─────────────────────┼──────────────────────────┤
-    │ collector    │ web_search           │ 正在搜索竞品相关信息...     │
-    │ collector    │ web_fetch            │ 正在抓取数据源...           │
-    │ collector    │ embed_texts          │ 正在向量化文本...           │
-    │ collector    │ collect              │ 正在采集竞品数据...         │
-    │ analyzer     │ analyze              │ 正在多维度分析竞品...       │
-    │ analyzer     │ rag_retrieve         │ 正在检索相关片段...         │
-    │ writer       │ write                │ 正在生成分析报告...         │
-    │ writer       │ rewrite              │ 正在根据反馈重写报告...     │
-    │ quality      │ grade                │ 正在质检报告...             │
-    │ quality      │ evaluate             │ 正在评估报告质量...         │
-    │ supervisor   │ think                │ Supervisor 正在决策下一步... │
-    │ supervisor   │ delegate             │ Supervisor 正在分配任务...  │
-    │ (其他)       │ (其他)               │ "agent: 正在执行 action"    │
-    └──────────────┴─────────────────────┴──────────────────────────┘
+    这个函数确保 _format_progress_message 收到的永远是 dict | None，
+    而不是 str。否则 .get() 会在字符串上触发 AttributeError。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        import json
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def _format_progress_message(
+    agent: str,
+    action: str,
+    response: dict | None,
+    duration_ms: float | None = None,
+) -> str:
+    """根据 agent + action + response 数据构造详细的中文进度消息。
+
+    【设计思路】参考控制台日志的详细程度，将 response 中的结构化数据
+    转为可读的用户消息。每条消息包含：动作摘要 + 关键数据指标 + 耗时。
 
     【前端展示效果】
-    Timeline 风格进度列表，类似：
-      ✓ 正在搜索竞品相关信息...
-      ✓ 正在多维度分析竞品...
-      ⟳ 正在生成分析报告...
-      ⏳ 等待质检...
-    ⟳ = 当前进行中，✓ = 已完成，⏳ = 等待中
+      🟢 Collector 采集完成: 3竞品 15页面 42片段 · 3.2秒
+      🟡 Analyzer 分析完成: 5维度(定价/功能/...) · 4.5秒
+      🔵 Writer  报告生成: 3,200字符 · 1.2秒
+      🟣 Quality 质检评分: 82.5分 ✅通过 · 0.8秒
 
     Args:
         agent: collector / analyzer / writer / quality / supervisor
-        action: web_search / web_fetch / analyze / write / grade 等
-        response: Agent 响应 JSONB（当前版本未使用，预留扩展——
-                  未来可根据 response 中的 result_count / token_used 补充更详细的消息）
+        action: 具体 action 名
+        response: Agent 响应 JSONB，包含该 Agent 执行结果的结构化数据
+        duration_ms: 执行耗时（毫秒）
 
     Returns:
-        中文进度消息，如 "正在采集竞品数据..."
+        详细的中文进度消息，如 "Collector 采集完成: 3竞品 15页面 42片段 · 3.2秒"
     """
-    # ── agent + action 双键映射表 ──
-    # 双层 dict：第一层按 agent 名，第二层按 action 名，确定唯一消息
-    agent_messages: dict[str, dict[str, str]] = {
-        "collector": {
-            "web_search": "正在搜索竞品相关信息...",
-            "web_fetch": "正在抓取数据源...",
-            "embed_texts": "正在向量化文本...",
-            "collect": "正在采集竞品数据...",
-        },
-        "analyzer": {
-            "analyze": "正在多维度分析竞品...",
-            "rag_retrieve": "正在检索相关片段...",
-        },
-        "writer": {
-            "write": "正在生成分析报告...",
-            "rewrite": "正在根据反馈重写报告...",
-        },
-        "quality": {
-            "grade": "正在质检报告...",
-            "evaluate": "正在评估报告质量...",
-        },
-        "supervisor": {
-            "think": "Supervisor 正在决策下一步...",
-            "delegate": "Supervisor 正在分配任务...",
-        },
-    }
+    if response is None:
+        response = {}
 
-    default_msgs = agent_messages.get(agent, {})
-    message = default_msgs.get(action, f"{agent}: 正在执行 {action}")
-    return message
+    # ── 耗时格式化 ──
+    time_str = ""
+    if duration_ms is not None:
+        if duration_ms >= 1000:
+            time_str = f" · {duration_ms / 1000:.1f}秒"
+        else:
+            time_str = f" · {duration_ms:.0f}毫秒"
+
+    # ═══════════════════════════════════════════════════════════
+    # Collector: 采集阶段
+    # ═══════════════════════════════════════════════════════════
+    if agent == "collector":
+        if action == "collect_and_store":
+            total_pages = response.get("total_pages", 0)
+            total_chunks = response.get("total_chunks", 0)
+            competitors_count = response.get("competitors_count", 0)
+            # per-competitor details
+            comp_details = response.get("per_competitor", {})
+            comp_parts = []
+            for comp_name, info in sorted(comp_details.items()):
+                pages = info.get("pages", 0)
+                chunks = info.get("chunks", 0)
+                comp_parts.append(f"{comp_name}({pages}页/{chunks}段)")
+            detail = "、".join(comp_parts) if comp_parts else f"{total_pages}页面 {total_chunks}片段"
+            return f"✅ Collector 采集完成: {competitors_count}竞品 → {detail}{time_str}"
+        return f"Collector: {action}{time_str}"
+
+    # ═══════════════════════════════════════════════════════════
+    # Analyzer: 分析阶段
+    # ═══════════════════════════════════════════════════════════
+    if agent == "analyzer":
+        if action == "multi_dimension_analysis":
+            dims = response.get("dimensions_analyzed", [])
+            dim_count = response.get("dimensions_count", len(dims))
+            dim_names = response.get("dimension_names", dims)
+            dims_short = "、".join(dim_names[:5])
+            if len(dim_names) > 5:
+                dims_short += f"等{len(dim_names)}个"
+            # per-dimension detail snippet
+            dim_details = response.get("per_dimension", {})
+            if dim_details:
+                snippets = []
+                for dname, info in list(dim_details.items())[:3]:
+                    comps = info.get("competitors_analyzed", 0)
+                    data_flag = info.get("has_data", True)
+                    flag = "" if data_flag else " [数据不足]"
+                    snippets.append(f"{dname}({comps}竞品{flag})")
+                dims_short = "、".join(snippets)
+            return f"✅ Analyzer 分析完成: {dim_count}维度 → {dims_short}{time_str}"
+        return f"Analyzer: {action}{time_str}"
+
+    # ═══════════════════════════════════════════════════════════
+    # Writer: 撰写阶段
+    # ═══════════════════════════════════════════════════════════
+    if agent == "writer":
+        if action == "generate_report":
+            report_len = response.get("report_length", 0)
+            is_rewrite = response.get("rewrite", False)
+            prefix = "🔄 Writer 改写完成" if is_rewrite else "✅ Writer 报告生成"
+            return f"{prefix}: {report_len:,}字符{time_str}"
+        return f"Writer: {action}{time_str}"
+
+    # ═══════════════════════════════════════════════════════════
+    # Quality: 质检阶段
+    # ═══════════════════════════════════════════════════════════
+    if agent == "quality":
+        if action == "judge_report":
+            score = response.get("score", 0)
+            passed = response.get("passed", False)
+            dim_scores = response.get("dimension_scores", {})
+            # 维度评分明细
+            if dim_scores:
+                score_parts = [f"{d}={s}分" for d, s in dim_scores.items()]
+                score_detail = " | ".join(score_parts[:5])
+            else:
+                score_detail = ""
+            status = "✅通过" if passed else "❌不通过(需重写)"
+            msg = f"✅ Quality 质检评分: {score:.1f}分 {status}"
+            if score_detail:
+                msg += f" | {score_detail}"
+            return f"{msg}{time_str}"
+        return f"Quality: {action}{time_str}"
+
+    # ═══════════════════════════════════════════════════════════
+    # Supervisor: 调度阶段
+    # ═══════════════════════════════════════════════════════════
+    if agent == "supervisor":
+        if action == "route":
+            route_to = response.get("route", "?")
+            reason = response.get("reason", "")
+            detail = f" → {route_to}"
+            if reason:
+                detail += f" ({reason})"
+            return f"🧠 Supervisor 路由决策{detail}{time_str}"
+        return f"Supervisor: {action}{time_str}"
+
+    # ── 通用兜底 ──
+    return f"{agent}: {action}{time_str}"

@@ -163,6 +163,13 @@ def setup_logging(level: int = logging.INFO) -> BoundLogger:
     root = logging.getLogger("competitive_analysis")
     root.setLevel(level)
 
+    # 修复 Windows 控制台 GBK 编码导致中文日志乱码
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     # 避免重复添加 handler（多次调用 setup_logging 时）
     if not root.handlers:
         handler = logging.StreamHandler(sys.stdout)

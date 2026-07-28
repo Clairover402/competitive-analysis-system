@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -153,7 +154,26 @@ def _parse_jsonb(value: object) -> dict | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """管理连接池和路由器的生命周期。
+    """管理全局共享依赖的生命周期——启动时构建一次，所有任务复用。
+
+    【L4 工程】为什么 build 在 lifespan 而非每次请求？
+    ────────────────────────────────────────────────
+    之前每次 POST /api/tasks 都会：
+      — create_llm_client() × 9（每次建 HTTP Client）
+      — build_pipeline_graph() → compile()（遍历图拓扑 + 绑定 checkpointer）
+      — PostgresSaver.setup()（CREATE TABLE IF NOT EXISTS，幂等但每次查 PG）
+      — A2ARouter.register() × 4（注册 AgentCard + handler）
+      — _setup_dependencies() 重建整个依赖树
+
+    根治后：所有一次性构建操作只在 lifespan 启动时执行一次。
+    任务创建时只做 graph.ainvoke(initial_state, config)——纯执行，零初始化。
+
+    共享安全：
+      — LLM Client (ChatDeepSeek)：无状态 HTTP Client，实例级线程安全
+      — MCP Server：只读工具能力，不持有任务状态
+      — A2ARouter：注册表是启动时静态快照，运行时只读查询
+      — CompiledStateGraph：任务隔离靠 config["thread_id"]，不是图实例
+      — LongTermMemoryEngine：user_id 参数化，引擎本身是 DB+LLM 的无状态包装
 
     【L4 工程】lifespan 替代 @app.on_event("startup")
     — FastAPI 从 0.93 开始推荐 lifespan（支持 async context manager）
@@ -176,12 +196,67 @@ async def lifespan(app: FastAPI):
     # ── 自定义日志器 ──
     app.state.log = BoundLogger(logger)
 
-    # ── IntentRouter 延迟导入（避免循环引用） ──
-    # 只在 lifespan 中导入一次，不在模块顶层导入
+    # ── MCP Server + 连接池（全局单例）──
+    from src.mcp import create_mcp_server
+    mcp_server = create_mcp_server(settings)
+    app.state.mcp_server = mcp_server
+
+    # ── Pipeline 图（预编译，所有 Pipeline 任务复用）──
+    from src.pipeline.graph import build_pipeline_graph
+    logger.info("正在构建 Pipeline 图（LLM × 4 + PostgresSaver + 记忆引擎）...")
+    pipeline_graph = await build_pipeline_graph(mcp_server, pool)
+    app.state.pipeline_graph = pipeline_graph
+    logger.info("Pipeline 图编译完成 ✅")
+
+    # ── Supervisor 图（预编译，所有 Supervisor 任务复用）──
+    from src.supervisor.supervisor import build_supervisor_graph
+    from src.supervisor.a2a import A2ARouter, create_agent_cards
+    from src.harness import HarnessGuard
+    from src.agents import (
+        collector_agent, analyzer_agent, writer_agent, quality_agent,
+        create_llm_client,
+    )
+
+    # A2ARouter（注册 4 个 AgentCard + handler + 专属温度 LLM）
+    guard = HarnessGuard(pool)
+    a2a_router = A2ARouter(mcp_server, harness=guard)
+    cards = create_agent_cards()
+
+    llm_collector = create_llm_client(settings, temperature=0.3)
+    llm_analyzer = create_llm_client(settings, temperature=0.1)
+    llm_writer = create_llm_client(settings, temperature=0.3)
+    llm_quality = create_llm_client(settings, temperature=0.0)
+
+    handlers = {
+        "collector": (collector_agent, llm_collector),
+        "analyzer": (analyzer_agent, llm_analyzer),
+        "writer": (writer_agent, llm_writer),
+        "quality": (quality_agent, llm_quality),
+    }
+    for name, card in cards.items():
+        handler, llm = handlers[name]
+        a2a_router.register(card, handler, llm)
+
+    llm_supervisor = create_llm_client(settings, temperature=0.3)
+
+    logger.info("正在构建 Supervisor 图（think→act→observe→route 闭环）...")
+    supervisor_graph = await build_supervisor_graph(
+        mcp_server=mcp_server,
+        pool=pool,
+        router=a2a_router,
+        llm_supervisor=llm_supervisor,
+    )
+    app.state.supervisor_graph = supervisor_graph
+    logger.info("Supervisor 图编译完成 ✅")
+
+    # ── IntentRouter（纯路由决策，不持有依赖）──
     from src.supervisor.router import IntentRouter
     app.state.router = IntentRouter(settings)
 
-    logger.info("竞品分析系统启动完成, DB pool: min=2, max=10")
+    logger.info(
+        "竞品分析系统启动完成 | DB pool: min=2 max=10 | "
+        "Pipeline ✅ | Supervisor ✅ | A2A 4Agent ✅"
+    )
 
     yield
 
@@ -201,15 +276,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── CORS 中间件（前后端分离 — 允许前端开发服务器跨域）──
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ── 注册认证路由（公开，无需 JWT）──
 app.include_router(auth_router)
-
-# ── 静态文件（登录页）──
-from fastapi.staticfiles import StaticFiles
-import os
-_static_dir = os.path.join(os.path.dirname(__file__), "..", "..", "static")
-if os.path.isdir(_static_dir):
-    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -226,16 +303,6 @@ def _get_pool(request: Request) -> Pool:
     if pool is None:
         raise HTTPException(500, "数据库连接池未初始化")
     return pool
-
-
-def _get_router(request: Request):
-    """从请求上下文获取 IntentRouter 实例。"""
-    from src.supervisor.router import IntentRouter
-
-    router = request.app.state.router
-    if router is None:
-        raise HTTPException(500, "路由器未初始化")
-    return router
 
 
 def _make_task_dict(
@@ -262,21 +329,37 @@ async def _execute_task(
     llm_parsed: dict,
     request: Request,
 ) -> None:
-    """后台执行任务——IntentRouter 全链路。
+    """后台执行任务——从 app.state 复用预编译图，零初始化。
 
-    【L4 工程】步骤：
+    【L4 工程】根治架构债务：
+    之前每次都调 router.route() → _setup_dependencies() → build_*_graph()
+    → 每任务创建 9 个 LLM Client + 编译 2 张 StateGraph。
+    根治后：所有一次性构建在 lifespan 启动时完成，任务创建时
+    直接从 app.state 拿预编译图 → graph.ainvoke()，纯执行。
+
+    步骤：
     1. 更新任务状态 → running
-    2. 调用 IntentRouter.route(task, llm_parsed)
-    3. 根据路由结果 → 分发到 Pipeline 或 Supervisor 引擎
+    2. IntentRouter.classify() → 纯函数路由决策（零 LLM，0ms）
+    3. 从 app.state 拿对应预编译图 → graph.ainvoke()
     4. 更新任务状态 → completed / failed
     5. 记录 Prometheus 指标
-
-    ⚠️ 不修改现有模块——只包装调用 + 指标采集。
     """
     pool = _get_pool(request)
-    router = _get_router(request)
     task_id_str = str(task_id)
     started_at = time.monotonic()
+
+    # ── 路由决策（纯函数，零 LLM 调用）──
+    from src.supervisor.router import IntentRouter
+    route_type = IntentRouter.classify(llm_parsed)
+
+    # ── 丰富 task ──
+    enriched_task = {
+        "id": task.get("id", task_id_str),
+        "title": task.get("title", "竞品分析"),
+        "user_id": task.get("user_id", "default"),
+        "competitors": llm_parsed.get("competitors", []),
+        "dimensions": llm_parsed.get("dimensions", []),
+    }
 
     try:
         # ── 1. 标记 running ──
@@ -284,20 +367,94 @@ async def _execute_task(
         await task_dao.update_status(task_id_str, "running")
         record_task_started()
 
-        # ── 2. 执行路由 + 引擎 ──
-        result = await router.route(task, llm_parsed)
+        # ── 2. 从 app.state 拿预编译图 → 直接执行 ──
+        if route_type == "pipeline":
+            graph = request.app.state.pipeline_graph
+            initial_state = {
+                "task_id": enriched_task["id"],
+                "title": enriched_task["title"],
+                "user_id": enriched_task["user_id"],
+                "competitors": enriched_task["competitors"],
+                "dimensions": enriched_task["dimensions"],
+                "pipeline_mode": "pipeline",
+                "collected_data": {},
+                "analysis_results": {},
+                "report_content": "",
+                "report_version": 0,
+                "quality_score": 0.0,
+                "quality_details": {},
+                "quality_passed": False,
+                "rewrite_suggestions": [],
+                "messages": [],
+                "remaining_steps": 3,
+                "final_report": "",
+            }
+            config = {"configurable": {"thread_id": f"pipeline-{enriched_task['id']}"}}
+            final_state = await graph.ainvoke(initial_state, config)
+            result = {
+                "task_id": enriched_task["id"],
+                "final_report": final_state.get("final_report", ""),
+                "quality_score": final_state.get("quality_score", 0.0),
+            }
+        else:
+            graph = request.app.state.supervisor_graph
+            initial_state = {
+                # §1 任务元信息
+                "task_id": enriched_task["id"],
+                "title": enriched_task["title"],
+                "user_id": enriched_task["user_id"],
+                "user_query": enriched_task["title"],
+                # §2 探索结果（初始为空，ReAct 循环动态填充）
+                "found_competitors": enriched_task["competitors"],
+                "collected_data": {},
+                "analysis_results": {},
+                "report_content": "",
+                # §3 质量（初始为 0/空）
+                "quality_score": 0.0,
+                "quality_passed": False,
+                "rewrite_suggestions": [],
+                # §4 控制
+                "current_round": 1,
+                "max_rounds": 10,
+                "reasoning_trace": [],
+                "messages_buffer": [],
+                # §5 终止
+                "final_output": "",
+                "is_complete": False,
+                # §6 中间字段（初始为空）
+                "pending_decision": {},
+                "pending_task_result": {},
+                "pending_task_agent": "",
+                "pending_task_status": "",
+            }
+            config = {"configurable": {"thread_id": f"supervisor-{enriched_task['id']}"}}
+            final_state = await graph.ainvoke(initial_state, config)
+            result = {
+                "task_id": enriched_task["id"],
+                "final_output": final_state.get("final_output", ""),
+                "quality_score": final_state.get("quality_score", 0.0),
+                "is_complete": final_state.get("is_complete", False),
+            }
 
         # ── 3. 检查执行结果 ──
-        # IntentRouter.route() 即使失败也返回 dict（含 "error" 字段），
-        # 不抛异常。必须检查 error 字段，否则静默标 completed。
-        if "error" in result:
+        # Pipeline 失败信号: final_report 为空（节点异常被 catch 后不赋值）
+        # Supervisor 失败信号: !is_complete（ReAct 未正常终止，如 LLM 反复失败）
+        pipeline_failed = (
+            route_type == "pipeline"
+            and not final_state.get("final_report", "")
+        )
+        supervisor_failed = (
+            route_type == "supervisor"
+            and not final_state.get("is_complete", False)
+        )
+        if pipeline_failed or supervisor_failed:
             await task_dao.update_status(task_id_str, "failed")
             elapsed = time.monotonic() - started_at
             record_task_failed()
             request.app.state.log.bind(
                 task_id=task_id_str[:8]
             ).error("任务执行失败", extra={
-                "error": result["error"],
+                "route": route_type,
                 "elapsed_ms": int(elapsed * 1000),
             })
             return
@@ -305,23 +462,21 @@ async def _execute_task(
         # ── 4. 标记 completed ──
         await task_dao.update_status(task_id_str, "completed")
         elapsed = time.monotonic() - started_at
-        route = result.get("route", "pipeline")
-        record_task_completed(route, elapsed)
+        record_task_completed(route_type, elapsed)
 
         request.app.state.log.bind(
             task_id=task_id_str[:8]
         ).info("任务完成", extra={
-            "route": route,
+            "route": route_type,
             "elapsed_ms": int(elapsed * 1000),
         })
 
     except Exception as e:
-        # ── 4. 标记 failed ──
+        # ── 标记 failed ──
         try:
             task_dao = TaskDAO(pool)
             await task_dao.update_status(task_id_str, "failed")
         except Exception as db_err:
-            logger = logging.getLogger(__name__)
             logger.exception(
                 "标记失败状态时 DB 写入也失败了 task_id=%s", task_id_str[:8],
                 exc_info=True,
@@ -329,7 +484,6 @@ async def _execute_task(
 
         record_task_failed()
         elapsed = time.monotonic() - started_at
-        logger = logging.getLogger(__name__)
         logger.exception("任务失败 task_id=%s elapsed=%.0fms",
                           task_id_str[:8], elapsed * 1000)
 

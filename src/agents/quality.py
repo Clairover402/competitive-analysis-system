@@ -98,6 +98,13 @@ _QUALITY_PROMPT = """你是报告质量评审专家。对以下竞品分析报�
 通过阈值: overall_score >= 70
 不通过必须提供至少 2 条 rewrite_suggestions。
 
+【重要】rewrite_suggestions 必须是具体可执行的修改指令，格式：
+  维度名 | 问题 | 修改建议
+示例：
+  - 可追溯性 | 企业微信定价缺少source_url | 在"企业微信定价"段落后添加来源链接
+  - 完整性 | 缺少"社交系统"维度的竞品对比 | 补充微信、飞书在该维度的对比表格
+禁止笼统建议（如"补充来源"、"改善结构"、"增加内容"）——每条必须指出具体位置和具体操作。
+
 overall_score 按权重计算：(完整性*0.3 + 准确性*0.3 + 可追溯性*0.2 + 可读性*0.1 + 客观性*0.1)
 """
 
@@ -152,6 +159,14 @@ async def quality_agent(
     log_dao = AgentLogDAO(pool)
 
     t0 = time.perf_counter()
+
+    # ── ✏️ 输入日志 ──
+    logger.info(
+        "【Quality】开始 task=%s 标题=%r 竞品=%s 维度=%s report=%d字符",
+        task_id, title,
+        ",".join(competitors), ",".join(dimensions),
+        len(report),
+    )
 
     prompt = _QUALITY_PROMPT % (
         title,
@@ -212,16 +227,31 @@ async def quality_agent(
     )
 
     duration_ms = (time.perf_counter() - t0) * 1000
+    # ── 构建维度评分明细（与控制台日志对齐）──
+    dim_score_map = {}
+    for dim_name, info in dim_scores.items():
+        dim_score_map[dim_name] = info.get("score", 0)
     await log_dao.log(
         task_id=task_id,
         agent_name="quality",
         action="judge_report",
         request={"title": title},
-        response={"score": overall_score, "passed": passed},
+        response={
+            "score": overall_score,
+            "passed": passed,
+            "dimension_scores": dim_score_map,
+        },
         duration_ms=round(duration_ms, 1),
     )
 
-    logger.info("Quality done: score=%.0f passed=%s", overall_score, passed)
+    # ── ✏️ 输出日志：维度级评分明细 ──
+    dim_summary = {dim: f"{info['score']}分 {info.get('comment','')[:30]}" for dim, info in dim_scores.items()}
+    logger.info(
+        "【Quality】完成 task=%s score=%.1f passed=%s 耗时%.0fms\n  维度评分: %s",
+        task_id, overall_score, passed, duration_ms, dim_summary,
+    )
+    if result["rewrite_suggestions"]:
+        logger.info("  改写建议: %s", result["rewrite_suggestions"])
 
     """
     quality 输出示例：

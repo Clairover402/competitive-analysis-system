@@ -302,6 +302,14 @@ async def collector_agent(
     result: dict[str, dict] = {}
     t0 = time.perf_counter()
 
+    # ── ✏️ 输入日志 ──
+    logger.info(
+        "【Collector】开始 task=%s 竞品=%d个(%s) 维度=%d个(%s)",
+        task_id,
+        len(competitors), ",".join(competitors),
+        len(dimensions), ",".join(dimensions),
+    )
+
     for competitor in competitors:
         result[competitor] = {"chunk_ids": [], "pages": []}
 
@@ -528,6 +536,14 @@ async def collector_agent(
     # 【L4 工程】每个 Agent 执行完毕后记录日志
     # supervisor 可以根据日志判断每个阶段的耗时、成功率
     duration_ms = (time.perf_counter() - t0) * 1000
+    # ── 构建 per-competitor 详情（与控制台日志对齐）──
+    per_competitor = {}
+    for comp, data in result.items():
+        per_competitor[comp] = {
+            "pages": len(data["pages"]),
+            "chunks": len(data["chunk_ids"]),
+            "urls": [p["url"] for p in data["pages"]],
+        }
     await log_dao.log(
         task_id=task_id,
         agent_name="collector",
@@ -536,29 +552,27 @@ async def collector_agent(
         response={
             "total_pages": sum(len(v["pages"]) for v in result.values()),
             "total_chunks": len(all_chunks),
+            "competitors_count": len(competitors),
+            "per_competitor": per_competitor,
         },
         duration_ms=round(duration_ms, 1),
     )
 
+    # ── ✏️ 输出日志：按竞品分维度统计 ──
+    output_lines = []
+    for comp, data in result.items():
+        page_count = len(data["pages"])
+        chunk_count = len(data["chunk_ids"])
+        urls = [p["url"] for p in data["pages"]]
+        output_lines.append(f"  {comp}: {page_count}页面 {chunk_count}chunk → {urls}")
     logger.info(
-        "日志：collector执行完成：共 %d 个页面，拆分 %d 个文本块，耗时 %.0f 毫秒",
+        "【Collector】完成 task=%s 共%d竞品 %d页面 %dchunk 耗时%.0fms\n%s",
+        task_id,
+        len(competitors),
         sum(len(v["pages"]) for v in result.values()),
         len(all_chunks),
         duration_ms,
+        "\n".join(output_lines),
     )
 
-
-    """
-    # collector 的 return result
-    {
-        "飞书": {
-            "chunk_ids": ["uuid-1", "uuid-2", "uuid-3", ...],
-            "pages": [
-                {"url": "https://feishu.cn/pricing", "title": "...", "text": "飞书企业版..."},
-                ...
-            ]
-        },
-        "钉钉": {...}
-    }
-    """
     return result

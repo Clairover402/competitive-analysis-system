@@ -58,6 +58,48 @@ _embedding_model: object | None = None
 _reranker_model: object | None = None
 
 
+def _resolve_local_path(model_name: str) -> str | None:
+    """将 HF Hub 仓库名映射到本地缓存路径。
+
+    HuggingFace 缓存布局：
+      ~/.cache/huggingface/hub/models--{org}--{repo}/snapshots/{hash}/
+
+    例如 "BAAI/bge-m3" →
+      ~/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/<hash>/
+
+    如果缓存目录存在且包含非空 snapshots → 返回最新 snapshot 路径。
+    不存在 → 返回 None，调用方走远程下载。
+    """
+    import os
+    from pathlib import Path
+
+    hub_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    # "BAAI/bge-m3" → "BAAI--bge-m3"
+    dir_name = model_name.replace("/", "--")
+
+    # 两个可能的缓存布局：
+    # 1) HF 标准: hub/models--BAAI--bge-m3/snapshots/<hash>/
+    # 2) ModelScope: hub/models/BAAI--bge-m3/snapshots/master/
+    for parent in ("models--", "models"):
+        model_cache = Path(hub_dir) / parent / dir_name / "snapshots"
+        if not model_cache.is_dir():
+            continue
+
+        snapshots = sorted(model_cache.iterdir(), reverse=True)
+        for snap in snapshots:
+            if snap.is_dir() and snap.name != ".locks":
+                # 验证至少有一个非空模型文件（排除下载中断留下的 0 字节占位）
+                has_model_file = (
+                    any(f.is_file() and f.stat().st_size > 0 for f in snap.glob("pytorch_model*.bin"))
+                    or any(f.is_file() and f.stat().st_size > 0 for f in snap.glob("model*.safetensors"))
+                    or any(f.is_file() and f.stat().st_size > 0 for f in snap.glob("*.onnx"))
+                )
+                if has_model_file:
+                    return str(snap)
+
+    return None
+
+
 def _get_embedding_model(settings: Settings | None = None):
     """懒加载 BGE-M3 嵌入模型（约 2GB）。
 
@@ -85,21 +127,52 @@ def _get_embedding_model(settings: Settings | None = None):
 
     from FlagEmbedding import BGEM3FlagModel
 
-    logger.info(
-        "Loading BGE-M3 model: %s on %s",
-        settings.embedding_model,
-        settings.embedding_device,
-    )
+    model_name = settings.embedding_model
+
+    # ── 国内网络适配：优先用 HF 本地缓存，避免联网校验超时 ──
+    # BGEM3FlagModel("BAAI/bge-m3") 底层走 AutoTokenizer.from_pretrained，
+    # 即使本地已有缓存，依然先调用 huggingface_hub.list_repo_tree() 校验仓库完整性，
+    # 国内直连 HF 不稳定 → 持续超时、反复重试。
+    #
+    # 解决方案：检查 ~/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/
+    # 如果已存在 → 直接用本地路径，跳过联网校验。
+    model_path = _resolve_local_path(model_name)
+    if model_path is not None:
+        logger.info(
+            "Loading BGE-M3 from local cache: %s (device=%s)",
+            model_path, settings.embedding_device,
+        )
+    else:
+        logger.info(
+            "Loading BGE-M3 from HF Hub: %s on %s (first-time download)",
+            model_name, settings.embedding_device,
+        )
+        model_path = model_name  # 走远程下载
 
     # 【L4 工程】device="cpu" 时不启用 FP16
     # CPU 上 FP16 比 FP32 还慢（需要转换），所以只在 GPU 上启用
     use_fp16 = settings.embedding_device != "cpu"
 
-    _embedding_model = BGEM3FlagModel(
-        settings.embedding_model,
-        use_fp16=use_fp16,
-        device=settings.embedding_device,
-    )
+    # ── 强制离线模式 ──
+    # BGEM3FlagModel 内部会调用 AutoTokenizer.from_pretrained / AutoModel.from_pretrained，
+    # 它们默认 local_files_only=False，即使用本地路径也会联网校验。
+    # 设置 HF_HUB_OFFLINE=1 告诉 huggingface_hub 全链路禁止网络访问，
+    # 所有文件必须来自本地缓存——国内网络环境下的唯一解。
+    import os
+    _prev_offline = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        _embedding_model = BGEM3FlagModel(
+            model_path,
+            use_fp16=use_fp16,
+            device=settings.embedding_device,
+        )
+    finally:
+        if _prev_offline is None:
+            del os.environ["HF_HUB_OFFLINE"]
+        else:
+            os.environ["HF_HUB_OFFLINE"] = _prev_offline
+
     return _embedding_model
 
 
@@ -136,17 +209,44 @@ def _get_reranker_model(settings: Settings | None = None):
     if settings is None:
         settings = Settings()
 
-    from sentence_transformers import CrossEncoder
+    # 【2026-07-27 兼容性修复】FlagReranker 和 CrossEncoder
+    # 内部均调用 tokenizer.prepare_for_model()，
+    # 该方法在 transformers>=5.12 中被移除。
+    # 改用原生 AutoTokenizer + AutoModelForSequenceClassification，
+    # 绕过所有中间层的 API 兼容问题。
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import torch
 
-    logger.info(
-        "Loading reranker model (CrossEncoder): %s",
-        settings.reranker_model,
-    )
-    _reranker_model = CrossEncoder(
-        settings.reranker_model,
-        trust_remote_code=True,
-        device=settings.embedding_device,
-    )
+    reranker_name = settings.reranker_model
+    reranker_path = _resolve_local_path(reranker_name)
+    if reranker_path is not None:
+        logger.info("Loading reranker from local: %s", reranker_path)
+    else:
+        logger.info("Loading reranker from HF: %s (first download)", reranker_name)
+        reranker_path = reranker_name
+
+    # ── 强制离线模式（同 embedding 模型）──
+    # AutoTokenizer / AutoModel 默认 local_files_only=False，会联网校验
+    import os as _os
+    _prev_offline = _os.environ.get("HF_HUB_OFFLINE")
+    _os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(reranker_path, trust_remote_code=True)
+        model = AutoModelForSequenceClassification.from_pretrained(reranker_path, trust_remote_code=True)
+    finally:
+        if _prev_offline is None:
+            del _os.environ["HF_HUB_OFFLINE"]
+        else:
+            _os.environ["HF_HUB_OFFLINE"] = _prev_offline
+
+    model.eval()
+
+    device = settings.embedding_device
+    if device != "cpu" and torch.cuda.is_available():
+        model = model.to(device)
+
+    # 返回 (tokenizer, model) 二元组，供 rerank() 函数使用
+    _reranker_model = (tokenizer, model)
     return _reranker_model
 
 
@@ -260,20 +360,30 @@ async def rerank(
         return []
 
     try:
-        model = _get_reranker_model(settings)
-        pairs = [[query, doc] for doc in documents]
+        tokenizer, model = _get_reranker_model(settings)
 
-        # CrossEncoder.predict() 返回原始 logits → sigmoid 归一化到 [0, 1]
-        # 【L4 工程】sigmoid 替代 normalize=True
-        # FlagReranker 旧版 normalize=True 内部做 sigmoid，
-        # CrossEncoder 需要手动做——效果完全等价
+        # 原生 transformers 推理——逐对计算
+        # 【2026-07-27】绕过 FlagReranker/CrossEncoder 的 API 兼容问题
         import numpy as np
-        raw_scores = model.predict(
-            pairs,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        scores = 1.0 / (1.0 + np.exp(-raw_scores))  # sigmoid → [0, 1]
+        import torch
+        scores = np.empty(len(documents), dtype=np.float64)
+        with torch.no_grad():
+            for i, doc in enumerate(documents):
+                inputs = tokenizer(
+                    query, doc,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                )
+                # 模型可能已在 GPU 上，确保输入也在同一设备
+                if next(model.parameters()).device.type != "cpu":
+                    inputs = {k: v.to(next(model.parameters()).device) for k, v in inputs.items()}
+                logits = model(**inputs, return_dict=True).logits.view(-1).float()
+                scores[i] = logits.cpu().item()
+
+        # sigmoid → [0, 1] 概率得分
+        scores = 1.0 / (1.0 + np.exp(-scores))
 
         # 构建带排名的结果
         ranked = [

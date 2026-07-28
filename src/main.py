@@ -22,6 +22,20 @@ import uvicorn
 
 
 def main() -> None:
+    # ── 修复 Windows GBK 控制台编码导致中文日志乱码 ──
+    # 根因：Windows 终端默认 GBK (cp936)，Python stdout 继承此编码
+    # reconfigure() 在当前进程有效，但 uvicorn reload 模式会 fork 子进程，
+    # 子进程又回到 GBK。因此设 PYTHONIOENCODING 环境变量，子进程继承。
+    import os as _os
+    _os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+    # Fix Windows console GBK encoding for Chinese log output
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass  # stdout redirected (pipe)
+
     # 【L4 工程】全局日志配置——INFO 级别才能看到 Pipeline 节点日志
     # 默认 WARNING 过滤掉所有 INFO，导致中间节点静默执行
     logging.basicConfig(
