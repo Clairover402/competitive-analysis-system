@@ -131,7 +131,9 @@ _SUPERVISOR_SKELETON = (
     "## 当前任务\n"
     "- 任务ID: {task_id}\n"
     "- 标题: {title}\n"
-    "- 用户查询: {user_query}\n\n"
+    "- 用户查询: {user_query}\n"
+    "- 分析维度: {dimensions}\n"
+    "- 指定竞品: {competitors_list}\n\n"
 
     "## 当前进度\n"
     "{progress}\n\n"                      # ← 根据 state 各字段动态构造
@@ -153,15 +155,21 @@ _SUPERVISOR_SKELETON = (
     "}}\n```\n\n"
 
     "## 规则\n"
+    "0. 如果竞品列表包含「待探索」或为空，禁止调用 collector！应先用内部知识推理可能的竞品名称，\n"
+    "   然后更新 found_competitors，再进入正常流程。\n"
     "1. 如果所有必要数据已收集、分析完成、报告已生成、质量已通过 -> action=\"finish\"\n"
-    "2. 如果需要收集竞品数据 -> action=\"collector\"，arguments 包含 competitors 和 dimensions\n"
-    "3. 如果已收集数据但未分析 -> action=\"analyzer\"\n"
-    "4. 如果分析完成但未写报告 -> action=\"writer\"\n"
-    "5. 如果报告已生成但未评分 -> action=\"quality\"\n"
+    "2. 如果需要收集竞品数据 -> action=\"collector\"，arguments 必须包含:\n"
+    "   - competitors: [竞品A, 竞品B, ...]  — 使用上方「指定竞品」列表（不能是「待探索」）\n"
+    "   - dimensions: [维度1, 维度2, ...]     — 使用上方「分析维度」列表\n"
+    "3. 如果已收集数据但未分析 -> action=\"analyzer\"，arguments 同样包含 competitors + dimensions\n"
+    "4. 如果分析完成但未写报告 -> action=\"writer\"，arguments 包含 title + analysis_results\n"
+    "5. 如果报告已生成但未评分 -> action=\"quality\"，arguments 包含 report_markdown\n"
     "6. 如果质量未通过且还有剩余轮次 -> action=\"writer\"（重写）\n"
     "7. 如果质量已通过 -> action=\"finish\"\n"
     "8. 每轮只能选择一个 agent 执行\n"
-    "9. 输出必须是合法 JSON，不要有任何额外文本"
+    "9. 输出必须是合法 JSON，不要有任何额外文本\n"
+    "10. 如果同一 agent 连续调用 2 次都返回空结果（0页面/0分析），代表该 agent 无法完成任务，\n"
+    "    应输出 action=\"finish\"，并在 reason 中说明「因数据不足，需用户补充信息」"
 )
 """Supervisor System Prompt 骨架。
 
@@ -244,66 +252,13 @@ def _extract_json(text: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §2 _extract_memory — 长期记忆提取（按 Agent 角色分级）
+# §2 长期记忆写入已禁用
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def _extract_memory(
-    state: SupervisorState,
-    decision: dict,
-    engine: LongTermMemoryEngine,
-) -> None:
-    """从本轮决策结果提取关键信息写入长期记忆。
-
-    【L5 决策】记忆类型分级 — memory_type 按 Agent 角色区分
-    ─────────────────────────────────────────────────────
-    ┌───────────┬──────────────┬────────────────────────────────────┐
-    │ Agent     │ memory_type  │ 原因                               │
-    ├───────────┼──────────────┼────────────────────────────────────┤
-    │ analyzer  │ "decision"   │ 分析推理过程 → 未来相似问题参考      │
-    │ writer    │ "decision"   │ 写作策略选择 → 报告风格偏好积累      │
-    │ quality   │ "decision"   │ 评判标准 → 质量阈值的经验            │
-    │ collector │ "fact"       │ 搜索发现 → 事实性信息（竞品有新功能）│
-    │ finish    │ (不写)       │ 无新决策信息                        │
-    └───────────┴──────────────┴────────────────────────────────────┘
-
-    【L4 工程】add_memory 用 task_id 参数（任务溯源）
-    ─────────────────────────────────────────────
-    每条记忆关联 source_task_id，便于:
-    — 审计: 这条记忆来自哪次分析任务？
-    — 过期: 同 task 的新记忆覆盖旧记忆（insert_conflict="upsert"）
-    — 追溯: 出问题时按 task_id 回查原始上下文
-
-    写入异常不抛——long_term 写入失败不应阻塞 ReAct 主循环。
-
-    Args:
-        state: 当前 SupervisorState（读 user_id / task_id）
-        decision: _think 产出的 LLM 决策 dict（读 agent / reason）
-        engine: LongTermMemoryEngine 实例
-    """
-    try:
-        agent = decision.get("agent", "")
-        thought = decision.get("thought", "")
-        reason = decision.get("reason", "")
-
-        # finish 不写——没有新的决策信息
-        if agent == "finish":
-            return
-
-        # 按 Agent 角色分级记忆类型
-        memory_type = "decision" if agent in ("analyzer", "writer", "quality") else "fact"
-        # 优先用 reason（简明），fallback 用 thought[:200]（截断防超长）
-        content = f"[{agent}] {reason}" if reason else f"[{agent}] {thought[:200]}"
-
-        await engine.add_memory(
-            user_id=state["user_id"],
-            content=content,
-            memory_type=memory_type,
-            task_id=state.get("task_id"),
-        )
-        logger.info("长期记忆已保存: type=%s, agent=%s", memory_type, agent)
-    except Exception:
-        # 长期记忆写入失败不阻塞主循环
-        logger.exception("长期记忆保存失败（不影响主流程）")
+# 【L5 决策】_extract_memory 函数已删除
+# 原因：自动从 Agent 执行结果提取"决策/偏好/事实"写入 agent_memories 表
+# 会把任务临时数据（如"Google市场份额23%"）当作用户画像，严重污染长期记忆
+# 长期记忆改为手动写入路径（仅用户明确表达的偏好/决策驱动）
+# 参见 MEMORY.md 2026-07-28 教训记录
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -415,11 +370,15 @@ def _make_node_think(
             memory_context = "（无相关长期记忆）"
 
         # ─── 步骤③: 拼装 Prompt + LLM 调用 ───
+        dimensions = state.get("dimensions", [])
+        competitors = state.get("found_competitors", [])
         prompt = _SUPERVISOR_SKELETON.format(
             agent_list=router.list_capabilities(),
             task_id=state.get("task_id", ""),
             title=state.get("title", ""),
             user_query=state.get("user_query", ""),
+            dimensions=", ".join(dimensions) if dimensions else "（待探索）",
+            competitors_list=", ".join(competitors) if competitors else "（待探索）",
             progress=progress,
             reasoning_trace=trace_text,
             memory_context=memory_context,
@@ -544,6 +503,40 @@ def _make_node_act(router: A2ARouter):
         decision = state.get("pending_decision", {})
         agent_name = decision.get("agent", "")
         action = decision.get("action", "")
+        arguments = decision.get("arguments", {})
+
+        # ─── 安全网：自动补全必填字段 ───
+        # 【2026-07-29 BUG修复】LLM 可能忘记在 arguments 里填充 competitors/dimensions，
+        # 但 AgentCard.input_schema.required 强制要求这些字段。
+        # 在调度前用 state 中的值自动补全——Prompt 负责"教 LLM 怎么做"，
+        # 代码负责"确保 LLM 做错也不会崩"。
+        if action in ("collector", "analyzer"):
+            if "competitors" not in arguments or not arguments["competitors"]:
+                arguments["competitors"] = state.get("found_competitors", [])
+            if "dimensions" not in arguments or not arguments["dimensions"]:
+                arguments["dimensions"] = state.get("dimensions", [])
+
+        # ─── 安全网：拦截"待探索"占位符 ───
+        # 【2026-07-29 BUG修复】"待探索"是语义占位符，不是真实竞品名。
+        # Collector 的搜索过滤器依赖标题匹配真实竞品名——"待探索"永远不会命中。
+        # 传占位符到 Collector → 100% 返回 0结果 → Supervisor 重复重试 → 轮次耗尽。
+        # 拦截策略：标记为 failed 而非 silently 替换，让 observe 的失败路径处理。
+        _PLACEHOLDER_COMPETITORS = {"待探索"}
+        if action == "collector" and arguments.get("competitors"):
+            actual = set(arguments["competitors"])
+            if actual.issubset(_PLACEHOLDER_COMPETITORS) or actual == set():
+                logger.warning(
+                    "【安全网拦截】collector 收到占位符竞品: %s，阻止调度",
+                    arguments["competitors"],
+                )
+                return {
+                    "pending_task_agent": "collector",
+                    "pending_task_status": "failed",
+                    "pending_task_result": {
+                        "error": "竞品列表仅为占位符「待探索」，无法执行采集",
+                        "suggestion": "请用户补充具体竞品名称，例如「飞书」「钉钉」「企业微信」",
+                    },
+                }
 
         # finish 短路: think 决策了结束 → 不调用任何 Agent
         if action == "finish":
@@ -555,11 +548,17 @@ def _make_node_act(router: A2ARouter):
             }
 
         # 构造任务单（一行构造）
+        # 【2026-07-29 BUG修复】task.id 必须使用真实的 task_id（来自 tasks 表），
+        # 而非 A2ATask 默认生成的随机 UUID。
+        # 否则 HarnessGuard 的审计日志写入 agent_logs 表时，外键约束报错：
+        # "键值对(task_id)=(随机UUID)没有在表 tasks 中出现"
         task = A2ATask(
             agent_name=agent_name,
             action=action,
-            arguments=decision.get("arguments", {}),
+            arguments=arguments,  # 可能已被安全网自动补全了 competitors/dimensions
         )
+        # 覆盖为真实 task_id（来自 SupervisorState，对应 tasks 表中的主键）
+        task.id = state["task_id"]
         logger.info("Supervisor act: agent=%s, action=%s", agent_name, action)
 
         # 路由分发（查表 → 构造 → 调用 → 返回）
@@ -672,13 +671,33 @@ def _make_node_observe(
             if agent_name == "collector":
                 # result 格式: {竞品名: {chunk_ids: [str], pages: [{url,title,text}]}}
                 found = list(result.keys()) if result else []
-                updates["found_competitors"] = found
-                updates["collected_data"] = result
-                logger.info("收集完成: %d 个竞品", len(found))
-                trace_obs = {
-                    "round": current_round,
-                    "observation": f"collected {len(found)} competitors",
-                }
+                # ── 检查是否有有效素材 ──
+                # 【2026-07-29 BUG修复】collector "成功完成"但返回 0 chunk = 事实上的失败。
+                # 需要在 reasoning_trace 中明确标记，让 LLM 看到"上轮collector无有效数据"。
+                total_chunks = sum(len(result.get(c, {}).get("chunk_ids", [])) for c in found)
+                total_pages = sum(len(result.get(c, {}).get("pages", [])) for c in found)
+                if total_chunks == 0 and total_pages == 0:
+                    logger.warning(
+                        "⚠️ Collector 返回空数据: %d竞品 0chunk — 视为采集失败",
+                        len(found),
+                    )
+                    trace_obs = {
+                        "round": current_round,
+                        "observation": (
+                            f"collector returned 0 pages/chunks for {found} — "
+                            f"竞品名称可能是占位符或搜索无匹配结果，需更换竞品或终止"
+                        ),
+                    }
+                    # 不更新 business fields（避免覆盖正确的 found_competitors）
+                    # 但追踪已记录，LLM 下一轮 think 会看到这条
+                else:
+                    updates["found_competitors"] = found
+                    updates["collected_data"] = result
+                    logger.info("收集完成: %d 个竞品, %d 页面, %d chunk", len(found), total_pages, total_chunks)
+                    trace_obs = {
+                        "round": current_round,
+                        "observation": f"collected {len(found)} competitors, {total_pages} pages",
+                    }
 
             elif agent_name == "analyzer":
                 # result 格式: {维度名: {竞品名: "分析结论"}}
@@ -714,9 +733,9 @@ def _make_node_observe(
                     "observation": f"quality score: {updates['quality_score']}",
                 }
 
-            # ─── 步骤⑦: 长期记忆提取（成功路径 + memory_engine 非 None） ───
-            if memory_engine is not None:
-                await _extract_memory(state, decision, memory_engine)
+            # ─── 步骤⑦: 长期记忆提取 —— 已禁用
+            # 自动提取会把"Google市场份额23%"这类临时数据当作用户画像
+            # 长期记忆改为手动写入路径，详见 MEMORY.md
 
         # ─── 步骤⑧: 追加 messages_buffer ───
         reason = decision.get("reason", "")
@@ -993,6 +1012,7 @@ async def run_supervisor_task(
         "user_id": task.get("user_id", "default"),
         "user_query": task.get("title", ""),
         # §2 探索结果（初始为空，ReAct 循环动态填充）
+        "dimensions": task.get("dimensions", []),
         "found_competitors": task.get("competitors", []),
         "collected_data": {},
         "analysis_results": {},

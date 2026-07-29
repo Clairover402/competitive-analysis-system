@@ -66,10 +66,10 @@ logger = logging.getLogger(__name__)
 # 白名单：Agent × 能力 矩阵
 # 【L5 决策】所有对照关系只此一份，改一处全局生效
 AGENT_WHITELIST: dict[str, list[str]] = {
-    "collector": ["collect", "web_search", "web_fetch"],
-    "analyzer": ["analyze", "embed", "rerank"],
-    "writer": ["write", "compose_report"],
-    "quality": ["evaluate", "score_report"],
+    "collector": ["collect", "web_search", "web_fetch", "collector"],
+    "analyzer": ["analyze", "embed", "rerank", "analyzer"],
+    "writer": ["write", "compose_report", "writer"],
+    "quality": ["evaluate", "score_report", "quality"],
 }
 
 # PII 检测：三要素（手机号、身份证、邮箱）

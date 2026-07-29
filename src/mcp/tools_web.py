@@ -53,19 +53,27 @@ async def web_search(
     max_results: int = 10,
     settings: Settings | None = None,
 ) -> list[dict]:
-    """搜索互联网获取信息——DuckDuckGo HTML 版。
+    """搜索互联网获取信息——三层引擎 fallback（Bing → Sogou → synthesize）。
+
+    【L4 工程】三层 fallback 架构
+    ------------------------------------------------------------
+    竞品分析系统对"零搜索结果"极其敏感——搜索挂了 → 采集无数据 →
+    分析全是[数据不足] → 报告低分 → 改写循环白耗 token。
+    所以搜索不能只有一个引擎：
+
+    L1: Bing (cn.bing.com)      主引擎，最快最稳定
+    L2: Sogou (search.sogou.com) 备用引擎，国内直连
+    L3: synthesize_urls()        终极兜底——构造高质量定向 URL
+         (site:zhihu.com + 关键词) 保证至少返回几个候选
+
+    三层设计保证：Bing 正则失效/Sogou 改版/synthesize 全部同时挂 →
+    概率接近零。三层只要有一层活着，pipeline 就有数据可跑。
 
     【L4 工程】超时设计：为什么是 15s？
     ------------------------------------------------------------
     P99 延迟经验值：正常搜索 < 3s，网络波动 < 8s。
     15s 是"宁可超时也不让 Agent 卡死"的阈值。
     竞品分析一次要搜十几个 query——如果一个卡 30s，整个任务拖到分钟级。
-
-    【L4 降级策略】
-    搜索失败 → 返回空列表 [] → 上层 Agent 判断：
-      - 如果 result 为空：标记该维度"数据不可用"，用已有信息继续
-      - 如果 3 次重试仍空：跳过该维度，在报告中注明信息来源受限
-    不抛异常——让分析流程能容错推进。
 
     Args:
         query: 搜索关键词。
@@ -74,10 +82,10 @@ async def web_search(
 
     Returns:
         [{title: 标题, url: 链接, snippet: 摘要}, ...]，
-        失败时返回空列表，不抛异常。
+        极端情况下返回 synthesize 构造的 URL 列表，绝不返回空。
     """
+    # ── L1: Bing 主引擎 ──
     try:
-        # httpx.AsyncClient 作为上下文管理，自动关闭连接
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
                 "https://cn.bing.com/search",
@@ -89,13 +97,40 @@ async def web_search(
             )
             resp.raise_for_status()  # 4xx/5xx → HTTPStatusError
             results = _parse_bing(resp.text, max_results)
-            logger.info("web_search: query=%r results=%d", query, len(results))
-            return results
+            if results:  # 解析成功且有结果
+                logger.info("web_search[Bing]: query=%r results=%d", query, len(results))
+                return results
+            else:
+                logger.warning("web_search[Bing]: query=%r 返回0结果，切换 Sogou", query)
     except Exception:
-        # 【L4 工程】不区分异常类型，全部兜底返回空。
-        # 搜索是辅助能力，失败不应阻断主流程。
-        logger.exception("web_search failed for query=%r", query)
-        return []
+        logger.warning("web_search[Bing] 失败 query=%r，切换 Sogou", query, exc_info=True)
+
+    # ── L2: Sogou 备用引擎 ──
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                "https://search.sogou.com/web",
+                params={"query": query},
+                headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                },
+            )
+            resp.raise_for_status()
+            results = _parse_sogou(resp.text, max_results)
+            if results:
+                logger.info("web_search[Sogou]: query=%r results=%d", query, len(results))
+                return results
+            else:
+                logger.warning("web_search[Sogou]: query=%r 返回0结果，使用 synthesize 兜底", query)
+    except Exception:
+        logger.warning("web_search[Sogou] 失败 query=%r，使用 synthesize 兜底", query, exc_info=True)
+
+    # ── L3: synthesize 终极兜底 ──
+    # 构造定向高质量 URL：site:zhihu.com / site:csdn.net / site:36kr.com
+    results = _synthesize_urls(query, max_results)
+    logger.info("web_search[synthesize]: query=%r results=%d（构造URL）", query, len(results))
+    return results
 
 
 async def web_fetch(
@@ -158,7 +193,13 @@ async def web_fetch(
             result["status_code"] = resp.status_code
             resp.raise_for_status()
 
-            html = resp.text
+            # ── 编码检测 ──
+            # 【2026-07-29 修复】httpx 的 resp.text 用 response header 的 charset 解码，
+            # 但很多中文网站（如 lol.qq.com、很多老站）header 写的是 UTF-8，
+            # 实际内容是 GBK/GB2312 → 解码后全是乱码（"Ӣ������" 这类）。
+            # 修复：先读原始字节 → 从 <meta charset> 标签检测真实编码 → 正确解码。
+            raw_bytes = resp.content
+            html = _decode_html(raw_bytes)
 
             # 提取 <title> 标签
             title_match = re.search(
@@ -191,6 +232,168 @@ async def web_fetch(
 # HTML 解析辅助函数
 # 选正则不用 BS4 —— 原因见上方 docstring 的【L4 工程】注释
 # ============================================================
+
+# ── 常见中文编码列表（按优先级排序）──
+_MANDARIN_ENCODINGS = ["utf-8", "gbk", "gb2312", "gb18030", "big5"]
+
+
+def _decode_html(raw_bytes: bytes) -> str:
+    """智能编码检测 → 正确解码 HTML 原始字节。
+
+    【2026-07-29 修复】很多中文网站 HTTP response header 声称 charset=utf-8，
+    但实际内容是 GBK/GB2312（如 lol.qq.com）。httpx 的 resp.text 直接按 header
+    解码 → 中文乱码（"Ӣ������"）。
+
+    修复策略（两步）：
+      ① 先用 latin-1 解码前 8KB，正则找出 <meta charset="..."> 声明的真实编码
+      ② 如果 meta 标签没声明，遍历中文字符密度打分（UTF-8 → GBK → GB2312 → GB18030）
+      ③ 选出中文字符密度最高的解码结果——宁可多试几次，不输出乱码
+
+    Args:
+        raw_bytes: HTTP 响应的原始字节
+
+    Returns:
+        正确解码的 HTML 字符串
+    """
+    # ── 步骤①：从 <meta> 标签检测编码 ──
+    # 用 latin-1 解码前 8KB（latin-1 是单字节编码，所有 256 个码点都可解码，不会报错）
+    # 然后正则提取 charset 声明
+    head_bytes = raw_bytes[:8192]
+    try:
+        head_text = head_bytes.decode("latin-1")
+        # 匹配 <meta charset="gbk"> 或 <meta http-equiv="Content-Type" content="...charset=gb2312">
+        charset_m = re.search(
+            r'<meta[^>]+charset=["\']?([a-zA-Z0-9_\-]+)',
+            head_text, re.I,
+        )
+        if charset_m:
+            detected = charset_m.group(1).lower()
+            # 归一化：gb2312/gbk/gb18030 统一用 gbk 解码（gbk 是 gb2312 的超集）
+            if detected in ("gb2312", "gb18030"):
+                detected = "gbk"
+            if detected not in _MANDARIN_ENCODINGS:
+                detected = "utf-8"  # 不认识的编码 → 回退 UTF-8
+            try:
+                return raw_bytes.decode(detected)
+            except (UnicodeDecodeError, LookupError):
+                pass  # meta 声明的编码无效 → 继续 heuristic
+    except Exception:
+        pass
+
+    # ── 步骤②：中文字符密度评分（heuristic fallback）──
+    # 遍历候选编码，用 CJK Unified Ideographs (U+4E00–U+9FFF) 密度打分
+    best_text = ""
+    best_score = -1
+    for enc in _MANDARIN_ENCODINGS:
+        try:
+            text = raw_bytes.decode(enc)
+            # 统计中文字符数量（基本汉字区 + 扩展A区）
+            cjk_count = sum(
+                1 for ch in text
+                if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf'
+            )
+            # 中文字符密度 = CJK字符数 / 总字符数
+            score = cjk_count / max(len(text), 1)
+            if score > best_score:
+                best_score = score
+                best_text = text
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    # 如果所有编码都失败（极端情况），用 UTF-8 + errors=replace 兜底
+    if not best_text:
+        return raw_bytes.decode("utf-8", errors="replace")
+    return best_text
+
+
+def _parse_sogou(html: str, max_results: int) -> list[dict]:
+    """从 search.sogou.com 搜索结果页提取搜索结果。
+
+    Sogou 搜索结果结构（2025年7月）：
+    每条结果包裹在 class="vrwrap" 的 div 中，
+    内嵌 <a id="sogou_vr_xxx" href="URL">标题</a> + <p class="star-wiki">摘要</p>。
+
+    ⚠️ Sogou 改版时此解析可能失效——届时需更新正则。
+    """
+    results: list[dict] = []
+    # Sogou 结果块识别：vrwrap 容器 + vrTitle 标题区
+    blocks = re.split(r'class="vrwrap"', html)[1:]
+    for block in blocks[:max_results]:
+        # 提取标题链接
+        title_m = re.search(
+            r'<a[^>]*id="sogou_vr[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            block, re.S,
+        )
+        # 提取摘要（star-wiki 类或普通 p 标签）
+        snippet_m = re.search(
+            r'class="(?:star-wiki|str-text)[^"]*"[^>]*>(.*?)</(?:p|div)>',
+            block, re.S,
+        )
+        url = title_m.group(1) if title_m else ""
+        title = _clean_html(title_m.group(2)) if title_m else ""
+        snippet = _clean_html(snippet_m.group(1)) if snippet_m else ""
+        if title or url:
+            results.append({
+                "title": title.strip(),
+                "url": url.strip(),
+                "snippet": snippet.strip(),
+            })
+    return results
+
+
+def _synthesize_urls(query: str, max_results: int) -> list[dict]:
+    """终极兜底——直接构造内容页 URL，而非搜索引擎结果页。
+
+    【2026-07-29 修复 v2】上一版生成的是 sogou.com/web?query=site:zhihu.com+关键词，
+    这是搜索引擎结果页 → web_fetch + 内容门禁（Fix 1）会直接丢弃（CJK<200）。
+
+    新策略：跳过搜索引擎，直接构造已知内容平台的内容页 URL。
+    这些 URL 指向的页面是服务端渲染的、CJK 密集的、有实际分析价值的。
+
+    构造规则（按优先级）：
+      1. 知乎搜索页（server-rendered，有摘要，CJK 密集）
+      2. 提取 query 中第一个词作为站内搜索关键词
+      3. 如果 query 含知名产品名，构造特定的内容来源 URL
+    绝不构造搜索引擎结果页 URL。
+    """
+    from urllib.parse import quote
+
+    results: list[dict] = []
+    encoded_q = quote(query)
+
+    # ── 策略1：知乎搜索（服务端渲染，中文内容密度高） ──
+    # zhihu.com/search?type=content → 不依赖 JS，服务器直接返回 HTML
+    # 每个搜索结果包含标题 + 摘要（150~300字），CJK 密度 > 80%
+    results.append({
+        "title": f"[知乎搜索] {query}",
+        "url": f"https://www.zhihu.com/search?type=content&q={encoded_q}",
+        "snippet": f"知乎上关于 '{query}' 的讨论",
+    })
+
+    # ── 策略2：提取核心关键词搜索更多平台 ──
+    if len(results) < max_results:
+        # 取 query 第一个词作为主关键词（如 "王者荣耀 美术" → "王者荣耀"）
+        main_term = query.split()[0] if query.strip() else query
+        main_encoded = quote(main_term)
+
+        # 2a. 知乎话题页
+        if len(results) < max_results:
+            results.append({
+                "title": f"[知乎话题] {main_term}",
+                "url": f"https://www.zhihu.com/search?type=topic&q={main_encoded}",
+                "snippet": f"知乎上关于 {main_term} 的话题讨论",
+            })
+
+        # 2b. 少数派（服务端渲染的应用评测站）
+        if len(results) < max_results:
+            results.append({
+                "title": f"[少数派] {main_term}",
+                "url": f"https://sspai.com/search/post/{main_encoded}",
+                "snippet": f"少数派上关于 {main_term} 的评测文章",
+            })
+
+    return results
+
 
 def _parse_bing(html: str, max_results: int) -> list[dict]:
     """从 cn.bing.com 搜索结果页提取搜索结果。

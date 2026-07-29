@@ -176,9 +176,20 @@ async def quality_agent(
     )
 
     resp = await llm.ainvoke(prompt)
-    text = resp.content.strip()
+    text = (resp.content or "").strip()
 
-    # 【L4 工程】LLM 输出清理——比 analyzer 多一种情况处理
+    # ── 防御：LLM 空响应 ──
+    if not text:
+        logger.error("【Quality】LLM 返回空响应！可能是内容审核拦截或 API 服务端异常")
+        return {
+            "overall_score": 0,
+            "passed": False,
+            "dimension_scores": {dim: {"score": 0, "comment": "LLM 返回空响应"} for dim in _WEIGHTS},
+            "issues": ["LLM 返回空响应，无法评分"],
+            "rewrite_suggestions": ["请人工检查报告质量"],
+        }
+
+    # 【L4 工程】LLM 输出清理
     # ```json 开头 → 跳过 "```json" 标记
     # ``` 开头 → 跳过 "```" 标记
     if text.startswith("```"):
@@ -188,8 +199,47 @@ async def quality_agent(
         else:
             text = parts[1].strip()
 
-    # 解析 JSON（如果 LLM 不按规范输出 → 直接抛异常，由上层 Supervisor 处理）
-    parsed = json.loads(text)
+    # ── 防御：LLM 输出了非 JSON 文本（如拒绝回答、道歉等）──
+    if not text:
+        logger.error("【Quality】清理后文本为空 raw_text[:200]=%r", resp.content[:200] if resp.content else "NONE")
+        return {
+            "overall_score": 0,
+            "passed": False,
+            "dimension_scores": {dim: {"score": 0, "comment": "LLM 输出格式异常"} for dim in _WEIGHTS},
+            "issues": ["LLM 输出格式异常"],
+            "rewrite_suggestions": ["请检查 LLM 服务状态"],
+        }
+
+    # ── 防御：LLM 输出中混入了非 JSON 前缀/后缀 → 尝试提取 { ... } ──
+    if not text.startswith("{"):
+        # 找一个看起来像 JSON 对象的片段
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            logger.warning("【Quality】LLM 输出未以 { 开头，尝试提取 JSON 片段")
+            text = text[start:end + 1]
+        else:
+            logger.error("【Quality】LLM 输出中找不到 JSON 对象 text[:200]=%r", text[:200])
+            return {
+                "overall_score": 0,
+                "passed": False,
+                "dimension_scores": {dim: {"score": 0, "comment": "LLM 输出中无 JSON"} for dim in _WEIGHTS},
+                "issues": ["LLM 输出无法解析"],
+                "rewrite_suggestions": ["请检查 LLM 服务状态"],
+            }
+
+    # 解析 JSON
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error("【Quality】JSON 解析失败: %s text[:300]=%r", e, text[:300])
+        return {
+            "overall_score": 0,
+            "passed": False,
+            "dimension_scores": {dim: {"score": 0, "comment": f"JSON解析失败: {e}"} for dim in _WEIGHTS},
+            "issues": ["LLM 输出非有效 JSON"],
+            "rewrite_suggestions": ["请检查 LLM 输出格式"],
+        }
 
     # ═══════ 【L4 工程】代码重算分数 ← 防 LLM 算术错误 ═══════
     # LLM 输出的 overall_score 可能不是真正的加权和。

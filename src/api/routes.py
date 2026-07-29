@@ -67,6 +67,22 @@ logger = logging.getLogger("competitive_analysis")
 # §1 Pydantic 数据模型
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _split_i18n_commas(items: list[str]) -> list[str]:
+    """防御性拆分：中英文逗号都认，trim 空白，去空串。
+
+    【L4 工程】前端已做 split(/[,，]/)，但后端加防御层：
+      — 如果前端拼错（如"王者荣耀，英雄联盟"没拆开），后端自动拆分
+      — 保证 competitors/dimensions 每个元素都是单个名称
+    """
+    result: list[str] = []
+    for item in items:
+        for part in item.replace("，", ",").split(","):
+            cleaned = part.strip()
+            if cleaned:
+                result.append(cleaned)
+    return result
+
+
 class TaskRequest(BaseModel):
     """创建任务请求体。
 
@@ -87,7 +103,17 @@ class TaskRequest(BaseModel):
           — competitors=[] + dimensions=["功能"] → Supervisor 探索（传了但空）
           — competitors=None → 字段未传（跟空列表语义不同）
           — 用 `is not None` 而非 falsy 判断，避免空列表被误判为"未传"
+
+        【L4 工程】中英文逗号兼容：
+          — 前端 split(/[,，]/) 已做，但后端加防御层
+          — 如果前端没拆好（如"王者荣耀，英雄联盟"当成一个元素），后端自动拆
         """
+        # ── 防御性拆分：中文逗号 → 英文逗号 ——
+        if self.competitors:
+            self.competitors = _split_i18n_commas(self.competitors)
+        if self.dimensions:
+            self.dimensions = _split_i18n_commas(self.dimensions)
+
         has_structured = (self.competitors is not None and self.dimensions is not None)
         has_query = bool(self.query and self.query.strip())
         if not has_structured and not has_query:
@@ -305,6 +331,88 @@ def _get_pool(request: Request) -> Pool:
     return pool
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# LLM 实体提取：从自然语言 query 提取 competitors + dimensions
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ENTITY_EXTRACT_PROMPT = """从用户的竞品分析需求中提取结构化信息。
+
+输出格式（仅 JSON，无其他文字）：
+{"competitors": ["竞品名1", "竞品名2", ...], "dimensions": ["维度1", "维度2", ...]}
+
+规则：
+- competitors: 用户提到的竞品名称列表（产品/公司/品牌名），如果没有明确提到则返回 []
+- dimensions: 用户关心的分析维度列表（如"定价""功能""技术架构""市场"等），如果没提到也返回 []
+
+用户输入：%s
+JSON 输出："""
+
+
+async def _extract_entities_from_query(query: str, request: Request) -> dict:
+    """用 LLM 从自然语言 query 中提取竞品名和维度。
+
+    【2026-07-29 新增】修复 routes.py 中"交给 IntentRouter 的 LLM 实体提取"
+    只有注释没有实现的问题。
+
+    Args:
+        query: 用户自然语言输入
+        request: FastAPI Request（用于获取 settings 中的 API key）
+
+    Returns:
+        {"competitors": [str], "dimensions": [str]}
+        失败时返回 {"competitors": [], "dimensions": []}
+    """
+    import json as _json
+    from src.agents import create_llm_client
+
+    try:
+        settings = request.app.state.settings
+        llm = create_llm_client(settings, temperature=0.0)
+        prompt = _ENTITY_EXTRACT_PROMPT % query
+        resp = await llm.ainvoke(prompt)
+        text = (resp.content or "").strip()
+
+        # 清理 markdown 代码块
+        if text.startswith("```"):
+            text = text[3:]
+            nl = text.find("\n")
+            if nl >= 0:
+                text = text[nl:].strip()
+            if text.endswith("```"):
+                text = text[:-3].strip()
+
+        # 提取 JSON 对象
+        brace_idx = text.find("{")
+        if brace_idx >= 0:
+            brace_end = text.rfind("}")
+            if brace_end > brace_idx:
+                text = text[brace_idx:brace_end + 1]
+
+        parsed = _json.loads(text)
+        competitors = parsed.get("competitors", []) or []
+        dimensions = parsed.get("dimensions", []) or []
+
+        # 类型防御：LLM 可能返回字符串而非列表
+        if isinstance(competitors, str):
+            competitors = [competitors]
+        if isinstance(dimensions, str):
+            dimensions = [dimensions]
+
+        # 过滤非法值
+        competitors = [c for c in competitors if isinstance(c, str) and c.strip()]
+        dimensions = [d for d in dimensions if isinstance(d, str) and d.strip()]
+
+        logger.info(
+            "LLM 实体提取: query=%r → competitors=%s, dimensions=%s",
+            query[:60], competitors, dimensions,
+        )
+        return {"competitors": competitors, "dimensions": dimensions}
+
+    except Exception:
+        logger.exception("LLM 实体提取失败，将使用默认值")
+        return {"competitors": [], "dimensions": []}
+
+
 def _make_task_dict(
     task_id: UUID,
     request_body: TaskRequest,
@@ -406,6 +514,7 @@ async def _execute_task(
                 "user_query": enriched_task["title"],
                 # §2 探索结果（初始为空，ReAct 循环动态填充）
                 "found_competitors": enriched_task["competitors"],
+                "dimensions": enriched_task["dimensions"],
                 "collected_data": {},
                 "analysis_results": {},
                 "report_content": "",
@@ -520,7 +629,7 @@ async def create_task(
 
     # ── 构造 llm_parsed ──
     # 如果传了 competitors + dimensions → intent 明确
-    # 如果只传了 query → 交给 IntentRouter 的 LLM 实体提取
+    # 如果只传了 query → LLM 从自然语言中提取实体
     llm_parsed = {
         "competitors": body.competitors or [],
         "dimensions": body.dimensions or [],
@@ -528,6 +637,21 @@ async def create_task(
     }
     if body.query:
         llm_parsed["query"] = body.query
+
+    # ── LLM 实体提取：有 query 但无 competitors/dimensions 时自动从自然语言提取 ──
+    # 【2026-07-29 BUG修复】之前注释写"交给 IntentRouter 的 LLM 实体提取"，
+    # 但代码从没实现这一步。导致 "对比王者荣耀和英雄联盟在玩法设计、美术风格上的表现"
+    # → competitors=[], dimensions=[] → classify → supervisor → "待探索" → 死循环。
+    if body.query and (not llm_parsed["competitors"] or not llm_parsed["dimensions"]):
+        extracted = await _extract_entities_from_query(body.query, request)
+        if extracted["competitors"]:
+            llm_parsed["competitors"] = extracted["competitors"]
+        if extracted["dimensions"]:
+            llm_parsed["dimensions"] = extracted["dimensions"]
+        # 重新评估 intent_is_clear（提取后有值时可能改变）
+        llm_parsed["intent_is_clear"] = bool(
+            llm_parsed["competitors"] and llm_parsed["dimensions"]
+        )
 
     # ── 写入 DB ──
     pool = _get_pool(request)

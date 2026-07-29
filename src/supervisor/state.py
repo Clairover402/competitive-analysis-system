@@ -130,6 +130,11 @@ class SupervisorState(TypedDict):
     # §2 探索结果 — _act + _observe 逐步填充
     # ══════════════════════════════════════════════════════════════════════
 
+    dimensions: list[str]
+    """分析维度列表。用户在任务创建时指定，全链路透传供 think 节点注入 arguments。
+    【2026-07-29 补充】此前缺失此字段导致 LLM 无法将 dimensions 写入 arguments，
+    触发 HarnessGuard 参数校验 "缺少必填字段: dimensions"。"""
+
     found_competitors: list[str]
     """动态发现的竞品列表（逐轮追加，非初始化确定）。
     observe 收到 collector 的 result 后赋值。"""

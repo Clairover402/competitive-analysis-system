@@ -175,7 +175,12 @@ def _make_node_collect(mcp_server: MCPServer, llm: ChatDeepSeek):
             "competitors": state["competitors"],
             "dimensions": state["dimensions"],
         }
-        logger.info("【Pipeline】collect 开始, task=%s", state["task_id"])
+        logger.info(
+            "【Pipeline】collect node ── task=%s title=%r 竞品=%d(%s) 维度=%d(%s)",
+            state["task_id"], state.get("title", ""),
+            len(state["competitors"]), ",".join(state["competitors"]),
+            len(state["dimensions"]), ",".join(state["dimensions"]),
+        )
         result = await collector_agent(task, mcp_server, llm)
         return {
             "collected_data": result,
@@ -216,7 +221,9 @@ def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek, engine: LongTer
             "dimensions": state["dimensions"],
             "memory_context": memory_context,
         }
-        logger.info("【Pipeline】analyze 开始, task=%s, memories=%d", state["task_id"], len(memories))
+        logger.info("【Pipeline】analyze node ── task=%s 维度=%d 记忆=%d 版本=%d(第%d轮)",
+                    state["task_id"], len(state["dimensions"]), len(memories),
+                    state.get("report_version", 1), state.get("remaining_steps", 3))
         result = await analyzer_agent(task, mcp_server, llm)
         return {"analysis_results": result, "retrieved_memories": memories}
     return node_analyze
@@ -259,9 +266,26 @@ def _make_node_write(mcp_server: MCPServer, llm: ChatDeepSeek):
             "dimensions": state["dimensions"],
             "analysis_results": state.get("analysis_results", {}),
             "rewrite_suggestions": state.get("rewrite_suggestions"),
+            # 【2026-07-29 修复】把上一次 Quality 的完整评分信息传给 Writer
+            # 之前只传 rewrite_suggestions（LLM 随口说的"补引用"），
+            # Writer 不知道每个维度具体扣了多少分、为什么扣分。
+            # 现在传完整诊断：完整性42分（漏维度）、可追溯性30分（3处缺source_url）
+            # → Writer 能针对性修正 → 分数从 58→23→50 变为 58→75（一次通过）
+            "previous_quality": {
+                "overall_score": state.get("quality_score", 0),
+                "dimensions": state.get("quality_details", {}),
+            },
         }
-        logger.info("【Pipeline】write 开始, task=%s version=%d",
-                    state["task_id"], state.get("report_version", 0) + 1)
+        version = state.get("report_version", 0) + 1
+        steps_left = state.get("remaining_steps", 3) - 1
+        is_rewrite = state.get("rewrite_suggestions") is not None
+        prev_score = state.get("quality_score", 0)
+        logger.info(
+            "【Pipeline】write node ── task=%s v%d %s steps_left=%d prev_score=%.0f",
+            state["task_id"], version,
+            "🔄改写" if is_rewrite else "📝初稿",
+            steps_left, prev_score,
+        )
         result = await writer_agent(task, mcp_server, llm)
         return {
             "report_content": result["report_markdown"],
@@ -298,7 +322,8 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
             "report_markdown": state["report_content"],
             "version": state.get("report_version", 1),
         }
-        logger.info("【Pipeline】quality 开始, task=%s", state["task_id"])
+        logger.info("【Pipeline】quality node ── task=%s v=%d", 
+                    state["task_id"], state.get("report_version", 1))
         result = await quality_agent(task, mcp_server, llm)
         return {
             "quality_score": result["overall_score"],
@@ -309,7 +334,7 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
     return node_quality
 
 
-def _make_node_finalize(pool: Pool, engine: LongTermMemoryEngine | None = None, llm_extract: ChatDeepSeek | None = None):
+def _make_node_finalize(pool: Pool):
     """创建 finalize 节点函数（注入 Pool，不是 LLM）。
 
     【L5 决策】finalize 为什么需要 pool 而不是 llm？
@@ -334,39 +359,16 @@ def _make_node_finalize(pool: Pool, engine: LongTermMemoryEngine | None = None, 
             final_report 可能是低分报告 ← 调用方需要检查 quality_score
           — 不能假设 final_report 一定是一份通过的报告
         """
-        logger.info("【Pipeline】finalize 开始, task=%s score=%.0f",
-                    state["task_id"], state.get("quality_score", 0))
+        logger.info("【Pipeline】finalize node ── task=%s score=%.0f passed=%s",
+                    state["task_id"], state.get("quality_score", 0),
+                    state.get("quality_passed", False))
 
         task_dao = TaskDAO(pool)
         await task_dao.update_status(state["task_id"], "completed")
 
-        # Persist 3-5 key decisions to long-term memory
-        if engine and state.get("report_content"):
-            try:
-                extract_prompt = (
-                    "Extract 3-5 key decisions, user preferences, or important facts from the competitive analysis report below. "
-                    "One per line, format: {type}|{content} "
-                    "type must be one of: decision/preference/fact. "
-                    "No other text. "
-                    "\n\nReport:\n" + state["report_content"][:3000]
-                )
-                llm_result = await llm_extract.ainvoke(extract_prompt)
-                lines = llm_result.content.strip().split("\n")
-                for line in lines:
-                    line = line.strip()
-                    if "|" in line:
-                        parts = line.split("|", 1)
-                        mem_type = parts[0].strip()
-                        mem_content = parts[1].strip()
-                        if mem_type in ("decision", "preference", "fact") and len(mem_content) > 5:
-                            await engine.add_memory(
-                            user_id=state["user_id"],
-                                content=mem_content,
-                                memory_type=mem_type,
-                                source_task_id=state["task_id"],
-                            )
-            except Exception:
-                logger.exception("Failed to persist memories from report")
+        # 【L5 决策】长期记忆不再自动从报告提取
+        # 原因：报告中的"Google市场份额23%"这类临时数据不应作为用户画像
+        # 长期记忆改为手动写入路径（由用户明确偏好/决策驱动），详见 MEMORY.md
 
         return {
             "final_report": state["report_content"],
@@ -512,7 +514,7 @@ async def build_pipeline_graph(
     graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer, ltm_engine))
     graph.add_node("write", _make_node_write(mcp_server, llm_writer))
     graph.add_node("quality", _make_node_quality(mcp_server, llm_quality))
-    graph.add_node("finalize", _make_node_finalize(pool, ltm_engine, llm_analyzer))
+    graph.add_node("finalize", _make_node_finalize(pool))
 
     # ─── 确定性边 ───
     # 【L3 核心考点】add_edge("A", "B")

@@ -394,9 +394,21 @@ def _format_progress_message(
             time_str = f" · {duration_ms:.0f}毫秒"
 
     # ═══════════════════════════════════════════════════════════
-    # Collector: 采集阶段
+    # Collector: 采集阶段（含中间进度）
     # ═══════════════════════════════════════════════════════════
     if agent == "collector":
+        if action == "generate_keywords":
+            # 中间进度：正在为竞品生成搜索词
+            return f"🔍 Collector 正在生成搜索关键词...{time_str}"
+        if action == "search_complete":
+            # 中间进度：搜索完成
+            queries = response.get("queries", 0)
+            return f"🔍 Collector 搜索完成: {queries}条查询{time_str}"
+        if action == "fetch_complete":
+            # 中间进度：抓取完成
+            pages = response.get("pages", 0)
+            with_text = response.get("with_text", 0)
+            return f"📥 Collector 抓取完成: {pages}页面(有效{with_text}){time_str}"
         if action == "collect_and_store":
             total_pages = response.get("total_pages", 0)
             total_chunks = response.get("total_chunks", 0)
@@ -413,9 +425,16 @@ def _format_progress_message(
         return f"Collector: {action}{time_str}"
 
     # ═══════════════════════════════════════════════════════════
-    # Analyzer: 分析阶段
+    # Analyzer: 分析阶段（含中间进度）
     # ═══════════════════════════════════════════════════════════
     if agent == "analyzer":
+        if action == "dim_analysis":
+            # 中间进度：单个维度分析完成
+            dim = response.get("dimension", "?")
+            if "error" in response:
+                return f"⚠️ Analyzer: {dim} 分析失败 ({(response.get('error','') or '?')[:60]}){time_str}"
+            comps = response.get("competitors", 0)
+            return f"🟡 Analyzer: {dim} 分析完成({comps}竞品){time_str}"
         if action == "multi_dimension_analysis":
             dims = response.get("dimensions_analyzed", [])
             dim_count = response.get("dimensions_count", len(dims))

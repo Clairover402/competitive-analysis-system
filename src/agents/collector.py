@@ -124,50 +124,76 @@ async def _generate_keywords(
     """
     dims_str = json.dumps(dimensions, ensure_ascii=False)
     prompt = _KEYWORD_PROMPT % (competitor, dims_str)
-    try:
-        resp = await llm.ainvoke(prompt)
-        text = (resp.content or "").strip()
-        # 【L4 工程】防御空响应：LLM 有时返回空内容（rate limit / 上下文溢出）
-        if not text:
-            logger.warning("日志：LLM返回空内容，competitor=%r，使用模板兜底", competitor)
-            raise ValueError("LLM returned empty response")
-        # 清理可能的 markdown 代码块包裹（模型输出防御）
-        # 【L4 工程】模型不一定严格遵守"只输出 JSON"的指令，
-        # 有时会给 ```json\n...\n```，所以统一预处理
-        if text.startswith("```"):
-            parts = text.split("`", 2)
-            if len(parts) > 2:
-                text = parts[2].split("```", 1)[0].strip()
+
+    # ── 以空响应重试来容错模型临时的返回格式异常 ──
+    max_attempts = 2
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            resp = await llm.ainvoke(prompt)
+            text = (resp.content or "").strip()
+
+            # 【L4 工程】防御空响应：LLM 有时返回空内容
+            if not text:
+                raise ValueError("LLM returned empty response (attempt %d)" % (attempt + 1))
+
+            # 清理可能的 markdown 代码块包裹
+            # 【2026-07-29 强化】兼容更多格式变体：```json\n...```、```list\n...```、
+            # 甚至直接 ```[...]```（无语言标识）
+            if text.startswith("```"):
+                # 去掉开头的 ``` 及可选的语言标识行
+                # 格式: ```json\n...\n``` 或 ```\n...\n``` 或 ```[...]```
+                cleaned = text[3:]  # 去掉前3个反引号
+                newline_idx = cleaned.find("\n")
+                if newline_idx >= 0:
+                    cleaned = cleaned[newline_idx:].strip()
+                else:
+                    # 无换行：结尾是 ``` → 去掉
+                    if cleaned.endswith("```"):
+                        cleaned = cleaned[:-3].strip()
+                    else:
+                        cleaned = cleaned.strip()
+                # 去掉结尾的 ```
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3].strip()
+                text = cleaned
+
+            # 【2026-07-29 强化】兼容 "前面解释+JSON" 格式
+            # 在 LLM 不遵守"只输出 JSON"时，从文本中提取 [ 到 ] 部分
+            if not text.startswith("["):
+                bracket_idx = text.find("[")
+                if bracket_idx >= 0:
+                    bracket_end = text.rfind("]")
+                    if bracket_end > bracket_idx:
+                        text = text[bracket_idx:bracket_end + 1]
+
+            # 【2026-07-29 强化】空值二次防御 + JSONDecodeError 重试
+            if not text or not text.strip():
+                raise ValueError("LLM output became empty after extraction (attempt %d)" % (attempt + 1))
+
+            keywords = json.loads(text)
+            if isinstance(keywords, list) and len(keywords) > 0:
+                logger.info("日志：LLM为 %r 生成了 %d 个关键词", competitor, len(keywords))
+                return keywords
             else:
-                text = text.strip("`").strip()
-        # 【L4 工程】防御非 JSON 输出（LLM 返回自然语言兜底文本）
-        # 尝试从文本中提取 JSON 列表部分，解决"前面解释+后面 JSON"的格式
-        if not text.startswith("["):
-            # 找到第一个 '[' 作为 JSON 起点
-            bracket_idx = text.find("[")
-            if bracket_idx >= 0:
-                text = text[bracket_idx:]
-                # 找到最后一个 ']' 作为 JSON 终点
-                bracket_end = text.rfind("]")
-                if bracket_end >= 0:
-                    text = text[:bracket_end + 1]
-        # 二次空值防御：提取后可能是空字符串（LLM 只返回了解释文字）
-        if not text or not text.strip():
-            raise ValueError("LLM output became empty after extraction")
-        keywords = json.loads(text)
-        if isinstance(keywords, list) and len(keywords) > 0:
-            logger.info("日志：LLM为 %r 生成了 %d 个关键词", competitor, len(keywords))
-            return keywords
-        else:
-            logger.warning("日志：LLM返回非列表或空列表，competitor=%r", competitor)
-            raise ValueError("LLM returned non-list keywords")
-    except Exception:
-        # 【L4 工程】exc_info=False —— 降级到模板是正常路径，不需要打堆栈
-        logger.warning(
-            "日志：为 %r 生成关键词失败，将使用模板兜底（原因: %s）",
-            competitor,
-            _extract_error_root_cause(),
-        )
+                raise ValueError("LLM returned non-list or empty list (attempt %d)" % (attempt + 1))
+
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                logger.warning(
+                    "关键词生成第%d次尝试失败: %s，重试中...",
+                    attempt + 1, str(e)[:120],
+                )
+                continue  # 重试
+
+    # ── 2 次尝试均失败 → 记录根因 + 降级到模板 ──
+    logger.warning(
+        "为 %r 生成关键词失败(%d次尝试)，将使用模板兜底（根因: %s）",
+        competitor,
+        max_attempts,
+        _extract_error_root_cause() if last_error else "unknown",
+    )
     # 兜底：模板拼接 {竞品} {维度}
     # 【L4 工程】这是设计契约的最低保证——无论如何不会返回空列表
 
@@ -313,16 +339,34 @@ async def collector_agent(
     for competitor in competitors:
         result[competitor] = {"chunk_ids": [], "pages": []}
 
-    # ──────────── 步骤1: LLM 生成搜索关键词 ────────────
+    # ══════════════════════════════════════════════════════════
+    # 步骤1: LLM 生成搜索关键词
+    # ══════════════════════════════════════════════════════════
+    t_generate = time.perf_counter()
     # 【L4 工程】每个竞品独立调用 LLM 生成 query
     # 不并行化（llm.ainvoke 不支持同时多请求，除非用多 key 池）
-    all_queries: list[tuple[str, str, str]] = []  # (competitor, dimension, query)
+    all_queries: list[tuple[str, str]] = []  # (competitor, query)
+    per_competitor_keywords: dict[str, list[str]] = {}  # 记录每个竞品的关键词生成结果
     for competitor in competitors:
         keywords = await _generate_keywords(competitor, dimensions, llm)
-        # keyword × dimension 笛卡尔积 → 每个 query 对照每个维度搜索
+        per_competitor_keywords[competitor] = keywords
+        # 每个关键词搜索一次（不去重，留给后面的 seen_urls 处理）
         for kw in keywords:
-            for dim in dimensions:
-                all_queries.append((competitor, dim, kw))
+            all_queries.append((competitor, kw))
+    
+    # ── ✏️ 日志：关键词生成完成（含每个竞品的详细结果）──
+    await log_dao.log(
+        task_id=task_id, agent_name="collector", action="generate_keywords",
+        request={"competitors": competitors, "dimensions": dimensions},
+        response={
+            "total_queries": len(all_queries),
+            "per_competitor": {
+                c: {"keyword_count": len(kws), "keywords": kws}
+                for c, kws in per_competitor_keywords.items()
+            },
+        },
+        duration_ms=round((time.perf_counter() - t_generate) * 1000, 1),
+    )
 
     """
     
@@ -346,7 +390,7 @@ async def collector_agent(
     # 不是多线程/多进程——所有协程在单线程中交替执行，IO 等待时让出。
     # 【L4 工程】Semaphore 限制实际并发数，保护目标服务不被 DDoS
 
-    async def _search_one(competitor: str, _dim: str, query: str):
+    async def _search_one(competitor: str, query: str):
         async with semaphore:
             resp = await mcp_server.call_tool("web_search", {"query": query, "max_results": 3})
             # 【L4 工程】MCP 错误处理：不因为单条搜索失败而阻塞整个 gather
@@ -360,8 +404,30 @@ async def collector_agent(
                                 competitor, query[:50], e)
                 return (competitor, [])
 
-    search_tasks = [_search_one(c, d, q) for (c, d, q) in all_queries]
+    search_tasks = [_search_one(c, q) for (c, q) in all_queries]
+    t_search = time.perf_counter()
     search_results = await asyncio.gather(*search_tasks)
+
+    # ── ✏️ 日志：搜索完成（含每个竞品的搜索结果明细）──
+    search_detail: dict[str, dict] = {}
+    total_results = 0
+    for competitor, results in search_results:
+        if competitor not in search_detail:
+            search_detail[competitor] = {"total": 0, "sample_urls": []}
+        search_detail[competitor]["total"] += len(results)
+        total_results += len(results)
+        if results:
+            # 取首条结果的标题和 URL 作为样本
+            first = results[0]
+            search_detail[competitor]["sample_urls"].append(
+                {"title": first.get("title", "")[:50], "url": first.get("url", "")}
+            )
+    await log_dao.log(
+        task_id=task_id, agent_name="collector", action="search_complete",
+        request={"queries": len(search_results)},
+        response={"total_results": total_results, "per_competitor": search_detail},
+        duration_ms=round((time.perf_counter() - t_search) * 1000, 1),
+    )
 
     # ──────────── 搜索结果去重 + 分组 ────────────
     # 【L4 工程】URL 全局去重：不同 query 可能返回相同的 URL
@@ -372,10 +438,40 @@ async def collector_agent(
         "baike.baidu.com",  # 百度百科——双重反爬（TLS fingerprint + cookie）
     }
 
+    # 【2026-07-29 修复】搜索结果相关性过滤
+    # 问题：搜索 "英雄联盟 玩法设计" → Bing 返回 "英雄（张艺谋电影）"、
+    # "英雄_CCTV节目" → Collector 抓这些页面存为 chunk → Analyzer 面对
+    # 电影/电视剧的内容无法做竞品分析 → [数据不足]。
+    # 这不是"英雄联盟"的个例——任何模糊匹配的搜索词都可能被同名词条污染。
+    # 修复：搜索结果标题必须包含竞品名的至少一个关键词子串（或已知别名），
+    # 否则丢弃。关键词子串 = 对竞品名按空格/tab分词后的所有非停用词片段。
+    def _build_relevance_filter(competitor_name: str) -> set[str]:
+        """从竞品名构建相关性关键词集合。
+        例："英雄联盟" → {"英雄联盟", "LOL", "League"}
+        例："王者荣耀" → {"王者荣耀", "王者", "荣耀"}
+        例："Notion" → {"Notion"}
+        """
+        terms: set[str] = set()
+        # 完整名必保留
+        terms.add(competitor_name.strip().lower())
+        # 分词子串（按空格/tab分词，过滤单字）
+        for token in competitor_name.split():
+            token = token.strip().lower()
+            if len(token) >= 2:
+                terms.add(token)
+        return terms
+
+    def _result_relevant(title: str, snippet: str, filter_terms: set[str]) -> bool:
+        """检查搜索结果是否与竞品相关。"""
+        combined = (title + " " + snippet).lower()
+        return any(term in combined for term in filter_terms)
+
     seen_urls: set[str] = set()
     competitor_urls: dict[str, list[dict]] = {c: [] for c in competitors}
     skipped_baike: int = 0  # 跳过的反爬域名计数
+    skipped_irrelevant: int = 0  # 跳过的无关搜索结果计数
     for competitor, results in search_results:
+        filter_terms = _build_relevance_filter(competitor)
         for r in results:
             url = r.get("url", "")
             if url and url not in seen_urls:
@@ -388,6 +484,12 @@ async def collector_agent(
                 if host in _ANTI_SCRAPE_DOMAINS:
                     skipped_baike += 1
                     continue
+                # 结果相关性过滤：标题+snippet不包含竞品关键词 → 跳过
+                if not _result_relevant(
+                    r.get("title", ""), r.get("snippet", ""), filter_terms
+                ):
+                    skipped_irrelevant += 1
+                    continue
                 seen_urls.add(url)
                 competitor_urls[competitor].append({
                     "url": url,
@@ -396,6 +498,8 @@ async def collector_agent(
                 })
     if skipped_baike:
         logger.info("日志：跳过 %d 个反爬域名的URL（baike.baidu.com等）", skipped_baike)
+    if skipped_irrelevant:
+        logger.info("日志：跳过 %d 个不相关搜索结果（标题不包含竞品关键词）", skipped_irrelevant)
 
     # ──────────── 步骤3: 并发抓取网页内容 ────────────
     # 【L4 工程】每个竞品最多抓取 5 条 URL（urls[:5]）
@@ -436,15 +540,57 @@ async def collector_agent(
         for u in urls[:5]:  # 每竞品最多 5 条 URL
             fetch_tasks.append(_fetch_one(competitor, u))
 
+    t_fetch = time.perf_counter()
     fetch_results = await asyncio.gather(*fetch_tasks)
+
+    # ── ✏️ 日志：抓取完成（含每页文字量明细）──
+    fetch_detail: dict[str, dict] = {}
+    fetched_pages = 0
+    fetched_chars = 0
+    for competitor, page in fetch_results:
+        if competitor not in fetch_detail:
+            fetch_detail[competitor] = {"pages": 0, "empty_pages": 0, "total_chars": 0}
+        fetch_detail[competitor]["pages"] += 1
+        text = page.get("text", "")
+        if text:
+            fetched_pages += 1
+            fetched_chars += len(text)
+            fetch_detail[competitor]["total_chars"] += len(text)
+        else:
+            fetch_detail[competitor]["empty_pages"] += 1
+    await log_dao.log(
+        task_id=task_id, agent_name="collector", action="fetch_complete",
+        request={"pages": len(fetch_results), "with_text": fetched_pages},
+        response={
+            "total_chars": fetched_chars,
+            "per_competitor": fetch_detail,
+        },
+        duration_ms=round((time.perf_counter() - t_fetch) * 1000, 1),
+    )
 
     # ──────────── 步骤4: 文本分块 ────────────
     # 收集所有有文本的页面 → 逐个分块
+    # 【2026-07-29 修复】内容质量门禁：剔除无效的 SPA 骨架页面
+    #  httpx 只能拿到 HTML 源码，不能执行 JS → 现代 SPA 网站（pvp.qq.com、douban）
+    #  返回的 text 只有导航栏、页脚、loading 文案等 20~100 字符的骨架。
+    #  这些页面嵌入后变成噪音向量，污染 RAG 检索结果 → Analyzer [数据不足]。
+    #  修复：统计中文汉字密度（CJK Unified Ideographs），< 200 汉字 → 丢弃。
+    _MIN_CJK_CHARS = 200
     all_texts: list[str] = []
     text_meta: list[dict] = []  # {competitor, url, title, chunk_texts: [...]}
+    discarded_pages: int = 0
     for competitor, page in fetch_results:
         result[competitor]["pages"].append(page)
         if page["text"]:
+            # ── 内容质量门禁：统计有效汉字数 ──
+            cjk_count = sum(1 for ch in page["text"] if '\u4e00' <= ch <= '\u9fff')
+            if cjk_count < _MIN_CJK_CHARS:
+                discarded_pages += 1
+                logger.info(
+                    "日志：丢弃低质量页面 competitor=%r url=%s CJK=%d（阈值=%d）",
+                    competitor, page["url"], cjk_count, _MIN_CJK_CHARS,
+                )
+                continue  # 跳过 SPA 骨架页面，不进入分块和嵌入
             all_texts.append(page["text"])
             text_meta.append({
                 "competitor": competitor,
@@ -452,6 +598,8 @@ async def collector_agent(
                 "title": page["title"],
                 "chunk_texts": [],
             })
+    if discarded_pages:
+        logger.info("日志：内容门禁丢弃 %d 个低质量页面，保留 %d 个", discarded_pages, len(text_meta))
 
     for i, text in enumerate(all_texts):
         chunks = _chunk_text(text)

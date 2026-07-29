@@ -187,8 +187,8 @@ export function mount() {
 
     try {
       var body = { title: title || '\u672A\u547D\u540D' };
-      if (competitors) body.competitors = competitors.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
-      if (dimensions) body.dimensions = dimensions.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+      if (competitors) body.competitors = competitors.split(/[,，]/).map(function(s) { return s.trim(); }).filter(Boolean);
+      if (dimensions) body.dimensions = dimensions.split(/[,，]/).map(function(s) { return s.trim(); }).filter(Boolean);
       var data = await API.post('/api/tasks', body);
       showMsg('> \u4EFB\u52A1\u5DF2\u521B\u5EFA :: ' + data.task_id, 'success');
       SFX.confirm();

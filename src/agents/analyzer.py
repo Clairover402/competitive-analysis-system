@@ -142,9 +142,94 @@ _ANALYSIS_PROMPT = """你是一个竞品分析专家。基于给出的网页文�
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 单维度 RAG 检索 + 分析
+# 正文智能截取工具
 # ═════════════════════════════════════════════════════════════════════════════
 
+# 【L4 工程】导航栏噪音行特征库
+# web_fetch 提取的页面文本前 200 字符通常是导航栏/页眉，
+# 这些行短（<50字符）、多为功能词（首页/登录/注册/搜索）。
+# LLM 读到"首页 搜索 登录 产品 价格 联系我们" → 判无有效信息 → [数据不足]。
+_NAV_NOISE_PATTERNS: list[str] = [
+    "首页", "搜索", "登录", "注册", "退出", "我的", "购物车",
+    "联系我们", "关于我们", "服务条款", "隐私政策", "网站地图",
+    "导航", "菜单", "目录", "回到顶部", "分享到", "扫描二维码",
+    "下载APP", "打开APP", "关注我们", "微信公众号", "微博", "收藏本站",
+    "切换语言", "English", "Language", "Menu", "Search", "Login",
+    "热搜", "热门推荐", "推荐文章", "最新文章", "热门标签",
+    "上一篇", "下一篇", "设为首页", "加入收藏", "会员中心",
+]
+
+
+def _smart_slice(text: str, max_chars: int = 1500) -> str:
+    """智能截取：跳过页面导航栏/页眉噪音，从第一个正文段落开始截取。
+
+    【L4 工程】核心思路
+    ------------------------------------------------------------
+    不改变截取长度（1500 字符），只改变"从哪里截"。
+
+    原文（从 web_fetch 出来）：
+      "首页 搜索 登录 注册 我的 \n \n \n
+       飞书企业版定价策略深度解析 \n \n
+       2024年Q4飞书将企业版价格从¥200/人/月..."
+
+    doc[:1500] 的结果：
+      "首页 搜索 登录 注册 我的 飞书企业版定价策..."
+      → LLM 看到导航栏 + 截断的标题 → "无有效信息"
+
+    _smart_slice(doc, 1500) 的结果：
+      "飞书企业版定价策略深度解析 \n \n
+       2024年Q4飞书将企业版价格从¥200/人/月..."
+      → LLM 直接看到正文 → 完整分析
+
+    算法：
+      ① 按行分割文本
+      ② 跳过前导短行（<50 字符 且 匹配导航噪音词）
+      ③ 找到第一个正文行（>50 字符 或 不含噪音词）
+      ④ 从该行开始截取 max_chars
+
+    Args:
+        text: web_fetch 提取的原始文本
+        max_chars: 最大截取字符数（默认 1500）
+
+    Returns:
+        截取后的正文文本，保证有内容（至少 1 字符）
+    """
+    if not text:
+        return ""
+
+    lines = text.split("\n")
+    first_content_idx = 0
+
+    # 扫描跳过前导噪音行
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # 空行 → 继续
+        if not stripped:
+            continue
+        # 短行 + 匹配噪音词 → 是导航栏，跳过
+        if len(stripped) < 50 and _is_nav_noise(stripped):
+            continue
+        # 找到第一个正文行
+        first_content_idx = i
+        break
+
+    # 从正文行开始拼接
+    sliced = "\n".join(lines[first_content_idx:])
+    result = sliced[:max_chars].strip()
+    # 极端情况：全部被过滤 → 返还原文（兜底）
+    return result if result else text[:max_chars].strip()
+
+
+def _is_nav_noise(line: str) -> bool:
+    """判断一行文本是否为导航栏噪音（匹配特征库）。"""
+    for pattern in _NAV_NOISE_PATTERNS:
+        if pattern in line:
+            return True
+    return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 单维度 RAG 检索 + 分析
 async def _retrieve_and_analyze_dimension(
     task_id: str,
     competitors: list[str],
@@ -243,13 +328,18 @@ async def _retrieve_and_analyze_dimension(
             top_sources = [r["source_url"] for r in merged[:15]]
 
         # ─── Step 6: LLM 分析 ───
-        # 【L4 工程】每个 chunk 截取 1500 字符
+        # 【L4 工程】智能截取：跳过页面导航栏/页眉垃圾，只取正文
+        # 问题：web_fetch 提取的文本前 200 字符通常是导航栏
+        #   ("首页 搜索 登录 注册 我的 购物车 联系我们")，
+        #   直接 doc[:1500] 会把这段垃圾喂给 LLM → 判无有效信息 → [数据不足]。
+        # 修复：跳过前导短行（<50字符的导航栏文本），从第一个真正段落开始截取。
         # 15 chunks × 1500 chars = 22500 chars ≈ 8000~12000 tokens
         # + prompt ≈ 500 tokens → 总共 ~12K tokens
         # 在 DeepSeek 128K 窗口内完全安全
         chunks_text = ""
         for i, (doc, src) in enumerate(zip(top_docs, top_sources)):
-            chunks_text += f"[片段{i+1}] (来源: {src})\n{doc[:1500]}\n\n"
+            sliced = _smart_slice(doc, max_chars=1500)
+            chunks_text += f"[片段{i+1}] (来源: {src})\n{sliced}\n\n"
 
         prompt = _ANALYSIS_PROMPT % (dimension, competitors, chunks_text)
         resp = await llm.ainvoke(prompt)
@@ -258,7 +348,22 @@ async def _retrieve_and_analyze_dimension(
         # 【L4 工程】LLM 输出防御：模型不一定遵守"只输出 JSON"
         # 有时会包裹 ```json ... ```，预清理防 JSON parse 失败
         if text.startswith("```"):
-            text = text.split("`", 2)[2].split("```", 1)[0].strip()
+            parts = text.split("```", 2)
+            if len(parts) >= 3:
+                text = parts[2].strip()
+            else:
+                text = parts[1].strip()
+
+        if not text:
+            logger.error("【Analyzer】LLM 返回空响应 dimension=%r", dimension)
+            return {c: "[分析失败] LLM返回空响应" for c in competitors}
+
+        # 如果没以 { 开头，尝试提取 JSON 片段
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
 
         result = json.loads(text)
         if not isinstance(result, dict):
@@ -269,6 +374,49 @@ async def _retrieve_and_analyze_dimension(
         # 【L4 工程】全面捕获，返回错误标记而不是抛异常
         logger.exception("Dimension %r analysis failed", dimension)
         return {"error": str(e)}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Analyzer 中间进度辅助函数
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _track_dim_completion(
+    task_id: str,
+    dim_name: str,
+    coro,
+    log_dao,
+):
+    """执行单个维度分析，完成后立即写入 agent_logs → SSE 实时推送。
+
+    【L4 工程】关键设计：不改变并行语义
+    原本是 asyncio.gather(*coros)，gather 的行为是所有 coro 并行跑、
+    全部完成后才返回。现在用这个包装函数保持并行但"每完成一个就写一条日志"。
+    核心技巧：gather 本身不改变——只是每个 coro 内部多了一步 log。
+    并行度完全不变（Semaphore 约束在内部）。
+    """
+    result = await coro
+    # 检查结果类型，决定日志内容
+    if isinstance(result, Exception):
+        await log_dao.log(
+            task_id=task_id, agent_name="analyzer", action="dim_analysis",
+            request={"dimension": dim_name},
+            response={"dimension": dim_name, "error": str(result)},
+        )
+    elif isinstance(result, dict) and "error" in result:
+        await log_dao.log(
+            task_id=task_id, agent_name="analyzer", action="dim_analysis",
+            request={"dimension": dim_name},
+            response={"dimension": dim_name, "error": result["error"]},
+        )
+    else:
+        # 正常完成：统计竞品数量
+        comp_count = len(result) if isinstance(result, dict) else 0
+        await log_dao.log(
+            task_id=task_id, agent_name="analyzer", action="dim_analysis",
+            request={"dimension": dim_name},
+            response={"dimension": dim_name, "competitors": comp_count},
+        )
+    return result
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -322,11 +470,19 @@ async def analyzer_agent(
     #   — 如果某个维度抛了未捕获异常，gather 不会中断整个批次
     #   — 异常作为 Exception 对象出现在 results_list 中
     #   — 由下面的 for 循环处理为 "[分析失败]" 标记
+
+    # 【L4 工程】中间进度：逐维度打日志，让 SSE 实时推送到前端
+    # 因为 gather 是并行的，我们不要等全部完成——改用 asyncio.as_completed
     tasks_coros = [
         _retrieve_and_analyze_dimension(task_id, competitors, dim, chunk_dao, llm, settings)
         for dim in dimensions
     ]
-    results_list = await asyncio.gather(*tasks_coros, return_exceptions=True)
+    # 包装：给每个 coro 打上标签 (dim_name, coro)
+    tagged = [
+        _track_dim_completion(task_id, dim, coro, log_dao)
+        for dim, coro in zip(dimensions, tasks_coros)
+    ]
+    results_list = await asyncio.gather(*tagged, return_exceptions=True)
 
     # ─── 后处理：异常 → [分析失败] + 错误信息 ───
     # 【L5 决策】三种失败处理的分级：
