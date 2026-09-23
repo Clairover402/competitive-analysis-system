@@ -4,6 +4,8 @@
 # ============================================================
 FROM postgres:16-bookworm
 
+# ---- 换国内镜像源（阿里云），加速 apt 下载（ECS 访问境外源极慢） ----
+RUN sed -i "s@deb.debian.org@mirrors.aliyun.com@g" /etc/apt/sources.list.d/debian.sources
 # ---- 系统依赖：编译工具 + SCWS 分词库运行时 ----
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -35,7 +37,8 @@ RUN wget -q http://www.xunsearch.com/scws/down/scws-1.2.3.tar.bz2 && \
     cd /tmp && rm -rf scws-1.2.3*
 
 # ---- 编译安装 zhparser（PG 中文全文检索扩展） ----
-RUN git clone --depth 1 https://github.com/amutu/zhparser.git && \
+# 用 Gitee 镜像（gitee.com/mirrors/zhparser），ECS 访问 GitHub 不通
+RUN git clone --depth 1 https://gitee.com/mirrors/zhparser.git && \
     cd zhparser && \
     make && make install && \
     cd /tmp && rm -rf zhparser
