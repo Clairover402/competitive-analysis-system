@@ -276,6 +276,35 @@ async def embed_texts(
 
     返回：[[0.12, -0.03, ...], ...]，每个内层 list 长度 = 1024
     """
+    if settings is None:
+        settings = Settings()
+
+    # 【ECS 2G 内存方案】API 模式：不加载本地 2GB 模型，走 HTTP
+    # 好处：内存从 ~2.3GB 降到接近 0，2G 机器也能跑；
+    # 模型仍是 BAAI/bge-m3（同一个模型），向量空间与本地一致，旧数据无需重灌。
+    if settings.embedding_api_enabled and settings.siliconflow_api_key:
+        import httpx
+        url = f"{settings.siliconflow_base_url}/embeddings"
+        headers = {
+            "Authorization": f"Bearer {settings.siliconflow_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.embedding_model,   # BAAI/bge-m3
+            "input": texts,
+            "encoding_format": "float",          # 返回 float32，与本地 BGE-M3 一致
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            # OpenAI 兼容格式：data[i].embedding = [1024 维 float]
+            return [item["embedding"] for item in data["data"]]
+        except Exception:
+            logger.exception("embed_texts via SiliconFlow API failed, n=%d", len(texts))
+            return []
+
     try:
         model = _get_embedding_model(settings)
         output = model.encode(
@@ -358,6 +387,42 @@ async def rerank(
     """
     if not documents:
         return []
+
+    if settings is None:
+        settings = Settings()
+
+    # 【ECS 2G 内存方案】API 模式：走 SiliconFlow rerank API
+    if settings.embedding_api_enabled and settings.siliconflow_api_key:
+        import httpx
+        url = f"{settings.siliconflow_base_url}/rerank"
+        headers = {
+            "Authorization": f"Bearer {settings.siliconflow_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.reranker_model,   # BAAI/bge-reranker-v2-m3
+            "query": query,
+            "documents": documents,
+            "top_n": top_k,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            # OpenAI 兼容格式：results[i] = {index, relevance_score}
+            ranked = [
+                {
+                    "index": r["index"],
+                    "text": documents[r["index"]],
+                    "score": float(r["relevance_score"]),
+                }
+                for r in data["results"]
+            ]
+            return ranked
+        except Exception:
+            logger.exception("rerank via SiliconFlow API failed")
+            return []
 
     try:
         tokenizer, model = _get_reranker_model(settings)

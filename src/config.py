@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str = "cpu"
 
+    # ---- Embedding/Rerank API（SiliconFlow 硅基流动）----
+    # 【ECS 2G 内存方案】True = 走在线 API，不加载本地 ~2GB 模型；
+    # False = 走本地 BGE-M3 / reranker 模型（原逻辑，需 ≥4G 内存）
+    embedding_api_enabled: bool = False
+    siliconflow_api_key: str = ""
+    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+
     # ---- Reranker: BGE-reranker-v2-m3 ----
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 

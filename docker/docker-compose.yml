@@ -12,18 +12,19 @@ services:
     container_name: competitive-analysis-pg
     restart: unless-stopped
     ports:
-      - "5433:5432"
+      # 只绑本机回环地址——PG 不暴露公网，安全最佳实践
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: competitive_analysis_pwd
-      POSTGRES_DB: competitive_analysis
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: cas_db
     volumes:
       # 数据持久化（容器删除后数据还在）
       - pgdata:/var/lib/postgresql/data
       # 初始化脚本（首次启动自动执行）
       - ../src/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d competitive_analysis"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cas_db"]
       interval: 10s
       timeout: 5s
       retries: 5
