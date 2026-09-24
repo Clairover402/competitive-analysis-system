@@ -14,7 +14,7 @@ export function render() {
         '<h1 class="pixel-font-display pixel-text-green" style="font-size:18px; letter-spacing:6px">' +
           '\u7ADE \u54C1 \u5206 \u6790 \u7CFB \u7EDF' +
         '</h1>' +
-        '<p class="pixel-text-amber pixel-font-mono" style="font-size:15px; margin-top:10px; letter-spacing:3px">AI \u9A71\u52A8\u7684\u591A Agent \u534F\u4F5C\u5206\u6790\u5E73\u53F0</p>' +
+        '<p class="pixel-text-amber pixel-font-mono" style="font-size:15px; margin-top:10px; letter-spacing:3px">AI \u9A71\u52A8\u7684\u591A Agent \u534F\u4F5C\u5206\u6790\u5E73\u53F0 \u00b7 v2.1</p>' +
       '</div>' +
 
       '<div class="pixel-box" style="padding:32px 28px">' +

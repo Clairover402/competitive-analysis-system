@@ -1,6 +1,6 @@
 # ============================================================
 # 竞品分析系统 — PostgreSQL 定制镜像
-# pgvector (向量检索) + zhparser (中文全文检索) + pg_bigm (中文模糊匹配)
+# pgvector (向量检索) + zhparser (中文全文检索)
 # ============================================================
 FROM postgres:16-bookworm
 
@@ -22,11 +22,6 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends postgresql-16-pgvector && \
     rm -rf /var/lib/apt/lists/*
 
-# ---- 安装 pg_bigm（中文 bigram 模糊匹配） ----
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends postgresql-16-pg-bigm && \
-    rm -rf /var/lib/apt/lists/*
-
 # ---- 编译安装 SCWS（中文分词库，zhparser 依赖） ----
 WORKDIR /tmp
 RUN wget -q http://www.xunsearch.com/scws/down/scws-1.2.3.tar.bz2 && \
@@ -37,8 +32,8 @@ RUN wget -q http://www.xunsearch.com/scws/down/scws-1.2.3.tar.bz2 && \
     cd /tmp && rm -rf scws-1.2.3*
 
 # ---- 编译安装 zhparser（PG 中文全文检索扩展） ----
-# 用 Gitee 镜像（gitee.com/mirrors/zhparser），ECS 访问 GitHub 不通
-RUN git clone --depth 1 https://gitee.com/mirrors/zhparser.git && \
+# 用 gitclone.com 镜像拉官方原版（ECS 访问 GitHub 不通，gitee/mirrors 已下线）
+RUN git clone --depth 1 https://gitclone.com/github.com/amutu/zhparser.git && \
     cd zhparser && \
     make && make install && \
     cd /tmp && rm -rf zhparser

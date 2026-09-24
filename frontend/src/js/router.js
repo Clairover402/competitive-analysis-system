@@ -16,6 +16,25 @@ var routes = [
   { pattern: /^#\/monitor$/i,                      page: 'monitor',     auth: true,  params: [] },
 ];
 
+/* ── 页面模块静态映射表 ──
+   为什么用静态 import 而不是变量拼接：
+   Vite 生产构建（rollup）无法静态分析 `import('../pages/' + page + '.js')`
+   这种运行时拼接的路径，会导致页面模块被打包跳过、dist 里缺失，
+   运行时 404 报「页面加载失败」。静态字面量 import 才能被正确打包。 */
+import * as LoginPage from '../pages/login.js';
+import * as DashboardPage from '../pages/dashboard.js';
+import * as TaskDetailPage from '../pages/task-detail.js';
+import * as ReportPage from '../pages/report.js';
+import * as MonitorPage from '../pages/monitor.js';
+
+var pageModules = {
+  'login':       LoginPage,
+  'dashboard':   DashboardPage,
+  'task-detail': TaskDetailPage,
+  'report':      ReportPage,
+  'monitor':     MonitorPage,
+};
+
 /** 当前挂载的页面模块 */
 var currentPage = null;
 
@@ -72,8 +91,8 @@ async function _route() {
   }
 
   try {
-    // 动态加载页面模块
-    var mod = await import('../pages/' + matched.page + '.js');
+    // 从静态映射表取页面模块（不再用变量拼接 import）
+    var mod = pageModules[matched.page];
 
     // 卸载旧页面
     if (currentPage && currentPage.unmount) {
