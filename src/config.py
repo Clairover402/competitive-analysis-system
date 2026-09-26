@@ -52,6 +52,19 @@ class Settings(BaseSettings):
     jwt_secret: str = ""  # 必须通过 .env 或环境变量设置，不给默认值
     jwt_expire_hours: int = 24
 
+    # ---- Web Search: Tavily（AI Agent 专用搜索 API，免费层 1000 次/月）----
+    # 【2026-09-26】解决 cn.bing.com 被官网/下载页 SEO 霸榜、搜不到点评文章的问题
+    # tavily_api_key 为空时，web_search 自动跳过 Tavily 层，回退到 Bing → Sogou
+    tavily_api_key: str = ""
+    tavily_enabled: bool = True          # 总开关：False 强制关闭 Tavily（即使有 key）
+    tavily_max_results: int = 10
+
+    # ---- Web Fetch: Jina Reader 兜底（免费无 key，抓 SPA 正文）----
+    # 【2026-09-26】实测 r.jina.ai 在当前网络不可达（ConnectTimeout，境外线路），
+    # 默认关闭。保留开关以便未来网络环境变化时启用。
+    # 当前抓 SPA 正文的主力方案改为 Tavily 的 include_raw_content（见 tools_web.py）。
+    jina_reader_enabled: bool = False
+
     # ---- Limits ----
     max_concurrent_collectors: int = 3
     max_rounds_supervisor: int = 10

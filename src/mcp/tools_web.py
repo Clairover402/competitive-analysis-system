@@ -84,6 +84,54 @@ async def web_search(
         [{title: 标题, url: 链接, snippet: 摘要}, ...]，
         极端情况下返回 synthesize 构造的 URL 列表，绝不返回空。
     """
+    # ── L0: Tavily 主引擎（AI Agent 专用，配置了 key 才启用）──
+    # 【2026-09-26】cn.bing.com 对游戏/产品竞品 query 做了强 SEO 干预，
+    # 前 10 条全是官网/下载页/应用商店/百科，点评文章一条都搜不到。
+    # Tavily 返回的本身就是网页正文（不只是链接），且支持 include_domains/
+    # exclude_domains 过滤官网，是“搜到点评文章”的最直接方案。
+    #
+    # 【关键】include_raw_content=True：让 Tavily 服务端渲染并把正文塞进结果，
+    # 解决“搜到 URL → httpx 抓不到 SPA 正文”的死结（jina.ai 实测不可达）。
+    if settings.tavily_enabled and settings.tavily_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": settings.tavily_api_key,
+                        "query": query,
+                        "max_results": settings.tavily_max_results or max_results,
+                        "search_depth": "basic",   # basic=1 credit，advanced=2 credits
+                        "include_raw_content": True,  # 服务端渲染正文，绕开 SPA
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                raw_results = data.get("results", [])
+                results = [
+                    {
+                        "title": r.get("title", ""),
+                        "url": r.get("url", ""),
+                        "snippet": r.get("content", "") or r.get("description", ""),
+                        "raw_content": r.get("raw_content", ""),  # 服务端渲染正文
+                    }
+                    for r in raw_results[:max_results]
+                    if r.get("url")
+                ]
+                if results:
+                    logger.info(
+                        "web_search[Tavily]: query=%r results=%d", query, len(results)
+                    )
+                    return results
+                else:
+                    logger.warning(
+                        "web_search[Tavily]: query=%r 返回0结果，切换 Bing", query
+                    )
+        except Exception:
+            logger.warning(
+                "web_search[Tavily] 失败 query=%r，切换 Bing", query, exc_info=True
+            )
+
     # ── L1: Bing 主引擎 ──
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -131,6 +179,57 @@ async def web_search(
     results = _synthesize_urls(query, max_results)
     logger.info("web_search[synthesize]: query=%r results=%d（构造URL）", query, len(results))
     return results
+
+
+async def _jina_fetch(url: str, max_chars: int = 10000) -> dict:
+    """Jina Reader 兜底抓取 —— 免费无 key，服务端渲染后再抓。
+
+    【2026-09-26】为什么需要 Jina Reader？
+    ------------------------------------------------------------
+    现代官网/点评平台（pvp.qq.com、TapTap、B站专栏）是 SPA，
+    正文靠 JS 动态加载，httpx 只能拿到几十个字符的骨架。
+    Jina Reader（r.jina.ai）在服务端用无头浏览器渲染页面，
+    再把正文转成干净的 Markdown 文本返回——等于“免费的 Playwright”。
+
+    用法：https://r.jina.ai/{url}
+    无 key、无注册，速率受限但对竞品分析的单页兜底足够。
+
+    Returns:
+        同 web_fetch 的结果 dict，失败时 error 字段非空。
+    """
+    result: dict = {
+        "url": url,
+        "title": "",
+        "text_content": "",
+        "status_code": 0,
+        "error": "",
+    }
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept": "text/markdown, text/plain, */*",
+            },
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(jina_url)
+            result["status_code"] = resp.status_code
+            resp.raise_for_status()
+            text = resp.text
+            result["text_content"] = text[:max_chars]
+            # 尝试从 Markdown 首行提取标题（Jina 返回 # 标题 开头）
+            first_line = text.lstrip().split("\n", 1)[0] if text else ""
+            if first_line.startswith("#"):
+                result["title"] = first_line.lstrip("# ").strip()
+    except httpx.HTTPStatusError as e:
+        result["error"] = f"HTTP {e.response.status_code}"
+    except httpx.TimeoutException:
+        result["error"] = "timeout"
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
 
 async def web_fetch(
@@ -224,6 +323,23 @@ async def web_fetch(
         # 其他异常（DNS 解析失败、连接重置等）
         logger.warning("请求失败 url=%s error=%s", url, e)
         result["error"] = str(e)
+
+    # ── Jina Reader 兜底：正文过少（SPA 骨架）时重试 ──
+    # 【2026-09-26】httpx 抓 SPA 页面只能拿到 JS 骨架，正文 CJK < 200。
+    # 此时用 Jina Reader 服务端渲染再抓一次，能拿到真正文。
+    if settings is not None and settings.jina_reader_enabled:
+        cjk = sum(1 for ch in result["text_content"] if '\u4e00' <= ch <= '\u9fff')
+        if cjk < 200:
+            logger.info(
+                "web_fetch: 正文过少(CJK=%d)，Jina Reader 兜底 url=%s", cjk, url
+            )
+            jina = await _jina_fetch(url, max_chars)
+            # 只有 Jina 拿到的正文明显更多才替换，否则保留原结果
+            jina_cjk = sum(
+                1 for ch in jina["text_content"] if '\u4e00' <= ch <= '\u9fff'
+            )
+            if jina_cjk > cjk:
+                result = jina
 
     return result
 

@@ -73,6 +73,8 @@ _QUALITY_PROMPT = """你是报告质量评审专家。对以下竞品分析报�
 报告:
 %s
 
+%s
+
 请严格按以下JSON格式输出评分（不要输出任何其他文字）：
 {
   "overall_score": 0,
@@ -106,6 +108,15 @@ _QUALITY_PROMPT = """你是报告质量评审专家。对以下竞品分析报�
 禁止笼统建议（如"补充来源"、"改善结构"、"增加内容"）——每条必须指出具体位置和具体操作。
 
 overall_score 按权重计算：(完整性*0.3 + 准确性*0.3 + 可追溯性*0.2 + 可读性*0.1 + 客观性*0.1)
+
+【重要】数据缺失 vs 撰写缺陷的区分：
+  上面的"数据缺失清单"列出了 Analyze 阶段就已判定 [数据不足]/[待验证] 的 维度×竞品 单元格。
+  这些属于采集/检索层的缺口，不是 Writer 的撰写缺陷。
+  对这类单元格：
+    - 不扣"完整性"分（完整性只考核"已有数据是否覆盖、结构是否完整"）
+    - 不生成"补充来源/补充数据"类 rewrite_suggestions（Writer 手里没有这些数据，要求它补是无意义循环）
+    - 只要 Writer 已如实标注 [数据不足] 并说明影响，就视为正确处理，不因缺失本身扣分
+  rewrite_suggestions 只能指向 Writer 能修复的问题：来源引用遗漏、结构不清、表述不客观、表格不完整等。
 """
 
 # 【L4 工程】权重定义在代码中而非 prompt 中
@@ -136,10 +147,17 @@ async def quality_agent(
     评分任务需要最大化确定性。即使重复调用，同一份报告应该得到相同分数。
     这是 temperature 最恰当的用法——不是生成多样性文本，而是做判断。
 
+    【2026-09-26 修复】数据缺失 vs 撰写缺陷区分
+    传入 analysis_results，把 Analyze 阶段就已 [数据不足]/[待验证] 的单元格
+    列为"数据缺失清单"注入 prompt，让 Quality 不因采集缺口扣 Writer 分、
+    不生成"补数据"类 rewrite 建议 → 避免"Quality 要求 Writer 补一个 Writer
+    手里没有的数据"的死循环（65→66.5→65.2 卡死就是此因）。
+
     Args:
         task: {
             id, title, competitors: [str], dimensions: [str],
             report_markdown: str  ← Writer 的输出
+            analysis_results: dict ← Analyze 阶段的结构化结果（{维度:{竞品:结论}}）
         }
         mcp_server: MCP 工具服务器（仅获取 settings）
         llm: ChatDeepSeek 客户端（temperature=0.0，评分日需要确定性）
@@ -153,6 +171,7 @@ async def quality_agent(
     competitors = task["competitors"]
     dimensions = task["dimensions"]
     report = task.get("report_markdown", "")
+    analysis_results = task.get("analysis_results", {})
 
     pool = await create_pool(settings)
     report_dao = ReportDAO(pool)
@@ -168,11 +187,29 @@ async def quality_agent(
         len(report),
     )
 
+    # ── 【2026-09-26】数据缺失清单：Analyze 阶段就 [数据不足]/[待验证] 的单元格 ──
+    # 这些是采集/检索层缺口，不是 Writer 缺陷。注入 prompt 让 Quality 不为此扣分。
+    missing_cells: list[str] = []
+    for dim in dimensions:
+        dim_data = analysis_results.get(dim, {})
+        for comp in competitors:
+            text_val = str(dim_data.get(comp, ""))
+            if "[数据不足]" in text_val or "[待验证]" in text_val:
+                missing_cells.append(f"{dim}×{comp}")
+    if missing_cells:
+        missing_block = (
+            "【数据缺失清单】（Analyze 阶段已判定的缺口，非 Writer 缺陷）：\n"
+            + "\n".join(f"  - {c}" for c in missing_cells)
+        )
+    else:
+        missing_block = "【数据缺失清单】：无（所有维度×竞品均有数据）"
+
     prompt = _QUALITY_PROMPT % (
         title,
         "、".join(competitors),
         "、".join(dimensions),
         report,
+        missing_block,
     )
 
     resp = await llm.ainvoke(prompt)

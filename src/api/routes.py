@@ -731,7 +731,7 @@ async def stream_task(
       — error: {"task_id": "...", "message": "..."}
 
     轮询：每秒从 agent_logs 表读取新增日志
-    超时：300 秒后强制发送 error 事件
+    超时：360 秒后强制发送 error 事件
     断连：客户端断开时自动清理（不中断后台任务）
     """
     pool = _get_pool(request)

@@ -77,9 +77,9 @@
 
 ● 轮询超时保护
 
-  总超时 300 秒（5 分钟）。超过后 yield error 事件 + break。
+  总超时 360 秒（6 分钟）。超过后 yield error 事件 + break。
   目的是防止"任务卡死但状态永远不变成 failed"时 SSE 连接永久挂起。
-  300 秒对齐最长的 Pipeline 执行预期（采集+分析+撰写+质检 < 5 分钟）。
+  360 秒对齐最长的 Pipeline 执行预期（采集+分析+撰写+质检 < 6 分钟）。
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _estimate_progress(agent_name: str) -> float:
     return _PROGRESS_MAP.get(agent_name, 0.5)
 
 
-async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
+async def event_generator(task_id: str, pool, total_timeout: float = 360.0):
     """SSE 事件生成器——从 agent_logs 表轮询进度。
 
     【完整流程 — 8 步】
@@ -139,7 +139,7 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
     【生产部署配置 — nginx 代理 SSE 需要的额外配置】
     proxy_buffering off;         ← 关键：关闭缓冲，否则 SSE 事件被 nginx 攒一起发
     proxy_cache off;
-    proxy_read_timeout 300s;     ← 与 total_timeout 对齐
+    proxy_read_timeout 360s;     ← 与 total_timeout 对齐
     chunked_transfer_encoding on;
 
     【端到端延迟】
@@ -151,8 +151,8 @@ async def event_generator(task_id: str, pool, total_timeout: float = 300.0):
     Args:
         task_id: 任务 UUID
         pool: asyncpg 连接池
-        total_timeout: 总超时秒数（默认 300 秒 = 5 分钟）
-            — 对齐最长 Pipeline 执行预期（采集+分析+撰写+质检 < 5 分钟）
+        total_timeout: 总超时秒数（默认 360 秒 = 6 分钟）
+            — 对齐最长 Pipeline 执行预期（采集+分析+撰写+质检 < 6 分钟）
             — 防止任务卡死但 status 永远不变时 SSE 连接永久挂起
 
     Yields:

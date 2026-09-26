@@ -65,6 +65,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 【2026-07-29】内容质量门禁阈值：正文中文字数（CJK Unified Ideographs）低于此值视为 SPA 骨架页，丢弃
+# 【2026-09-26】提升为模块级常量——_fetch_one（步骤3）需在分块前用它判断 Tavily 预取正文是否达标
+_MIN_CJK_CHARS = 200
+
 # ═════════════════════════════════════════════════════════════════════════════
 # §1 搜索关键词生成
 # ═════════════════════════════════════════════════════════════════════════════
@@ -392,7 +396,9 @@ async def collector_agent(
 
     async def _search_one(competitor: str, query: str):
         async with semaphore:
-            resp = await mcp_server.call_tool("web_search", {"query": query, "max_results": 3})
+            # 【2026-09-26】max_results 由 3 → 10：原硬编码 3 导致候选池过小
+            # （5 关键词 × 3 = 15 候选，再被相关性过滤砍到个位数），采集覆盖不足。
+            resp = await mcp_server.call_tool("web_search", {"query": query, "max_results": 10})
             # 【L4 工程】MCP 错误处理：不因为单条搜索失败而阻塞整个 gather
             if resp.get("isError"):
                 return (competitor, [])
@@ -432,24 +438,46 @@ async def collector_agent(
     # ──────────── 搜索结果去重 + 分组 ────────────
     # 【L4 工程】URL 全局去重：不同 query 可能返回相同的 URL
     # 如果不去重，会重复抓取同一个页面——浪费带宽 + 被目标站点视为爬虫攻击
-    # 【L4 工程】反爬域名黑名单——这些站纯 HTTP 请求必然返回 403/JS Challenge
-    # 直接过滤避免浪费带宽 + 报错噪音（httpx 无 TLS fingerprint 伪装能力）
+    # 【L4 工程】反爬/死链域名黑名单——这些站在当前部署环境（中国网络 + 无登录态）
+    # 下，httpx 抓不到正文：要么 403 反爬，要么境外超时/SSL 失败。
+    # 【2026-09-26 实测】王者荣耀/英雄联盟任务里，13 条 URL 有 6 条（46%）落在
+    # 这些域名的死链上（zhihu 403、pinterest SSL、google/reddit 超时），浪费
+    # 抓取名额 + 70 秒任务里有大量时间耗在等超时。提前过滤，把名额让给能抓的站。
+    # 注意：仅当 Tavily 未预取到正文（raw_content 空）时才过滤——raw_content 非空
+    # 说明 Tavily 服务端已渲染好正文，直接走直通，无需 httpx，故不跳过。
     _ANTI_SCRAPE_DOMAINS = {
-        "baike.baidu.com",  # 百度百科——双重反爬（TLS fingerprint + cookie）
+        "baike.baidu.com",   # 百度百科——双重反爬（TLS fingerprint + cookie）
+        "zhihu.com",         # 知乎——需登录态，httpx 无登录态 403
+        "pinterest.com",     # Pinterest——境外 + 本机 SSL 证书链缺失
+        "google.com",        # Google（含 sites.google.com）——境外，超时
+        "reddit.com",        # Reddit——境外，超时
     }
+
+    def _is_dead_domain(host: str) -> bool:
+        """判断域名是否落在反爬/境外死链黑名单（含子域匹配）。"""
+        return any(host == d or host.endswith("." + d) for d in _ANTI_SCRAPE_DOMAINS)
 
     # 【2026-07-29 修复】搜索结果相关性过滤
     # 问题：搜索 "英雄联盟 玩法设计" → Bing 返回 "英雄（张艺谋电影）"、
     # "英雄_CCTV节目" → Collector 抓这些页面存为 chunk → Analyzer 面对
     # 电影/电视剧的内容无法做竞品分析 → [数据不足]。
     # 这不是"英雄联盟"的个例——任何模糊匹配的搜索词都可能被同名词条污染。
-    # 修复：搜索结果标题必须包含竞品名的至少一个关键词子串（或已知别名），
-    # 否则丢弃。关键词子串 = 对竞品名按空格/tab分词后的所有非停用词片段。
+    #
+    # 【2026-09-26 两处修复】
+    #   1. 别名映射落地：原注释声称支持 "英雄联盟→LOL/League"，但代码从未实现，
+    #      导致英文优质结果（标题写 League of Legends 不含"英雄联盟"中文）被误杀。
+    #   2. max_results 3→10：候选池从 5×3=15 提到 5×10=50，覆盖度显著提升。
+    _COMPETITOR_ALIASES: dict[str, set[str]] = {
+        "英雄联盟": {"lol", "league of legends", "league", "英雄联盟手游"},
+        "王者荣耀": {"honor of kings", "王者荣耀世界", "王者"},
+        # 可继续按需扩充，未列出的竞品只做全名+分词子串匹配
+    }
+
     def _build_relevance_filter(competitor_name: str) -> set[str]:
-        """从竞品名构建相关性关键词集合。
-        例："英雄联盟" → {"英雄联盟", "LOL", "League"}
-        例："王者荣耀" → {"王者荣耀", "王者", "荣耀"}
-        例："Notion" → {"Notion"}
+        """从竞品名构建相关性关键词集合（含已知别名）。
+        例："英雄联盟" → {"英雄联盟", "lol", "league of legends", "league"}
+        例："王者荣耀" → {"王者荣耀", "honor of kings", "王者"}
+        例："Notion" → {"notion"}
         """
         terms: set[str] = set()
         # 完整名必保留
@@ -459,30 +487,38 @@ async def collector_agent(
             token = token.strip().lower()
             if len(token) >= 2:
                 terms.add(token)
+        # 已知别名（英文缩写等，中文无空格分词取不到）
+        for alias in _COMPETITOR_ALIASES.get(competitor_name.strip(), ()):
+            terms.add(alias)
         return terms
 
     def _result_relevant(title: str, snippet: str, filter_terms: set[str]) -> bool:
-        """检查搜索结果是否与竞品相关。"""
+        """检查搜索结果是否与竞品相关。
+
+        【2026-09-26】匹配面已通过别名映射扩宽（竞品名 + 英文缩写/别名）。
+        不引入维度词匹配：维度词可能为"功能/价格"等超通用词，会引入大量噪音。
+        """
         combined = (title + " " + snippet).lower()
         return any(term in combined for term in filter_terms)
 
     seen_urls: set[str] = set()
     competitor_urls: dict[str, list[dict]] = {c: [] for c in competitors}
-    skipped_baike: int = 0  # 跳过的反爬域名计数
+    skipped_dead: int = 0  # 跳过的死链域名计数（反爬/境外双抓不到）
     skipped_irrelevant: int = 0  # 跳过的无关搜索结果计数
     for competitor, results in search_results:
         filter_terms = _build_relevance_filter(competitor)
         for r in results:
             url = r.get("url", "")
+            raw = r.get("raw_content", "")
             if url and url not in seen_urls:
-                # 反爬域名：跳过抓取，保留 title/snippet 作为摘要信息
+                # 死链过滤：仅当 Tavily 未预取到正文（raw_content 空）且域名在黑名单时跳过
                 try:
                     from urllib.parse import urlparse
                     host = urlparse(url).hostname or ""
                 except Exception:
                     host = ""
-                if host in _ANTI_SCRAPE_DOMAINS:
-                    skipped_baike += 1
+                if not raw and _is_dead_domain(host):
+                    skipped_dead += 1
                     continue
                 # 结果相关性过滤：标题+snippet不包含竞品关键词 → 跳过
                 if not _result_relevant(
@@ -495,17 +531,35 @@ async def collector_agent(
                     "url": url,
                     "title": r.get("title", ""),
                     "snippet": r.get("snippet", ""),
+                    "raw_content": r.get("raw_content", ""),  # Tavily 预取正文（SPA 已渲染）
                 })
-    if skipped_baike:
-        logger.info("日志：跳过 %d 个反爬域名的URL（baike.baidu.com等）", skipped_baike)
+    if skipped_dead:
+        logger.info("日志：跳过 %d 个死链域名URL（zhihu/pinterest/google/reddit等，双抓不到）", skipped_dead)
     if skipped_irrelevant:
         logger.info("日志：跳过 %d 个不相关搜索结果（标题不包含竞品关键词）", skipped_irrelevant)
 
+    # ── ✏️ 日志：最终保留待抓取的 URL ──
+    # 这些 URL 已通过完整过滤链：全局去重 → 反爬域名黑名单 → 相关性过滤 → 每竞品截断8条
+    final_url_lines: list[str] = []
+    final_total: int = 0
+    for c in competitors:
+        kept = [u["url"] for u in competitor_urls[c][:8]]
+        final_total += len(kept)
+        final_url_lines.append(
+            f"  {c}({len(kept)}条): " + (" | ".join(kept) if kept else "无")
+        )
+    logger.info(
+        "【Collector】最终保留URL task=%s 共%d条\n%s",
+        task_id, final_total, "\n".join(final_url_lines),
+    )
+
     # ──────────── 步骤3: 并发抓取网页内容 ────────────
-    # 【L4 工程】每个竞品最多抓取 5 条 URL（urls[:5]）
-    #   — 5 是经验值：超过 5 个页面通常是重复内容或低质量内容
-    #   — 对 5 个竞品 × 5 条 URL = 25 个页面，每个 15000 字符
-    #   — 总共 ~375KB 文本，chunk 化后约 50~80 个 chunk
+    # 【L4 工程】每个竞品最多抓取 8 条 URL（urls[:8]）
+    #   — 8 是经验值：超过 8 个页面通常是重复内容或低质量内容
+    #   — 对 5 个竞品 × 8 条 URL = 40 个页面，每个 15000 字符
+    #   — 总共 ~600KB 文本，chunk 化后约 80~120 个 chunk
+    #   — 【2026-09-26】由 5 上调至 8：为多产品线竞品（如英雄联盟端游/手游）留足余量，
+    #     避免有效来源被截断；代价是 chunk 数增多，后续 Analyzer 检索成本略增
 
     async def _fetch_one(competitor: str, page_info: dict):
         """抓取单个页面内容，返回 (竞品名, 页面数据)。
@@ -513,8 +567,24 @@ async def collector_agent(
         【L4 工程】Semaphore 控制并发连接数。
         web_fetch max_chars=15000：取足够的分析上下文（约 3000~5000 中文字），
         但避免整站下载（可能 100KB+ 的 HTML/JSS/CSS 混合）。
+
+        【2026-09-26】Tavily 预取正文直通：search 阶段 Tavily 已用
+        include_raw_content 服务端渲染好正文，此时跳过 web_fetch，
+        既省一次请求，又绕开“httpx 抓不到 SPA 正文”的死结。
         """
         url = page_info["url"]
+
+        # ── Tavily 预取正文：CJK 足够时直接使用，不调 web_fetch ──
+        raw = page_info.get("raw_content", "")
+        if raw:
+            cjk = sum(1 for ch in raw if '\u4e00' <= ch <= '\u9fff')
+            if cjk >= _MIN_CJK_CHARS:
+                return (competitor, {
+                    "url": url,
+                    "title": page_info["title"],
+                    "text": raw[:15000],
+                })
+
         async with semaphore:
             resp = await mcp_server.call_tool("web_fetch", {"url": url, "max_chars": 15000})
             if resp.get("isError"):
@@ -537,7 +607,7 @@ async def collector_agent(
 
     fetch_tasks = []
     for competitor, urls in competitor_urls.items():
-        for u in urls[:5]:  # 每竞品最多 5 条 URL
+        for u in urls[:8]:  # 每竞品最多 8 条 URL
             fetch_tasks.append(_fetch_one(competitor, u))
 
     t_fetch = time.perf_counter()
@@ -575,7 +645,6 @@ async def collector_agent(
     #  返回的 text 只有导航栏、页脚、loading 文案等 20~100 字符的骨架。
     #  这些页面嵌入后变成噪音向量，污染 RAG 检索结果 → Analyzer [数据不足]。
     #  修复：统计中文汉字密度（CJK Unified Ideographs），< 200 汉字 → 丢弃。
-    _MIN_CJK_CHARS = 200
     all_texts: list[str] = []
     text_meta: list[dict] = []  # {competitor, url, title, chunk_texts: [...]}
     discarded_pages: int = 0

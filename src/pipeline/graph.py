@@ -320,6 +320,7 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
             "competitors": state["competitors"],
             "dimensions": state["dimensions"],
             "report_markdown": state["report_content"],
+            "analysis_results": state.get("analysis_results", {}),
             "version": state.get("report_version", 1),
         }
         logger.info("【Pipeline】quality node ── task=%s v=%d", 
