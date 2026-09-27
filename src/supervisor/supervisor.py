@@ -162,8 +162,10 @@ _SUPERVISOR_SKELETON = (
     "   - competitors: [竞品A, 竞品B, ...]  — 使用上方「指定竞品」列表（不能是「待探索」）\n"
     "   - dimensions: [维度1, 维度2, ...]     — 使用上方「分析维度」列表\n"
     "3. 如果已收集数据但未分析 -> action=\"analyzer\"，arguments 同样包含 competitors + dimensions\n"
-    "4. 如果分析完成但未写报告 -> action=\"writer\"，arguments 包含 title + analysis_results\n"
-    "5. 如果报告已生成但未评分 -> action=\"quality\"，arguments 包含 report_markdown\n"
+    "4. 如果分析完成但未写报告 -> action=\"writer\"，arguments 只需包含 title；\n"
+    "   analysis_results 由系统自动注入，请勿在 arguments 中重复填写（也勿转述其内容）\n"
+    "5. 如果报告已生成但未评分 -> action=\"quality\"；\n"
+    "   report_markdown 由系统自动注入，请勿在 arguments 中重复填写（也勿转述其内容）\n"
     "6. 如果质量未通过且还有剩余轮次 -> action=\"writer\"（重写）\n"
     "7. 如果质量已通过 -> action=\"finish\"\n"
     "8. 每轮只能选择一个 agent 执行\n"
@@ -515,6 +517,24 @@ def _make_node_act(router: A2ARouter):
                 arguments["competitors"] = state.get("found_competitors", [])
             if "dimensions" not in arguments or not arguments["dimensions"]:
                 arguments["dimensions"] = state.get("dimensions", [])
+
+        # ─── 安全网：writer 的 analysis_results 强制从 state 注入 ───
+        # 【2026-09-27 BUG修复】analysis_results 是 analyzer 已产出的确定性事实，
+        # 不该由 LLM 在 think 的 arguments 里重新生成/转述——LLM 会把嵌套 dict 写成
+        # str 或 list，触发 HarnessGuard 参数校验（期望 object 实际 str）或 writer
+        # handler 的 .items() AttributeError。与上方 collector/analyzer 补全同哲学：
+        # 确定性数据一律从 state 覆盖，不信 LLM 转述。
+        if action == "writer":
+            arguments["analysis_results"] = state.get("analysis_results", {})
+
+        # ─── 安全网：quality 的 report_markdown 强制从 state 注入 ───
+        # 【2026-09-27 BUG修复】report_markdown 是 writer 已产出的确定性事实，
+        # 不该由 LLM 在 think 的 arguments 里重新生成/转述——LLM 无法把数千字的
+        # 完整报告内联进 JSON，会留空或缺失，导致 quality 拿到空报告 → score 0.0
+        # → 死循环到轮次耗尽。与 writer 的 analysis_results 兜底同哲学：
+        # 确定性数据一律从 state 覆盖，不信 LLM 转述。
+        if action == "quality":
+            arguments["report_markdown"] = state.get("report_content", "")
 
         # ─── 安全网：拦截"待探索"占位符 ───
         # 【2026-07-29 BUG修复】"待探索"是语义占位符，不是真实竞品名。

@@ -77,6 +77,8 @@ def create_llm_client(
         api_key=settings.deepseek_api_key,
         api_base=settings.deepseek_base_url,
         temperature=temperature,
+        request_timeout=120.0,
+        max_retries=2,
     )
 
 

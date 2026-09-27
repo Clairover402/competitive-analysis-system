@@ -69,6 +69,26 @@ def _vector_str(embedding: list[float]) -> str:
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
 
 
+def _sanitize_text(text: str | None) -> str | None:
+    """清理 PostgreSQL text 不接受的控制字符。
+
+    【L4 工程】为什么这里要删 NUL（\\x00）？
+    ------------------------------------------------------------
+    PostgreSQL 的 text 类型对任何编码（含 UTF-8）都拒绝 NUL 字节
+    （0x00），因为它是 C 字符串终止符。asyncpg 写入含 \\x00 的字符串
+    会直接抛 CharacterNotInRepertoireError（"无效的 UTF8 编码字节顺序: 0x00"）。
+
+    来源：Collector 抓取的网页正文里偶发混入 \\x00（如二进制残留、
+    编码损坏），经过 chunk 切分后仍可能落在 chunk_text / source_url 中，
+    导致整个 batch_insert 失败。这里统一在入库前清洗，属数据卫生兜底。
+
+    只删 \\x00，不动其他合法 UTF-8 字符，不影响正常内容。
+    """
+    if text is None:
+        return None
+    return text.replace("\x00", "")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TaskDAO
 # ═══════════════════════════════════════════════════════════════════════════
@@ -381,9 +401,9 @@ class ChunkEmbeddingDAO:
                 [
                     (
                         task_id,
-                        c["chunk_text"],
+                        _sanitize_text(c["chunk_text"]),
                         c["chunk_index"],
-                        c["source_url"],
+                        _sanitize_text(c["source_url"]),
                         _vector_str(c["embedding"]),
                     )
                     for c in chunks
