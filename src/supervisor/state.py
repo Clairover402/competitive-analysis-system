@@ -158,6 +158,11 @@ class SupervisorState(TypedDict):
     quality_passed: bool
     """质量门禁是否通过。_think 读取判断是否回退重写。"""
 
+    quality_details: dict
+    """五维评分明细 {维度名: {score, comment}}。
+    Quality 产出，writer 重写时作为 previous_quality 透传，
+    让 Writer 知道具体哪个维度扣了多少分（否则重写盲目、分数不变）。"""
+
     rewrite_suggestions: list[str]
     """Quality 不通过时的改写建议。"""
 
@@ -171,6 +176,12 @@ class SupervisorState(TypedDict):
 
     max_rounds: int
     """硬上限 = 10。初始化一次不变。"""
+
+    rewrite_count: int
+    """Writer 重写次数（仅 writer 完成时 +1）。
+    用于防止"数据硬伤导致 quality 永远不通过"的死循环：
+    重写次数达到上限后强制 finish，接受当前报告而非无限重写。
+    阈值由 act 节点判断（MAX_REWRITES）。"""
 
     reasoning_trace: Annotated[list, operator.add]
     """推理轨迹（累加 reducer）。

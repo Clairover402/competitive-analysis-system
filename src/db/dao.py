@@ -842,6 +842,9 @@ class AgentLogDAO:
         response: dict | None = None,
         error: str | None = None,
         duration_ms: float | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
     ) -> None:
         """记录一次 Agent 操作日志。
 
@@ -851,17 +854,21 @@ class AgentLogDAO:
         不需要 await 返回值（无返回值 → 不需要赋值）。
         如果日志写入失败，exceptions 会被 asyncpg 抛出，
         但调用方通常不处理——日志是辅助链路，不能阻断主链路。
+
+        【2026-10-01 可观测性增强】新增 3 个 token 参数，默认 None：
+        Harness 阻断日志（AuditLogger）不调 LLM，不传 → 列恒 NULL。
         """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO agent_logs (task_id, agent_name, action,
                                            request, response, error,
-                                           duration_ms)
-                   VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)""",
+                                           duration_ms, prompt_tokens,
+                                           completion_tokens, total_tokens)
+                   VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9, $10)""",
                 task_id, agent_name, action,
                 json.dumps(request, ensure_ascii=False) if request else None,
                 json.dumps(response, ensure_ascii=False) if response else None,
-                error, duration_ms,
+                error, duration_ms, prompt_tokens, completion_tokens, total_tokens,
             )
 
     async def get_by_task(self, task_id: str) -> list[dict]:

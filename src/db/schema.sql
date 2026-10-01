@@ -213,8 +213,14 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     response     JSONB,                     -- 响应内容
     error        TEXT,                      -- 错误信息（NULL = 无错误）
     duration_ms  FLOAT,                     -- 耗时（毫秒），NULL = 未记录
+    prompt_tokens     INT,                  -- 输入 token 数（usage_metadata.input_tokens）
+    completion_tokens INT,                  -- 输出 token 数（usage_metadata.output_tokens）
+    total_tokens      INT,                  -- 总 token 数（usage_metadata.total_tokens）
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- 【2026-10-01 可观测性增强】agent_logs 新增 3 个 token 列，
+-- 用于 Grafana 的 Token 成本面板（按 agent 聚合 SUM(total_tokens)）。
+-- Harness 阻断日志（AuditLogger）不调 LLM，这三列恒为 NULL。
 
 CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_logs (task_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_agent_name ON agent_logs (agent_name);

@@ -1,34 +1,41 @@
 # ============================================================
-# 竞品分析系统 — PostgreSQL Docker Compose
-# 启动: docker compose up -d
-# 停止: docker compose down
-# 重建: docker compose up -d --build
+# 竞品分析系统 — Grafana 监控面板 Docker Compose
+# 说明：真实主库是手动容器 pg-chinese（localhost:5432），
+#       本 compose 只负责 Grafana 监控面板，不再管理 postgres。
+# 启动: docker compose -f docker/docker-compose.yml up -d grafana
 # ============================================================
 services:
-  postgres:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: competitive-analysis-pg
+  # ============================================================
+  # Grafana 监控面板 — 直连 PostgreSQL（agent_logs 表）
+  # 登录: admin / admin（首次登录会提示改密码，可跳过）
+  # 访问: http://127.0.0.1:3000
+  #
+  # 注意：Grafana 连的是"手动容器 pg-chinese"（真实主库），
+  # 通过 host.docker.internal 走宿主机 5432 映射到 pg-chinese。
+  # ============================================================
+  grafana:
+    image: grafana/grafana:10.4.5
+    container_name: competitive-analysis-grafana
     restart: unless-stopped
     ports:
-      # 只绑本机回环地址——PG 不暴露公网，安全最佳实践
-      - "127.0.0.1:5432:5432"
+      # 只绑本机回环地址——监控面板不暴露公网
+      - "127.0.0.1:3000:3000"
+    extra_hosts:
+      # Docker Desktop 下把 host.docker.internal 解析到宿主机，
+      # 让 Grafana 能访问映射在宿主机 5432 的 pg-chinese
+      - "host.docker.internal:host-gateway"
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: 123456
-      POSTGRES_DB: cas_db
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     volumes:
-      # 数据持久化（容器删除后数据还在）
-      - pgdata:/var/lib/postgresql/data
-      # 初始化脚本（首次启动自动执行）
-      - ../src/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d cas_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      # 面板配置持久化
+      - grafana-data:/var/lib/grafana
+      # 数据源 + Dashboard 自动装载（provisioning）
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
 
 volumes:
-  pgdata:
-    name: competitive-analysis-pgdata
+  grafana-data:
+    name: competitive-analysis-grafana-data

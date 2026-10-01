@@ -25,7 +25,21 @@
 
 from __future__ import annotations
 
+# prometheus_client 是 Prometheus 官方的 Python 客户端库，
+# 用来在你的 Python 代码（FastAPI、Django、Agent、微服务）里埋点、定义监控指标，
+# 启动一个 HTTP `/metrics` 端点，让 Prometheus 服务定期拉取指标（pull 模型）PyPI
+#
+# > 一句话：在 Python 应用内部生成监控指标，暴露给 Prometheus 采集
+
+
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, REGISTRY
+
+# 核心 4 种指标类型（面试高频）
+#
+# 1. **Counter**：计数器，**只增不减**。接口总请求数、异常总数。`inc()` 递增，不能减少。
+# 2. **Gauge**：仪表盘，**可增可减**。当前并发数、内存占用、队列长度。`set()` 直接赋值。
+# 3. **Summary**：统计分位数（耗时分布），客户端本地计算。适合接口响应时间。
+# 4. **Histogram**：直方图，桶（bucket）统计，推荐生产用，Prometheus 端算分位数。
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -37,6 +51,10 @@ ca_tasks_total = Counter(
     "竞品分析任务总数",
     ["status"],  # pending / running / completed / failed
 )
+
+# **直方图指标**，用来统计 Agent 任务执行耗时，
+# 按 `route` 标签区分类型（`pipeline` / `supervisor`），
+# 桶：`[1,5,10,30,60,120,300,600]` 秒，范围 1 秒～10 分钟。
 
 ca_task_duration_seconds = Histogram(
     "ca_task_duration_seconds",
@@ -62,6 +80,9 @@ ca_quality_score = Histogram(
     buckets=[0, 50, 60, 70, 75, 80, 85, 90, 95, 100],
 )
 
+
+#  Gauge：仪表盘类型，代表一个瞬时、可任意读写的数值，可以 set、inc、dec。
+#  用来记录当前状态、当前计算出来的浮点数。
 ca_rag_recall = Gauge(
     "ca_rag_recall",
     "RAG 检索召回率（当前任务值）",

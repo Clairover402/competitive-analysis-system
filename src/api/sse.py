@@ -398,17 +398,30 @@ def _format_progress_message(
     # ═══════════════════════════════════════════════════════════
     if agent == "collector":
         if action == "generate_keywords":
-            # 中间进度：正在为竞品生成搜索词
-            return f"🔍 Collector 正在生成搜索关键词...{time_str}"
+            # 中间进度：为各竞品生成搜索关键词
+            # response 字段对齐 collector.py：total_queries + per_competitor[].keyword_count
+            total = response.get("total_queries", 0)
+            comps = response.get("per_competitor", {})
+            parts = [f"{c}({info.get('keyword_count', 0)}词)" for c, info in sorted(comps.items())]
+            detail = "、".join(parts) if parts else f"{total}条关键词"
+            return f"🔍 Collector 生成搜索词: {total}条 → {detail}{time_str}"
         if action == "search_complete":
             # 中间进度：搜索完成
-            queries = response.get("queries", 0)
-            return f"🔍 Collector 搜索完成: {queries}条查询{time_str}"
+            # response 字段对齐 collector.py：total_results + per_competitor[].total
+            total = response.get("total_results", 0)
+            comps = response.get("per_competitor", {})
+            parts = [f"{c}({info.get('total', 0)}条)" for c, info in sorted(comps.items())]
+            detail = "、".join(parts) if parts else f"{total}条结果"
+            return f"🔍 Collector 搜索完成: {total}条结果 → {detail}{time_str}"
         if action == "fetch_complete":
             # 中间进度：抓取完成
-            pages = response.get("pages", 0)
-            with_text = response.get("with_text", 0)
-            return f"📥 Collector 抓取完成: {pages}页面(有效{with_text}){time_str}"
+            # response 字段对齐 collector.py：total_chars + per_competitor[].pages/empty_pages
+            comps = response.get("per_competitor", {})
+            total_chars = response.get("total_chars", 0)
+            pages = sum(info.get("pages", 0) for info in comps.values())
+            empty = sum(info.get("empty_pages", 0) for info in comps.values())
+            valid = pages - empty
+            return f"📥 Collector 抓取完成: {pages}页面(有效{valid}) {total_chars:,}字符{time_str}"
         if action == "collect_and_store":
             total_pages = response.get("total_pages", 0)
             total_chunks = response.get("total_chunks", 0)
@@ -498,6 +511,22 @@ def _format_progress_message(
             if reason:
                 detail += f" ({reason})"
             return f"🧠 Supervisor 路由决策{detail}{time_str}"
+        if action == "think":
+            # 【2026-09-27 增强】Supervisor 决策日志（由 supervisor.py 写入）
+            next_agent = response.get("agent", "")
+            thought = response.get("thought", "")
+            round_no = response.get("round", "?")
+            # 决策"结束"或"调度某 Agent"→ 给用户一句可读的下一步说明
+            if next_agent == "finish":
+                detail = "分析完成，准备收尾"
+            elif next_agent:
+                detail = f"调度 {next_agent}"
+            else:
+                detail = "思考中"
+            msg = f"🧠 Supervisor 决策(R{round_no}): {detail}"
+            if thought:
+                msg += f" | {(thought or '')[:40]}"
+            return f"{msg}{time_str}"
         return f"Supervisor: {action}{time_str}"
 
     # ── 通用兜底 ──

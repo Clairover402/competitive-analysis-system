@@ -106,6 +106,8 @@ from langgraph.graph import StateGraph, END
 from src.supervisor.state import SupervisorState
 from src.supervisor.a2a import A2ATask, A2ARouter, TaskStatus
 from src.pipeline.checkpoint import PostgresSaver
+from src.db.dao import AgentLogDAO
+from src.observability.token_usage import extract_usage
 
 if TYPE_CHECKING:
     from langgraph.graph import CompiledStateGraph
@@ -117,6 +119,12 @@ if TYPE_CHECKING:
     from src.memory.long_term import LongTermMemoryEngine
 
 logger = logging.getLogger(__name__)
+
+# 【2026-10-01 BUG修复】Writer 重写次数硬上限。
+# 防止"数据硬伤导致 quality 永远不通过"的死循环：
+# 某些维度（如准确性）受采集数据本身限制，重写再多次也提不上去，
+# 若无限 writer↔quality 交替会耗尽 600 秒超时。达到上限后强制 finish。
+_MAX_REWRITES = 2
 
 # ============================================================
 # 【L4 工程】Prompt 常量 — 固定骨架，运行时动态插值
@@ -171,7 +179,9 @@ _SUPERVISOR_SKELETON = (
     "8. 每轮只能选择一个 agent 执行\n"
     "9. 输出必须是合法 JSON，不要有任何额外文本\n"
     "10. 如果同一 agent 连续调用 2 次都返回空结果（0页面/0分析），代表该 agent 无法完成任务，\n"
-    "    应输出 action=\"finish\"，并在 reason 中说明「因数据不足，需用户补充信息」"
+    "    应输出 action=\"finish\"，并在 reason 中说明「因数据不足，需用户补充信息」\n"
+    "11. 如果质量已不通过、且已重写次数达到上限，不要继续派 writer——数据层面可能已无法提升，\n"
+    "    应输出 action=\"finish\"，接受当前最佳报告，在 reason 中说明「重写已达上限，接受当前报告」"
 )
 """Supervisor System Prompt 骨架。
 
@@ -272,6 +282,7 @@ def _make_node_think(
     router: A2ARouter,
     retrieval_strategy: MemoryRetrievalStrategy | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
+    log_dao: AgentLogDAO | None = None,
 ):
     """创建 think 节点函数——注入 LLM + router + 记忆组件。
 
@@ -333,6 +344,10 @@ def _make_node_think(
                 f"质量评分: {state['quality_score']}"
                 f" (通过={'是' if state['quality_passed'] else '否'})"
             )
+        if state.get("rewrite_count", 0) > 0:
+            progress_parts.append(
+                f"已重写次数: {state['rewrite_count']}（上限 {_MAX_REWRITES} 次）"
+            )
         progress = "\n".join(progress_parts) if progress_parts else "尚未开始"
 
         # ─── 步骤①续: 读取推理轨迹（最近 3 条） ───
@@ -390,6 +405,8 @@ def _make_node_think(
         for attempt in range(2):
             try:
                 response = await llm.ainvoke(prompt)
+                # 【2026-10-01 可观测性】提取 token 用量
+                usage = extract_usage(response)
                 text = (
                     response.content
                     if hasattr(response, "content")
@@ -403,6 +420,28 @@ def _make_node_think(
                         "Supervisor 决策(attempt=%d): action=%s, thought=%.60s",
                         attempt + 1, action, decision.get("thought", "")
                     )
+                    # ── ✏️ 调度日志：决策结果写入 agent_logs → SSE 推送到前端 ──
+                    # 【2026-09-27 增强】Supervisor 原本不写 agent_logs，前端看不到
+                    # "正在决策 → 下一步调度谁"的过程，造成"步骤间等待"盲区。
+                    # 决策成功后写一条 agent_name="supervisor" 日志，让前端实时看到
+                    # 下一步动作。fire-and-forget（log 内部 try/except），不阻断主链路。
+                    if log_dao is not None:
+                        await log_dao.log(
+                            task_id=state.get("task_id", ""),
+                            agent_name="supervisor",
+                            action="think",
+                            request={"round": state.get("current_round", 1)},
+                            response={
+                                "round": state.get("current_round", 1),
+                                "action": action,
+                                "agent": decision.get("action", ""),
+                                "thought": decision.get("thought", ""),
+                                "reason": decision.get("reason", ""),
+                            },
+                            prompt_tokens=usage.get("prompt_tokens"),
+                            completion_tokens=usage.get("completion_tokens"),
+                            total_tokens=usage.get("total_tokens"),
+                        )
                     return {
                         # pending_decision → act 节点消费
                         "pending_decision": {
@@ -507,6 +546,29 @@ def _make_node_act(router: A2ARouter):
         action = decision.get("action", "")
         arguments = decision.get("arguments", {})
 
+        # ─── 硬拦截：重写次数已达上限，禁止再派 writer ───
+        # 【2026-10-01 BUG修复】代码层兜底，不依赖 LLM 遵守 Prompt 规则 11。
+        # 数据硬伤时 LLM 可能仍选 writer，这里强制改成 finish，避免无限重写。
+        if (
+            action == "writer"
+            and state.get("rewrite_count", 0) >= _MAX_REWRITES
+        ):
+            logger.warning(
+                "【硬拦截】重写次数已达上限(%d)，强制 finish 而非继续 writer",
+                state.get("rewrite_count", 0),
+            )
+            return {
+                "pending_task_agent": "finish",
+                "pending_task_status": "completed",
+                "pending_task_result": {
+                    "message": "重写已达上限，接受当前报告",
+                    "forced_finish": True,
+                },
+                # 直接置完成标志，否则 route 看到 is_complete=False 会继续循环
+                "is_complete": True,
+                "final_output": "重写已达上限，接受当前报告",
+            }
+
         # ─── 安全网：自动补全必填字段 ───
         # 【2026-07-29 BUG修复】LLM 可能忘记在 arguments 里填充 competitors/dimensions，
         # 但 AgentCard.input_schema.required 强制要求这些字段。
@@ -526,6 +588,16 @@ def _make_node_act(router: A2ARouter):
         # 确定性数据一律从 state 覆盖，不信 LLM 转述。
         if action == "writer":
             arguments["analysis_results"] = state.get("analysis_results", {})
+            # 【2026-10-01 BUG修复】writer 重写时透传质检反馈，否则重写盲目、分数不变。
+            # 只有当质量已评过分且不通过时才传（初写时 quality_score=0 不传）。
+            # rewrite_suggestions + previous_quality（五维评分）让 Writer 知道
+            # 具体哪个维度扣了多少分、为什么扣分（呼应 2026-07-27 教训的“诊断细节”）。
+            if state.get("quality_score", 0.0) > 0 and not state.get("quality_passed", True):
+                arguments["rewrite_suggestions"] = state.get("rewrite_suggestions", [])
+                arguments["previous_quality"] = {
+                    "overall_score": state.get("quality_score", 0.0),
+                    "dimensions": state.get("quality_details", {}),
+                }
 
         # ─── 安全网：quality 的 report_markdown 强制从 state 注入 ───
         # 【2026-09-27 BUG修复】report_markdown 是 writer 已产出的确定性事实，
@@ -732,17 +804,28 @@ def _make_node_observe(
             elif agent_name == "writer":
                 # result 格式: {report_markdown: str}
                 updates["report_content"] = result.get("report_markdown", "")
-                logger.info("报告生成完成")
+                # 【2026-10-01 BUG修复】报告已重写，旧质量评分作废！
+                # 根因：writer 重写后 quality_score 仍保留旧值（如 68.5），
+                # 导致 Supervisor 永远看到"质量不通过"→ 规则 6 反复派 writer，
+                # 直到 600 秒超时。报告内容变了，评分必须重置为"未评分"状态，
+                # 让下一轮 think 决策重新走 quality 而非无脑 writer。
+                updates["quality_score"] = 0.0
+                updates["quality_passed"] = False
+                updates["rewrite_suggestions"] = []
+                # 重写次数 +1（用于防止无限重写）
+                updates["rewrite_count"] = state.get("rewrite_count", 0) + 1
+                logger.info("报告生成完成（质量评分已重置，待重新质检）")
                 trace_obs = {
                     "round": current_round,
-                    "observation": "report written",
+                    "observation": "report rewritten, quality reset",
                 }
 
             elif agent_name == "quality":
-                # result 格式: {overall_score: float, passed: bool, rewrite_suggestions: [str]}
+                # result 格式: {overall_score: float, passed: bool, rewrite_suggestions: [str], dimensions: {}}
                 updates["quality_score"] = result.get("overall_score", 0)
                 updates["quality_passed"] = result.get("passed", False)
                 updates["rewrite_suggestions"] = result.get("rewrite_suggestions", [])
+                updates["quality_details"] = result.get("dimensions", {})
                 logger.info(
                     "质量评分: %.1f, 通过=%s",
                     updates["quality_score"],
@@ -917,8 +1000,11 @@ async def build_supervisor_graph(
     logger.info("PostgresSaver 已就绪")
 
     # ─── 闭包工厂创建 3 个节点函数（DI 注入） ───
+    # 【2026-09-27 增强】注入 AgentLogDAO，让 Supervisor 决策写入 agent_logs
+    # （前端 SSE 轮询这张表 → 实时看到"调度决策"），消除"步骤间等待"盲区。
+    log_dao = AgentLogDAO(pool)
     node_think = _make_node_think(
-        llm_supervisor, router, retrieval_strategy, memory_engine
+        llm_supervisor, router, retrieval_strategy, memory_engine, log_dao
     )
     node_act = _make_node_act(router)
     node_observe = _make_node_observe(summarizer, memory_engine)

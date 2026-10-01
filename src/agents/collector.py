@@ -58,6 +58,7 @@ import tiktoken
 from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO
 from src.mcp.tools_rag import embed_texts
+from src.observability.token_usage import extract_usage, add_usage
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -101,6 +102,7 @@ async def _generate_keywords(
     competitor: str,
     dimensions: list[str],
     llm: ChatDeepSeek,
+    usage_acc: dict[str, int] | None = None,
 ) -> list[str]:
     """LLM 生成多样化搜索关键词（伪布尔检索问题 → 语义化 query）。
 
@@ -135,6 +137,9 @@ async def _generate_keywords(
     for attempt in range(max_attempts):
         try:
             resp = await llm.ainvoke(prompt)
+            # 【2026-10-01 可观测性】累计 token 用量（含重试，每次真实消耗都计入）
+            if usage_acc is not None:
+                add_usage(usage_acc, extract_usage(resp))
             text = (resp.content or "").strip()
 
             # 【L4 工程】防御空响应：LLM 有时返回空内容
@@ -351,8 +356,9 @@ async def collector_agent(
     # 不并行化（llm.ainvoke 不支持同时多请求，除非用多 key 池）
     all_queries: list[tuple[str, str]] = []  # (competitor, query)
     per_competitor_keywords: dict[str, list[str]] = {}  # 记录每个竞品的关键词生成结果
+    gen_usage: dict[str, int] = {}  # 【2026-10-01】累计关键词生成的 token 用量
     for competitor in competitors:
-        keywords = await _generate_keywords(competitor, dimensions, llm)
+        keywords = await _generate_keywords(competitor, dimensions, llm, gen_usage)
         per_competitor_keywords[competitor] = keywords
         # 每个关键词搜索一次（不去重，留给后面的 seen_urls 处理）
         for kw in keywords:
@@ -370,6 +376,9 @@ async def collector_agent(
             },
         },
         duration_ms=round((time.perf_counter() - t_generate) * 1000, 1),
+        prompt_tokens=gen_usage.get("prompt_tokens"),
+        completion_tokens=gen_usage.get("completion_tokens"),
+        total_tokens=gen_usage.get("total_tokens"),
     )
 
     """

@@ -435,6 +435,7 @@ class A2ARouter:
                 "analysis_results": task.arguments.get("analysis_results", {}),
                 "report_markdown": task.arguments.get("report_markdown", ""),
                 "rewrite_suggestions": task.arguments.get("rewrite_suggestions"),
+                "previous_quality": task.arguments.get("previous_quality"),
                 "memory_context": task.arguments.get("memory_context", ""),
             }
             # 调用 Agent handler（统一签名）

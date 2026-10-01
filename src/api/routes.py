@@ -521,10 +521,12 @@ async def _execute_task(
                 # §3 质量（初始为 0/空）
                 "quality_score": 0.0,
                 "quality_passed": False,
+                "quality_details": {},
                 "rewrite_suggestions": [],
                 # §4 控制
                 "current_round": 1,
                 "max_rounds": 10,
+                "rewrite_count": 0,
                 "reasoning_trace": [],
                 "messages_buffer": [],
                 # §5 终止

@@ -177,4 +177,20 @@ def setup_logging(level: int = logging.INFO) -> BoundLogger:
         handler.setFormatter(StructuredFormatter())
         root.addHandler(handler)
 
+        # ── 文件落盘：日志持久化，进程重启不丢失（可观测性必备）──
+        # 轮转：单文件 10MB × 最多保留 5 个，避免日志无限膨胀
+        import os
+        from logging.handlers import RotatingFileHandler
+        log_dir = os.environ.get("LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            os.path.join(log_dir, "app.log"),
+            maxBytes=10 * 1024 * 1024,   # 10MB
+            backupCount=5,               # 保留 app.log.1 ~ app.log.5
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(StructuredFormatter())
+        root.addHandler(file_handler)
+
     return BoundLogger(root)

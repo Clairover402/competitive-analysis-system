@@ -107,6 +107,7 @@ from typing import TYPE_CHECKING
 from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO
 from src.mcp.tools_rag import embed_query, rerank
+from src.observability.token_usage import extract_usage, add_usage
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -237,6 +238,7 @@ async def _retrieve_and_analyze_dimension(
     chunk_dao: ChunkEmbeddingDAO,
     llm: ChatDeepSeek,
     settings,  # 显式传递 settings，避免隐式依赖全局配置
+    usage_acc: dict[str, int] | None = None,
 ) -> dict[str, str]:
     """单个维度的 RAG 检索 + LLM 分析（内部函数，不抛异常）。
 
@@ -343,6 +345,9 @@ async def _retrieve_and_analyze_dimension(
 
         prompt = _ANALYSIS_PROMPT % (dimension, competitors, chunks_text)
         resp = await llm.ainvoke(prompt)
+        # 【2026-10-01 可观测性】累计 token 用量到维度级累加器
+        if usage_acc is not None:
+            add_usage(usage_acc, extract_usage(resp))
         text = resp.content.strip()
 
         # 【L4 工程】LLM 输出防御：模型不一定遵守"只输出 JSON"
@@ -385,6 +390,7 @@ async def _track_dim_completion(
     dim_name: str,
     coro,
     log_dao,
+    usage_acc: dict[str, int] | None = None,
 ):
     """执行单个维度分析，完成后立即写入 agent_logs → SSE 实时推送。
 
@@ -395,18 +401,27 @@ async def _track_dim_completion(
     并行度完全不变（Semaphore 约束在内部）。
     """
     result = await coro
+    # 【2026-10-01 可观测性】从维度级累加器取 token（None → 空 dict）
+    _u = usage_acc or {}
+    _tk = dict(
+        prompt_tokens=_u.get("prompt_tokens"),
+        completion_tokens=_u.get("completion_tokens"),
+        total_tokens=_u.get("total_tokens"),
+    )
     # 检查结果类型，决定日志内容
     if isinstance(result, Exception):
         await log_dao.log(
             task_id=task_id, agent_name="analyzer", action="dim_analysis",
             request={"dimension": dim_name},
             response={"dimension": dim_name, "error": str(result)},
+            **_tk,
         )
     elif isinstance(result, dict) and "error" in result:
         await log_dao.log(
             task_id=task_id, agent_name="analyzer", action="dim_analysis",
             request={"dimension": dim_name},
             response={"dimension": dim_name, "error": result["error"]},
+            **_tk,
         )
     else:
         # 正常完成：统计竞品数量
@@ -415,6 +430,7 @@ async def _track_dim_completion(
             task_id=task_id, agent_name="analyzer", action="dim_analysis",
             request={"dimension": dim_name},
             response={"dimension": dim_name, "competitors": comp_count},
+            **_tk,
         )
     return result
 
@@ -471,16 +487,19 @@ async def analyzer_agent(
     #   — 异常作为 Exception 对象出现在 results_list 中
     #   — 由下面的 for 循环处理为 "[分析失败]" 标记
 
-    # 【L4 工程】中间进度：逐维度打日志，让 SSE 实时推送到前端
-    # 因为 gather 是并行的，我们不要等全部完成——改用 asyncio.as_completed
+    # 【2026-10-01 可观测性】每个维度一个独立累加器，避免并行写入竞争
+    dim_usage_accs: list[dict[str, int]] = [{} for _ in dimensions]
     tasks_coros = [
-        _retrieve_and_analyze_dimension(task_id, competitors, dim, chunk_dao, llm, settings)
-        for dim in dimensions
+        _retrieve_and_analyze_dimension(
+            task_id, competitors, dim, chunk_dao, llm, settings,
+            dim_usage_accs[i],
+        )
+        for i, dim in enumerate(dimensions)
     ]
     # 包装：给每个 coro 打上标签 (dim_name, coro)
     tagged = [
-        _track_dim_completion(task_id, dim, coro, log_dao)
-        for dim, coro in zip(dimensions, tasks_coros)
+        _track_dim_completion(task_id, dim, coro, log_dao, dim_usage_accs[i])
+        for i, (dim, coro) in enumerate(zip(dimensions, tasks_coros))
     ]
     results_list = await asyncio.gather(*tagged, return_exceptions=True)
 

@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 
 from src.db.connection import create_pool
 from src.db.dao import ReportDAO, AgentLogDAO
+from src.observability.token_usage import extract_usage
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -213,6 +214,8 @@ async def quality_agent(
     )
 
     resp = await llm.ainvoke(prompt)
+    # 【2026-10-01 可观测性】提取 token 用量
+    usage = extract_usage(resp)
     text = (resp.content or "").strip()
 
     # ── 防御：LLM 空响应 ──
@@ -329,6 +332,9 @@ async def quality_agent(
             "dimension_scores": dim_score_map,
         },
         duration_ms=round(duration_ms, 1),
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        total_tokens=usage.get("total_tokens"),
     )
 
     # ── ✏️ 输出日志：维度级评分明细 ──

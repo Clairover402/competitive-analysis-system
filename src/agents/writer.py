@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 
 from src.db.connection import create_pool
 from src.db.dao import AgentLogDAO
+from src.observability.token_usage import extract_usage
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -208,6 +209,8 @@ async def writer_agent(
     )
 
     resp = await llm.ainvoke(prompt)
+    # 【2026-10-01 可观测性】提取 token 用量
+    usage = extract_usage(resp)
     report = resp.content.strip()
 
     duration_ms = (time.perf_counter() - t0) * 1000
@@ -224,6 +227,9 @@ async def writer_agent(
             "rewrite": bool(rewrite_suggestions),
         },
         duration_ms=round(duration_ms, 1),
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        total_tokens=usage.get("total_tokens"),
     )
 
     # ── ✏️ 输出日志 ──
