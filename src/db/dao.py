@@ -186,6 +186,22 @@ class TaskDAO:
                 task_id, status,
             )
 
+    async def update_pipeline_mode(self, task_id: str, pipeline_mode: str) -> None:
+        """回写任务实际执行的模式（pipeline / supervisor）。
+
+        【2026-10-01 BUG修复】pipeline_mode 字段之前在 create() 时硬编码为
+        "pipeline"，从未回写 IntentRouter 的实际路由结果，导致走 supervisor
+        的任务在 task 表里也被记成 pipeline。此方法在路由决策后立即回写，
+        让 task 表的 pipeline_mode 反映真实执行路径。
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE tasks
+                   SET pipeline_mode = $2, updated_at = NOW()
+                   WHERE id = $1""",
+                task_id, pipeline_mode,
+            )
+
 
 class ReportDAO:
     """分析报告数据访问。

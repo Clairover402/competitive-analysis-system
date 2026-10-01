@@ -470,9 +470,10 @@ async def _execute_task(
     }
 
     try:
-        # ── 1. 标记 running ──
+        # ── 1. 标记 running + 回写实际路由模式 ──
         task_dao = TaskDAO(pool)
         await task_dao.update_status(task_id_str, "running")
+        await task_dao.update_pipeline_mode(task_id_str, route_type)
         record_task_started()
 
         # ── 2. 从 app.state 拿预编译图 → 直接执行 ──
