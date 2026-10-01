@@ -1,0 +1,228 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "任务总数",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT COUNT(*) AS value FROM tasks",
+          "editorMode": "code"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "type": "stat",
+      "title": "成功率",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT ROUND(100.0 * SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS value FROM tasks WHERE status IN ('completed','failed')",
+          "editorMode": "code"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "type": "stat",
+      "title": "Agent 调用总次数",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT COUNT(*) AS value FROM agent_logs",
+          "editorMode": "code"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "type": "stat",
+      "title": "Agent 错误率",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT ROUND(100.0 * SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS value FROM agent_logs",
+          "editorMode": "code"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "任务耗时分布（P50/P95）",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(created_at,'1h') AS time, percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) AS p50, percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95 FROM agent_logs WHERE duration_ms IS NOT NULL AND $__timeFilter(created_at) GROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent 调用量趋势（按 Agent 分）",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(created_at,'1h') AS time, agent_name, COUNT(*) FROM agent_logs WHERE $__timeFilter(created_at) GROUP BY 1, agent_name ORDER BY 1",
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "type": "barchart",
+      "title": "各 Agent 平均耗时（ms）",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT agent_name, ROUND(AVG(duration_ms)) AS avg_ms FROM agent_logs WHERE duration_ms IS NOT NULL GROUP BY agent_name ORDER BY avg_ms DESC",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "barchart",
+      "title": "各 Agent 错误率（%）",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT agent_name, ROUND(100.0 * SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS error_rate FROM agent_logs GROUP BY agent_name ORDER BY error_rate DESC",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "type": "table",
+      "title": "Badcase 列表（出错日志，按耗时倒序）",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT created_at, task_id::text AS task, agent_name AS agent, action, duration_ms, LEFT(COALESCE(error,''),200) AS error FROM agent_logs WHERE error IS NOT NULL ORDER BY created_at DESC LIMIT 50",
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "最近任务（含状态）",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 30 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT created_at, id::text AS task_id, title, status, pipeline_mode FROM tasks ORDER BY created_at DESC LIMIT 50",
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "质检分趋势（reports 表）",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(created_at,'1d') AS time, ROUND(AVG(quality_score)::numeric, 1) AS avg_score, MIN(quality_score) AS min_score, MAX(quality_score) AS max_score FROM reports WHERE quality_score IS NOT NULL AND $__timeFilter(created_at) GROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0, "max": 100 } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Token 消耗趋势（按 Agent 分）",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(created_at,'1h') AS time, agent_name, SUM(total_tokens) AS total_tokens FROM agent_logs WHERE total_tokens IS NOT NULL AND $__timeFilter(created_at) GROUP BY 1, agent_name ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "type": "barchart",
+      "title": "各 Agent Token 消耗总量",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "postgres", "uid": "cas-postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "cas-postgres" },
+          "format": "table",
+          "rawSql": "SELECT agent_name, COALESCE(SUM(total_tokens),0) AS total_tokens FROM agent_logs WHERE total_tokens IS NOT NULL GROUP BY agent_name ORDER BY total_tokens DESC",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["competitive-analysis", "agent"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30d", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "竞品分析系统监控",
+  "uid": "cas-monitoring",
+  "version": 1
+}

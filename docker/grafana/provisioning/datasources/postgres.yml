@@ -1,0 +1,26 @@
+# Grafana 数据源自动装载
+# Grafana 启动时自动读取此文件，将 PostgreSQL 注册为数据源
+# 用户无需在 Web UI 手动添加数据源
+
+apiVersion: 1
+
+datasources:
+  - name: PostgreSQL
+    uid: cas-postgres        # 面板 JSON 中引用的固定 UID
+    type: postgres
+    access: proxy
+    # 主库是手动容器 pg-chinese（映射在宿主机 5432），
+    # Grafana 用 host.docker.internal 走宿主机映射连它，
+    # 不用 compose 服务名 postgres（那个是空库，见 docker-compose 注释）
+    url: host.docker.internal:5432
+    database: cas_db
+    user: postgres
+    secureJsonData:
+      password: "123456"
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    # 只读优化：监控面板只查询，不写入（最小权限原则）
+    readOnly: true
+    editable: false

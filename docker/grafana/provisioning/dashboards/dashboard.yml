@@ -1,0 +1,17 @@
+# Grafana Dashboard 自动装载
+# Grafana 启动时自动扫描 /var/lib/grafana/dashboards 目录，
+# 将 competitive-analysis-monitoring.json 加载为面板
+
+apiVersion: 1
+
+providers:
+  - name: "Competitive Analysis"
+    orgId: 1
+    folder: "竞品分析系统"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
