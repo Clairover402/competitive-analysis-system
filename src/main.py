@@ -18,6 +18,17 @@ import argparse
 import logging
 import sys
 
+# 【2026-10-02 LangSmith 接入修复】必须在任何 langchain/langgraph import 之前
+# 显式加载 .env，否则 LANGCHAIN_TRACING_V2 等变量在 langchain 首次 import 时
+# 还不在 os.environ 里，导致 tracing 被静默禁用、trace 不上报。
+#
+# 根因：pydantic-settings 只在 Settings() 实例化时才加载 .env，而 langchain 的
+# tracing 开关在模块 import 时就检查 os.environ，二者存在竞态。这里用
+# python-dotenv 的 load_dotenv 在最前面强制加载，保证顺序正确。
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import uvicorn
 
 
