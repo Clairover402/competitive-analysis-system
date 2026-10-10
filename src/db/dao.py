@@ -367,6 +367,69 @@ class EvidenceDAO:
             return [dict(r) for r in rows]
 
 
+class RetrievalSnapshotDAO:
+    """检索阶段快照数据访问。
+
+    【L3/L4 核心考点】为什么检索评估要单独落快照？
+    ------------------------------------------------------------
+    RAGAS 的 context_precision 测「检索本身准不准」，
+    对象必须是检索阶段原始产出的 retrieved_contexts（精排后的原文），
+    不能是「LLM 结论」或「事后按 URL 反查的 chunk」。故 analyzer 在
+    精排完成、喂 LLM 前，把召回全集 + 精排 TopK 原样落 retrieval_snapshot。
+    召回全集 recalled_urls 另用于 recall_hit_rate（域名对拍）度量召回是否漏。
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def insert_snapshot(
+        self,
+        task_id: str,
+        dimension: str,
+        query: str,
+        recalled_urls: list[str],
+        reranked_urls: list[str],
+        reranked_texts: list[str],
+    ) -> None:
+        """落一条检索快照（单个维度的检索中间结果）。"""
+        import json
+
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO retrieval_snapshot
+                   (task_id, dimension, query, recalled_urls,
+                    reranked_urls, reranked_texts)
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                task_id,
+                dimension,
+                query,
+                json.dumps(recalled_urls, ensure_ascii=False),
+                json.dumps(reranked_urls, ensure_ascii=False),
+                json.dumps(reranked_texts, ensure_ascii=False),
+            )
+
+    async def get_by_task(self, task_id: str) -> list[dict]:
+        """按 task 取全部维度的检索快照（用于评估时逐个维度打分）。"""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT * FROM retrieval_snapshot
+                   WHERE task_id = $1 ORDER BY created_at""",
+                task_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def get_by_dimension(self, task_id: str, dimension: str) -> dict | None:
+        """按 task + 维度取最新一条快照。"""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT * FROM retrieval_snapshot
+                   WHERE task_id = $1 AND dimension = $2
+                   ORDER BY created_at DESC LIMIT 1""",
+                task_id, dimension,
+            )
+            return dict(row) if row else None
+
+
 class ChunkEmbeddingDAO:
     """文档分块向量存储数据访问。
 
@@ -466,6 +529,34 @@ class ChunkEmbeddingDAO:
                 task_id, _vector_str(query_embedding), top_k,
             )
             return [dict(r) for r in rows]
+
+    async def get_texts_by_urls(
+        self,
+        task_id: str,
+        urls: list[str],
+    ) -> dict[str, str]:
+        """按 source_url 反查 chunk 原文，返回 {url: chunk_text}。
+
+        用于证据落库时回填 evidence_map.source_text——RAGAS 的 context_precision/
+        faithfulness 需要「检索到的原文」而非「LLM 二次加工的结论摘要」，
+        否则这两个指标会因输入失真而偏低（context_precision 甚至恒 0）。
+
+        【L4 工程】同一 URL 可能对应多个 chunk（一个页面被切成 N 块），
+        且第一块通常是导航栏/页眉噪音（"首页 搜索 登录…"）。
+        这里取该 URL 下「最长的一条 chunk」——正文块通常远长于导航块，
+        用最长块作为该来源的代表性原文，比按 chunk_index 取第一条更可靠。
+        """
+        if not urls:
+            return {}
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT DISTINCT ON (source_url) source_url, chunk_text
+                   FROM chunk_embeddings
+                   WHERE task_id = $1 AND source_url = ANY($2::text[])
+                   ORDER BY source_url, length(chunk_text) DESC""",
+                task_id, list(urls),
+            )
+            return {r["source_url"]: r["chunk_text"] for r in rows}
 
     async def keyword_search(
         self,
@@ -1005,3 +1096,264 @@ class UserDAO:
                 email,
             )
             return dict(row) if row else None
+
+
+class EvalResultDAO:
+    """评估结果数据访问 — 沉淀趋势 + 版本 diff + 回归判定。
+
+    【L4 工程】为什么评估结果要落库（而非只打印）？
+    ------------------------------------------------------------
+    评估的价值不在「一次性的 PASS/FAIL」，而在「时间轴上的趋势」：
+      - 趋势：同一 Golden Case 跨多次评估，faithfulness 是单调上升还是抖动
+      - 版本 diff：报告 rewrite（version 1→2）后，评估分有没有真变好
+      - 回归判定：改检索/提示词后跑一遍 Golden，单指标 -0.05 自动告警
+    没有 eval_results 表，这些只能靠人肉翻日志。
+
+    【表结构】主表 eval_results（批次元信息 + 总分 + 门禁）+ 明细表
+    eval_metric_scores（每指标一行，含维度/权重/阈值/是否通过），
+    指标集随 eval_type 弹性扩展，无需改表。
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def insert_result(
+        self,
+        task_id: str,
+        eval_type: str,
+        *,
+        report_id: str | None = None,
+        overall_score: float | None = None,
+        gate: str | None = None,
+        judge_model: str | None = None,
+        passed: bool | None = None,
+        is_golden: bool = False,
+        metadata: dict | None = None,
+    ) -> str:
+        """插入一条评估批次记录，返回 eval_id（供明细表外键）。
+
+        Args:
+            task_id: 任务 ID
+            eval_type: generation / retrieval / judge
+            report_id: 被评估的报告版本（检索评估无报告时为 None）
+            overall_score: 总分（0~1 或 0~100，语义随 eval_type）
+            gate: PASS/WARN/BLOCK/SKIP
+            judge_model: 评估模型（隔离可追溯）
+            passed: 是否通过（Judge 用，其余可 None）
+            is_golden: 是否 Golden 用例（区分标准回归 vs 真实任务趋势线）
+            metadata: 附加信息（reason/reference/competitors 等）
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO eval_results
+                   (task_id, report_id, eval_type, overall_score, gate,
+                    judge_model, passed, is_golden, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   RETURNING id""",
+                task_id,
+                report_id,
+                eval_type,
+                overall_score,
+                gate,
+                judge_model,
+                passed,
+                is_golden,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            )
+            return str(row["id"]) if row else ""
+
+    async def insert_metric_scores(
+        self,
+        eval_id: str,
+        metrics: list[dict],
+    ) -> None:
+        """批量插入指标明细。
+
+        Args:
+            eval_id: eval_results 主键
+            metrics: [{metric_name, dimension, score, weight, threshold, passed}]
+                     dimension/weight/threshold/passed 可为 None
+        """
+        if not metrics:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.executemany(
+                """INSERT INTO eval_metric_scores
+                   (eval_id, metric_name, dimension, score, weight, threshold, passed)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                [
+                    (
+                        eval_id,
+                        m.get("metric_name"),
+                        m.get("dimension"),
+                        m.get("score"),
+                        m.get("weight"),
+                        m.get("threshold"),
+                        m.get("passed"),
+                    )
+                    for m in metrics
+                ],
+            )
+
+    async def get_by_task(
+        self,
+        task_id: str,
+        eval_type: str | None = None,
+    ) -> list[dict]:
+        """按任务取评估批次（含指标明细），按时间升序 → 版本 diff 时间轴。
+
+        Args:
+            task_id: 任务 ID
+            eval_type: 可选过滤评估类型
+        """
+        async with self._pool.acquire() as conn:
+            if eval_type:
+                rows = await conn.fetch(
+                    """SELECT * FROM eval_results
+                       WHERE task_id = $1 AND eval_type = $2
+                       ORDER BY created_at""",
+                    task_id, eval_type,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT * FROM eval_results
+                       WHERE task_id = $1 ORDER BY created_at""",
+                    task_id,
+                )
+            results = [dict(r) for r in rows]
+            if not results:
+                return []
+
+            # 批量取明细，按 eval_id 归组
+            eval_ids = [r["id"] for r in results]
+            metric_rows = await conn.fetch(
+                """SELECT * FROM eval_metric_scores
+                   WHERE eval_id = ANY($1::uuid[]) ORDER BY created_at""",
+                eval_ids,
+            )
+            metrics_by_eval: dict[str, list[dict]] = {}
+            for mr in metric_rows:
+                m = dict(mr)
+                metrics_by_eval.setdefault(str(m["eval_id"]), []).append(m)
+
+            for r in results:
+                r["metrics"] = metrics_by_eval.get(str(r["id"]), [])
+            return results
+
+    async def get_trend(
+        self,
+        eval_type: str,
+        *,
+        metric_name: str | None = None,
+        is_golden: bool | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """取某类评估的历史趋势（跨任务）。
+
+        返回按时间排序的批次列表，每个含 overall_score 和 metrics；
+        若指定 metric_name，额外计算该指标的全局趋势序列。
+        """
+        async with self._pool.acquire() as conn:
+            params: list = [eval_type]
+            where = ["eval_type = $1"]
+            if is_golden is not None:
+                params.append(is_golden)
+                where.append(f"is_golden = ${len(params)}")
+
+            limit_param = len(params) + 1
+            rows = await conn.fetch(
+                f"""SELECT * FROM eval_results
+                    WHERE {' AND '.join(where)}
+                    ORDER BY created_at DESC LIMIT ${limit_param}""",
+                *params, limit,
+            )
+            return [dict(r) for r in rows]
+
+    async def diff_latest(
+        self,
+        task_id: str,
+        eval_type: str,
+    ) -> dict | None:
+        """对比同一任务最近两次同类型评估的分差（版本 diff）。
+
+        Returns:
+            {
+                "previous": {overall_score, metrics: {name: score}},
+                "latest":   {overall_score, metrics: {name: score}},
+                "deltas":   {metric_name: 最新-上次},  # 正=改善，负=退化
+            }
+            不足两次评估返回 None
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT * FROM eval_results
+                   WHERE task_id = $1 AND eval_type = $2
+                   ORDER BY created_at DESC LIMIT 2""",
+                task_id, eval_type,
+            )
+            if len(rows) < 2:
+                return None
+            latest, previous = dict(rows[0]), dict(rows[1])
+
+            async def _metrics(eval_id: str) -> dict[str, float]:
+                mrows = await conn.fetch(
+                    """SELECT metric_name, score FROM eval_metric_scores
+                       WHERE eval_id = $1""",
+                    eval_id,
+                )
+                return {m["metric_name"]: float(m["score"]) for m in mrows}
+
+            prev_m = await _metrics(previous["id"])
+            lat_m = await _metrics(latest["id"])
+
+            deltas = {}
+            all_names = set(prev_m) | set(lat_m)
+            for name in all_names:
+                deltas[name] = round(
+                    lat_m.get(name, 0.0) - prev_m.get(name, 0.0), 3
+                )
+
+            return {
+                "previous": {"overall_score": previous["overall_score"], "metrics": prev_m},
+                "latest": {"overall_score": latest["overall_score"], "metrics": lat_m},
+                "deltas": deltas,
+            }
+
+    async def check_regression(
+        self,
+        task_id: str,
+        eval_type: str,
+        *,
+        metric_name: str,
+        tolerance: float = 0.05,
+    ) -> dict | None:
+        """回归判定：同一任务最近两次评估，某指标是否倒退超过 tolerance。
+
+        Args:
+            metric_name: 关注的指标（如 faithfulness / context_precision）
+            tolerance: 允许的分数回撤阈值，跌幅超过则判「回归」
+
+        Returns:
+            {
+                "metric_name": str,
+                "previous": float, "latest": float,
+                "delta": float,           # 最新-上次（负=倒退）
+                "regressed": bool,        # 是否回归（delta < -tolerance）
+            }
+            不足两次评估返回 None
+        """
+        diff = await self.diff_latest(task_id, eval_type)
+        if diff is None:
+            return None
+        prev = diff["previous"]["metrics"].get(metric_name)
+        latest = diff["latest"]["metrics"].get(metric_name)
+        if prev is None or latest is None:
+            return None
+        delta = round(latest - prev, 3)
+        return {
+            "metric_name": metric_name,
+            "previous": prev,
+            "latest": latest,
+            "delta": delta,
+            "regressed": delta < -tolerance,
+        }

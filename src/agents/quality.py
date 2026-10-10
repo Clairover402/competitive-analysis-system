@@ -52,7 +52,7 @@ import time
 from typing import TYPE_CHECKING
 
 from src.db.connection import create_pool
-from src.db.dao import ReportDAO, AgentLogDAO
+from src.db.dao import ReportDAO, AgentLogDAO, EvidenceDAO, ChunkEmbeddingDAO
 from src.observability.token_usage import extract_usage
 
 if TYPE_CHECKING:
@@ -130,6 +130,94 @@ _WEIGHTS = {
     "客观性": 0.10,
 }
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 证据提取（2026-10-06 接线 evidence_map 落库）
+# ═════════════════════════════════════════════════════════════════════════════
+
+_URL_RE = __import__("re").compile(
+    r"https?://[^\s\)\]，,；;。\"'）()【】<>]+"
+)
+
+
+def _conclusion_text(val) -> str:
+    """从 analysis_results 单元格值中统一取出"结论文本"。
+
+    值有两种形态：结构化对象 {"conclusion": "...", "source_url": "..."} 或旧版自由文本。
+    用于 Quality 判断 [数据不足]/[待验证] 单元格时，忽略 source_url 字段，
+    避免把 URL 里的内容误判成结论的一部分。
+    """
+    if isinstance(val, dict):
+        return str(val.get("conclusion") or "")
+    return str(val or "")
+
+
+def _extract_evidences(
+    analysis_results: dict,
+) -> list[dict]:
+    """从 Analyzer 的结构化结果中提取 (claim, source_url, dimension) 证据。
+
+    analysis_results 结构：{dimension: {competitor: 值}}。
+    值有两种形态（LLM 输出不稳定，需兼容）：
+      A. 结构化对象（2026-10-06 加固后的目标形态）：
+         {"conclusion": "...", "source_url": "https://..."}
+      B. 旧版自由文本（历史遗留 / LLM 未遵守新格式）：
+         "结论（附带 source_url）" —— URL 混在文本里，用正则兜底抽取
+
+    规则：
+      - 跳过 [数据不足] / [待验证] / [分析失败] 的单元格（无实质结论，无证据可溯源）
+      - 结构化形态：source_url 为空或占位符 → 跳过（不可追溯）
+      - 旧文本形态：抽不到 URL → 跳过
+      - claim 取结论原文（不含 URL），dimension 取所属维度
+
+    Args:
+        analysis_results: Analyzer 返回的 {dimension: {competitor: 值}}
+
+    Returns:
+        [{claim, source_url, source_text, dimension}, ...]，可直接喂 EvidenceDAO.batch_insert
+    """
+    evidences: list[dict] = []
+    for dim, comp_data in analysis_results.items():
+        if not isinstance(comp_data, dict):
+            continue
+        for comp, val in comp_data.items():
+            # ── 形态 A：结构化对象 {conclusion, source_url} ──
+            if isinstance(val, dict):
+                conclusion = str(val.get("conclusion") or "").strip()
+                url = str(val.get("source_url") or "").strip()
+                # source_url 为空或仍是占位符 → 不可追溯，跳过
+                if not url or url in ("source_url", "（source_url）", "()"):
+                    continue
+                claim = conclusion
+            else:
+                # ── 形态 B：旧版自由文本（正则兜底） ──
+                text = str(val or "").strip()
+                if not text or text.startswith(("[数据不足]", "[待验证]", "[分析失败]")):
+                    continue
+                urls = _URL_RE.findall(text)
+                if not urls:
+                    continue
+                url = urls[0]
+                claim = text.replace(url, " ")
+
+            if not claim or claim.startswith(("[数据不足]", "[待验证]", "[分析失败]")):
+                continue
+
+            # 轻量清理：去掉 URL 位置残留的孤立标点/空括号/多余空白
+            claim = claim.replace("()", " ").replace("（）", " ")
+            claim = __import__("re").sub(r"[\s，,。；;：:]+", " ", claim).strip()
+            if not claim:
+                continue
+
+            evidences.append({
+                "claim": claim[:500],
+                "source_url": url,
+                "source_text": None,  # chunk 原文在 chunk_embeddings，这里暂不冗余存储
+                "dimension": dim[:50],
+            })
+    return evidences
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Quality Agent 主函数
 # ═════════════════════════════════════════════════════════════════════════════
@@ -194,7 +282,7 @@ async def quality_agent(
     for dim in dimensions:
         dim_data = analysis_results.get(dim, {})
         for comp in competitors:
-            text_val = str(dim_data.get(comp, ""))
+            text_val = _conclusion_text(dim_data.get(comp, ""))
             if "[数据不足]" in text_val or "[待验证]" in text_val:
                 missing_cells.append(f"{dim}×{comp}")
     if missing_cells:
@@ -308,13 +396,50 @@ async def quality_agent(
     #   ① 职责分离：Writer 负责生成，Quality 负责评估 + 持久化
     #   ② 如果 Writer 不通过 → rewrite → 新报告 → 覆盖旧记录
     #   ③ 评分和报告放在同一条记录里，方便查询 "哪些任务通过了"
-    await report_dao.create(
+    report_id = await report_dao.create(
         task_id=task_id,
         content=report,
         quality_score=overall_score,
         quality_details=dim_scores,
         version=task.get("version", 1),
     )
+
+    # ─── 证据落库（2026-10-06 接线，补 evidence_map 从未被写入的缺口）───
+    # 只有报告最终通过时才写证据——未通过的报告会被 rewrite 覆盖，
+    # 写证据会造成重复/脏数据。证据挂在 report_id 上，RAGAS 评估依赖它取 contexts。
+    if passed and report_id:
+        try:
+            evidences = _extract_evidences(analysis_results)
+            if evidences:
+                # 回填 source_text：按 source_url 反查 chunk 原文。
+                # RAGAS 的 context_precision/faithfulness 需要「检索原文」而非「结论摘要」，
+                # 否则输入失真导致这两个指标偏低（context_precision 甚至恒 0）。
+                try:
+                    chunk_dao = ChunkEmbeddingDAO(pool)
+                    url2text = await chunk_dao.get_texts_by_urls(
+                        task_id, [e["source_url"] for e in evidences]
+                    )
+                    for e in evidences:
+                        e["source_text"] = url2text.get(e["source_url"])
+                except Exception as e2:
+                    # source_text 回填失败不阻断证据落库——claim 兜底仍可追溯
+                    logger.warning("【Quality】source_text 回填失败: %s", e2)
+
+                evidence_dao = EvidenceDAO(pool)
+                await evidence_dao.batch_insert(report_id, evidences)
+                filled = sum(1 for e in evidences if e.get("source_text"))
+                logger.info(
+                    "【Quality】证据落库 report_id=%s 条数=%d 回填原文=%d",
+                    report_id, len(evidences), filled,
+                )
+            else:
+                logger.warning(
+                    "【Quality】无有效证据可落库 report_id=%s（结论文本中未抽到 source_url）",
+                    report_id,
+                )
+        except Exception as e:
+            # 证据落库失败不能阻断报告交付——它是评估的前置数据，不是报告本身的组成部分
+            logger.exception("【Quality】证据落库失败 report_id=%s: %s", report_id, e)
 
     duration_ms = (time.perf_counter() - t0) * 1000
     # ── 构建维度评分明细（与控制台日志对齐）──

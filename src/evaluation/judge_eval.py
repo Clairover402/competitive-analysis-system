@@ -187,12 +187,16 @@ async def evaluate_with_judge(
     if task is None or task.get("status") != "completed":
         return None
 
-    # 2. 获取报告
+    # 2. 获取报告（ReportDAO 只有 get_latest / get_all_versions，
+    #    没有 get_by_task —— 后者是 AgentLogDAO 的方法，此处不能混用）
     report_dao = ReportDAO(dao._pool)
-    reports = await report_dao.get_by_task(task_id)
-    if not reports:
+    report = await report_dao.get_latest(task_id)
+    if report is None:
         return None
-    report_text = "\n\n".join(r.get("content", "") for r in reports)
+    report_text = report.get("content", "") or ""
+
+    if not report_text.strip():
+        return None
 
     # 3. 调用 LLM 评估（模型隔离：judge_model != deepseek_model）
     settings = Settings()
@@ -230,6 +234,38 @@ async def evaluate_with_judge(
 
     # 5. 门禁：所有维度 >= 60
     passed = scores.all_above(60)
+
+    # 6. 落库（沉淀五维趋势，失败不阻断评估）
+    try:
+        from src.db.dao import EvalResultDAO
+
+        eval_dao = EvalResultDAO(dao._pool)
+        eval_id = await eval_dao.insert_result(
+            task_id=task_id,
+            eval_type="judge",
+            report_id=report["id"],
+            overall_score=scores.final_score,
+            gate="PASS" if passed else "BLOCK",
+            judge_model=judge_model,
+            passed=passed,
+            is_golden=False,
+        )
+        # 五维明细，带权重（完整性30/准确性30/可追溯性20/可读性10/客观性10）
+        _weights = {"完整性": 30, "准确性": 30, "可追溯性": 20, "可读性": 10, "客观性": 10}
+        await eval_dao.insert_metric_scores(eval_id, [
+            {
+                "metric_name": name,
+                "dimension": None,
+                "score": float(getattr(scores, name)),
+                "weight": float(_weights[name]),
+                "threshold": 60.0,
+                "passed": getattr(scores, name) >= 60,
+            }
+            for name in _weights
+        ])
+    except Exception:
+        logger = logging.getLogger(__name__)
+        logger.warning("Judge 评估结果落库失败 task_id=%s", task_id, exc_info=True)
 
     return {
         "task_id": task_id,

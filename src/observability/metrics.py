@@ -179,3 +179,45 @@ def record_harness_block(check_type: str) -> None:
         check_type: whitelist / param_validation / rate_limit / pii
     """
     ca_harness_blocks.labels(check_type=check_type).inc()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §5 评估指标（2026-10-06 评估体系自动落库 → 暴露 Prometheus 供 Grafana 面板）
+# ═════════════════════════════════════════════════════════════════════════════
+# 评估分数落库到 eval_results 后，同步推一份到 Prometheus（Gauge 当前值 + Counter
+# 计数），Grafana 面板就能实时看到 faithfulness/context_precision/judge 五维等趋势。
+
+ca_eval_scores = Gauge(
+    "ca_eval_scores",
+    "评估指标分数（当前值，按 metric_name 分桶）",
+    ["metric_name", "eval_type"],  # metric_name: faithfulness/answer_relevancy/context_precision/完整性…
+)                                  # eval_type: generation/retrieval/judge
+
+ca_eval_evals_total = Counter(
+    "ca_eval_evals_total",
+    "评估执行次数，按 eval_type 分桶",
+    ["eval_type"],
+)
+
+ca_eval_regressions_total = Counter(
+    "ca_eval_regressions_total",
+    "评估回归告警次数（单指标回撤超过容差）",
+    ["metric_name"],
+)
+
+
+def record_eval_scores(eval_type: str, metrics: dict[str, float]) -> None:
+    """上报一次评估的各指标分数（Gauge set 覆盖 + Counter 计数）。
+
+    Args:
+        eval_type: generation / retrieval / judge
+        metrics: {metric_name: score}
+    """
+    ca_eval_evals_total.labels(eval_type=eval_type).inc()
+    for name, score in metrics.items():
+        ca_eval_scores.labels(metric_name=name, eval_type=eval_type).set(score)
+
+
+def record_eval_regression(metric_name: str) -> None:
+    """记录一次评估回归告警。"""
+    ca_eval_regressions_total.labels(metric_name=metric_name).inc()

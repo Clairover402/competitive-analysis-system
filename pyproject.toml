@@ -38,6 +38,11 @@ dependencies = [
     "PyJWT>=2.9",
     "passlib[bcrypt]>=1.7",
     "bcrypt>=4.0,<5",
+    "ragas>=0.4.3",
+    # ragas 0.4.3 的 llms/base.py 顶层硬 import langchain_community.chat_models.vertexai，
+    # 该模块在 langchain-community >= 0.4 已被移除（拆到 langchain-google-vertexai）。
+    # 锁定 < 0.4 保证兼容（代码里另有 monkey-patch 兜底，双保险）。
+    "langchain-community<0.4.0",
 ]
 
 [project.optional-dependencies]

@@ -192,6 +192,39 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embedding_hnsw
 
 
 -- ============================================================
+-- 4.5 retrieval_snapshot — 检索阶段快照（RAGAS 检索质量评估输入）
+-- ============================================================
+-- 【L3/L4 核心考点】为什么检索评估要在「检索阶段」落快照，而不是事后从报告反查？
+--   RAGAS 的 context_precision 测的是「检索本身准不准」，
+--   对象必须是「向量+关键词+精排」产出的原始 retrieved_contexts，
+--   不能是「LLM 二次加工后的结论」或「事后按 URL 反查的最长 chunk」——
+--   后者经过 _smart_slice 丢弃与结论改写，检索质量信号已被稀释/污染。
+--
+--   因此本表在 analyzer 精排完成、喂 LLM 之前，把检索的中间结果原样落盘：
+--     - recalled_urls  = 向量(TopK=30) ∪ 关键词(TopK=20) 去重后的召回全集
+--     - reranked_urls/texts = Cross-encoder 精排后 TopK=15 的 url/text
+--   reranked_texts 才是 RAGAS context_precision 该吃的 retrieved_contexts。
+--   recalled_urls 则用于 recall_hit_rate（召回覆盖度）的域名对拍。
+--
+-- 【L4 工程】为什么 recalled 和 reranked 都要存？
+--   评估「召回」和「精排」是两个不同问题：recalled_urls 测召回是否漏，
+--   reranked_texts 测精排后头部是否相关。只存 reranked 会丢掉「漏召回」的可见性。
+CREATE TABLE IF NOT EXISTS retrieval_snapshot (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    dimension       VARCHAR(50) NOT NULL,     -- 所属维度（功能/定价/市场…）
+    query           TEXT NOT NULL,            -- 检索 query（通常=维度名）
+    recalled_urls   JSONB NOT NULL DEFAULT '[]',  -- 召回全集 URL（向量∪关键词去重后）
+    reranked_urls   JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 URL（保持排序）
+    reranked_texts  JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 chunk 原文（与 url 对齐）
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_snapshot_task_dim
+    ON retrieval_snapshot (task_id, dimension);
+
+
+-- ============================================================
 -- 5. agent_logs — Agent 审计日志
 -- ============================================================
 -- 【L5 面试必问】Harness Engineering 的审计模块落地方案
@@ -342,3 +375,76 @@ CREATE TABLE IF NOT EXISTS checkpoint_writes (
     value           JSONB,
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
 );
+
+
+-- ============================================================
+-- 10. eval_results — 评估批次主表（趋势沉淀 + 版本 diff 基础）
+-- ============================================================
+-- 【L4 工程】为什么评估结果要落库，而不是只在控制台打印？
+--   1) 趋势：同一 Golden Case 或同一类任务，跨多次评估看分数走向
+--      （faithfulness 从 0.8 → 0.85 是改进，还是噪声？）
+--   2) 版本 diff：报告 rewrite 后（version 1 → 2），评估分有没有真的变好
+--   3) 回归判定：改动检索/提示词后，跑一遍 Golden，分数 -0.05 自动告警
+--   这些都需要「历史评估」可查，不能只看最后一次。
+--
+-- 【L4 工程】为什么主表 + 明细表两张，而不是一张宽表？
+--   评估有三类对象（生成质量 / 检索质量 / Judge 报告质量），
+--   各自指标集不同（RAGAS 三维 vs 检索两指标 vs Judge 五维），
+--   宽表会有大量 NULL 列且加指标要改表。主表存「共性的元信息 + 总分 + 门禁」，
+--   明细表存「每个指标一行」，指标集随评估类型弹性扩展，无需 DDL。
+--
+-- 【L4 工程】eval_type 三值语义：
+--   generation = evaluate_task_with_ragas（成稿后，faithfulness/answer_relevancy/context_precision）
+--   retrieval  = evaluate_retrieval（检索阶段，context_precision/recall_hit_rate）
+--   judge      = evaluate_with_judge（五维报告质量）
+CREATE TABLE IF NOT EXISTS eval_results (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id      UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    report_id    UUID REFERENCES reports(id) ON DELETE CASCADE,
+                 -- 关联被评估的报告版本（version diff 的锚点）；检索评估无报告时为 NULL
+    eval_type    VARCHAR(20) NOT NULL,     -- generation / retrieval / judge
+    overall_score FLOAT,                   -- 总分（0~1 或 0~100，语义随 eval_type）
+    gate         VARCHAR(10),              -- PASS / WARN / BLOCK / SKIP（检索/Judge 可能无）
+    judge_model  VARCHAR(50),              -- 评估用模型（deepseek-chat，隔离可追溯）
+    passed       BOOLEAN,                  -- Judge 五维是否全过阈值；其余类型可 NULL
+    is_golden    BOOLEAN NOT NULL DEFAULT false,
+                 -- 是否 Golden 用例（区分「标准回归」与「真实任务」两条趋势线）
+    metadata     JSONB NOT NULL DEFAULT '{}',
+                 -- 附加信息：reason/reference 是否命中/competitors/dimensions/耗时等
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 【L4 工程】索引设计——支撑三类查询：
+--   (task_id, eval_type, created_at)  → 单任务某类评估的时间序列（版本 diff）
+--   (eval_type, is_golden, created_at) → 全局某类评估的趋势（Golden 回归线）
+CREATE INDEX IF NOT EXISTS idx_eval_results_task ON eval_results (task_id, eval_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_eval_results_trend ON eval_results (eval_type, is_golden, created_at);
+
+
+-- ============================================================
+-- 10.1 eval_metric_scores — 评估指标明细表（细粒度到单指标）
+-- ============================================================
+-- 【L4 工程】为什么指标要拆到明细表？
+--   overall_score 只能看「总分涨没涨」，但趋势分析需要知道「涨在哪」：
+--   faithfulness 涨了但 context_precision 跌了 → 生成变好但检索变差，
+--   总分持平是「两个方向抵消」的结果，只存总分就丢失了这个信号。
+--   拆到明细表后，可对单指标做趋势/回归/阈值判定。
+--
+-- 【L4 工程】dimension 列为什么可空？
+--   retrieval 评估是按维度打的（每个维度一个 context_precision），
+--   dimension 记录「这个分数属于哪个维度」；generation/judge 是任务级
+--   整体分数，dimension 为 NULL（或 'overall'）。
+CREATE TABLE IF NOT EXISTS eval_metric_scores (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    eval_id      UUID NOT NULL REFERENCES eval_results(id) ON DELETE CASCADE,
+    metric_name  VARCHAR(50) NOT NULL,     -- faithfulness / context_precision / recall_hit_rate / 完整性…
+    dimension    VARCHAR(50),              -- 所属维度（检索评估用），任务级指标为 NULL
+    score        FLOAT NOT NULL,           -- 0~1（RAGAS）或 0~100（Judge 五维）
+    weight       FLOAT,                    -- 该指标在总分中的权重（Judge 用，RAGAS 平均可 NULL）
+    threshold    FLOAT,                    -- 该指标的通过阈值（回归/门禁判定用）
+    passed       BOOLEAN,                  -- 该指标是否过阈值
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_metric_eval_id ON eval_metric_scores (eval_id);
+CREATE INDEX IF NOT EXISTS idx_eval_metric_name ON eval_metric_scores (metric_name);

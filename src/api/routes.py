@@ -431,6 +431,66 @@ def _make_task_dict(
     }
 
 
+async def _trigger_auto_eval(
+    task_id_str: str,
+    pool,
+) -> None:
+    """任务完成后自动隐式评估——fire-and-forget，不阻塞、用户无感。
+
+    【L4 工程】为什么评估要「自动隐式」，而不是让用户手动跑 CLI？
+    ------------------------------------------------------------
+    用户创建任务后，评估是「后台自动发生」的——任务 completed 后，
+    本函数在独立 asyncio task 里异步跑三类评估 + 落库到 eval_results。
+    用户全程无感，评估分数自动沉淀，之后去 Grafana 看趋势面板即可。
+
+    关键设计（让评估真正「无感」）：
+      1. fire-and-forget：用 asyncio.create_task 调度，不 await——
+         任务 completed 响应立即返回，评估在后台慢慢跑（几十秒）。
+      2. 隔离：评估异常被 try/except 吞掉，绝不影响已完成的报告交付。
+      3. 复用：直接吃 app.state.pool，走与 CLI 相同的 evaluate_task_full。
+    """
+    try:
+        from src.db.dao import TaskDAO
+        from src.evaluation.runner import evaluate_task_full
+
+        dao = TaskDAO(pool)
+        result = await evaluate_task_full(task_id_str, dao)
+
+        # 把评估分数推到 Prometheus（Grafana 面板数据源），
+        # 失败只告警不影响评估结果本身
+        try:
+            from src.observability.metrics import record_eval_scores
+
+            if result.get("generation") and result["generation"].get("ragas"):
+                record_eval_scores("generation", result["generation"]["ragas"])
+            if result.get("judge") and result["judge"].get("judge_scores"):
+                record_eval_scores("judge", result["judge"]["judge_scores"])
+            if result.get("retrieval"):
+                r = result["retrieval"]
+                ret_metrics = {}
+                if r.get("avg_context_precision") is not None:
+                    ret_metrics["context_precision"] = r["avg_context_precision"]
+                if r.get("recall_hit_rate") is not None:
+                    ret_metrics["recall_hit_rate"] = r["recall_hit_rate"]
+                if ret_metrics:
+                    record_eval_scores("retrieval", ret_metrics)
+        except Exception as metric_err:
+            logger.warning("评估指标上报 Prometheus 失败: %s", metric_err)
+
+        logger.info(
+            "自动评估完成 task_id=%s generation=%s retrieval=%s judge=%s",
+            task_id_str[:8],
+            "ok" if result.get("generation") else "skip",
+            "ok" if result.get("retrieval") else "skip",
+            "ok" if result.get("judge") else "skip",
+        )
+    except Exception as e:
+        # 评估是旁路，失败只告警，不影响任务已完成的交付
+        logger.warning(
+            "自动评估失败 task_id=%s: %s", task_id_str[:8], e, exc_info=True,
+        )
+
+
 async def _execute_task(
     task_id: UUID,
     task: dict,
@@ -451,6 +511,7 @@ async def _execute_task(
     3. 从 app.state 拿对应预编译图 → graph.ainvoke()
     4. 更新任务状态 → completed / failed
     5. 记录 Prometheus 指标
+    6. fire-and-forget 自动评估（后台隐式，用户无感）
     """
     pool = _get_pool(request)
     task_id_str = str(task_id)
@@ -582,6 +643,9 @@ async def _execute_task(
             "route": route_type,
             "elapsed_ms": int(elapsed * 1000),
         })
+
+        # ── 5. fire-and-forget 自动评估（用户无感，后台隐式沉淀评估结果）──
+        asyncio.create_task(_trigger_auto_eval(task_id_str, pool))
 
     except Exception as e:
         # ── 标记 failed ──

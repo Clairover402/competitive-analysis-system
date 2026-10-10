@@ -105,7 +105,7 @@ import time
 from typing import TYPE_CHECKING
 
 from src.db.connection import create_pool
-from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO
+from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO, RetrievalSnapshotDAO
 from src.mcp.tools_rag import embed_query, rerank
 from src.observability.token_usage import extract_usage, add_usage
 
@@ -127,16 +127,20 @@ _ANALYSIS_PROMPT = """你是一个竞品分析专家。基于给出的网页文�
 参考文本片段:
 %s
 
-请按 JSON 格式返回分析结果：
+请按 JSON 格式返回分析结果，每个竞品对应一个对象：
 {
-  "竞品名": "分析结论（必须附带 source_url），不确定信息标注[待验证]，数据缺失标注[数据不足]",
+  "竞品名": {
+    "conclusion": "分析结论（禁止在 conclusion 里写 source_url 或 URL 字样）",
+    "source_url": "该结论所依据的原文来源链接（即参考文本片段里 (来源: xxx) 的 xxx，原样复制，不要写 source_url 占位符）"
+  },
   ...
 }
 
 规则：
-- 每个结论必须引用原文的 source_url
-- 不确定的信息标注 [待验证]
-- 无法找到相关信息标注 [数据不足]
+- conclusion 里只写分析结论本身，不要把 URL 或 source_url 字样混进去
+- source_url 必须是对应结论依据的原文链接，原样来自参考文本片段里的 (来源: xxx)，若无来源填 ""
+- 不确定的信息在 conclusion 里标注 [待验证]
+- 无法找到相关信息时，该竞品的 conclusion 填 "[数据不足] 未找到相关信息"，source_url 填 ""
 - 禁止空话："功能强大"→"支持100人视频会议+文档实时协作"
 - 只输出 JSON，不要其他文字
 """
@@ -342,6 +346,29 @@ async def _retrieve_and_analyze_dimension(
         for i, (doc, src) in enumerate(zip(top_docs, top_sources)):
             sliced = _smart_slice(doc, max_chars=1500)
             chunks_text += f"[片段{i+1}] (来源: {src})\n{sliced}\n\n"
+
+        # ─── Step 5.5: 落检索快照（RAGAS 检索质量评估输入） ───
+        # 【L3/L4 核心考点】为什么在这里落快照，而不是事后从报告/证据反查？
+        #   context_precision 测「检索本身准不准」，对象必须是
+        #   精排后的原始 retrieved_contexts（top_docs），不能是 LLM 结论或
+        #   事后按 URL 反查的最长 chunk（会被 _smart_slice 丢弃信息 + 结论改写污染）。
+        #   因此这里把召回全集（recalled）和精排头部（reranked）原样落盘。
+        #   失败不阻断分析（快照是评估前置数据，不是报告组成部分）。
+        try:
+            snapshot_dao = RetrievalSnapshotDAO(chunk_dao._pool)
+            await snapshot_dao.insert_snapshot(
+                task_id=task_id,
+                dimension=dimension,
+                query=dimension,
+                recalled_urls=[r.get("source_url", "") for r in merged],
+                reranked_urls=top_sources,
+                reranked_texts=top_docs,
+            )
+        except Exception:
+            logger.exception(
+                "【Analyzer】检索快照落盘失败 task_id=%s dimension=%r",
+                task_id, dimension,
+            )
 
         prompt = _ANALYSIS_PROMPT % (dimension, competitors, chunks_text)
         resp = await llm.ainvoke(prompt)

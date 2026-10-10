@@ -13,11 +13,14 @@ src.db 是系统的"数据底座"——所有 Agent 通过 DAO 读写数据，
   MemorySummaryDAO  → memory_summaries (短期摘要记忆)
   AgentMemoryDAO    → agent_memories (长期记忆+时间衰减)
   AgentLogDAO       → agent_logs (审计)
+  RetrievalSnapshotDAO → retrieval_snapshot (检索快照)
+  EvalResultDAO    → eval_results + eval_metric_scores (评估结果)
 
 导出：
     连接池: create_pool / get_pool / close_pool
     DAO:    TaskDAO / ReportDAO / EvidenceDAO / ChunkEmbeddingDAO
             MemorySummaryDAO / AgentMemoryDAO / AgentLogDAO
+            UserDAO / RetrievalSnapshotDAO / EvalResultDAO
 """
 
 from src.db.connection import create_pool, get_pool, close_pool
@@ -30,6 +33,8 @@ from src.db.dao import (
     AgentMemoryDAO,
     AgentLogDAO,
     UserDAO,
+    RetrievalSnapshotDAO,
+    EvalResultDAO,
 )
 
 __all__ = [
@@ -44,4 +49,6 @@ __all__ = [
     "AgentMemoryDAO",
     "AgentLogDAO",
     "UserDAO",
+    "RetrievalSnapshotDAO",
+    "EvalResultDAO",
 ]
