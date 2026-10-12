@@ -204,7 +204,8 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embedding_hnsw
 --   后者经过 _smart_slice 丢弃与结论改写，检索质量信号已被稀释/污染。
 --
 --   因此本表在 analyzer 精排完成、喂 LLM 之前，把检索的中间结果原样落盘：
---     - recalled_urls  = 向量(TopK=30) ∪ 关键词(TopK=20) 去重后的召回全集
+--     - recalled_urls  = 向量(TopK=60) ∪ 关键词(TopK=30) 去重后的召回全集
+--       （2026-10-12 校正：与 analyzer.py 实际传参一致；此前注释写 30/20 是过期值）
 --     - reranked_urls/texts = Cross-encoder 精排后 TopK=15 的 url/text
 --   reranked_texts 才是 RAGAS context_precision 该吃的 retrieved_contexts。
 --   recalled_urls 则用于 recall_hit_rate（召回覆盖度）的域名对拍。

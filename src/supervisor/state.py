@@ -143,7 +143,7 @@ class SupervisorState(TypedDict):
     """采集结果: {竞品名: {chunk_ids: [str], pages: [{url, title, text}]}}。"""
 
     analysis_results: dict
-    """分析结果: {维度名: {竞品名: "分析结论"}}。"""
+    """分析结果: {维度名: {竞品名: {conclusion, source_url}}}。"""
 
     report_content: str
     """Markdown 格式报告文本。Writer 产出 → Quality 读取。"""

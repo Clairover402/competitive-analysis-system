@@ -792,7 +792,7 @@ def _make_node_observe(
                     }
 
             elif agent_name == "analyzer":
-                # result 格式: {维度名: {竞品名: "分析结论"}}
+                # result 格式: {维度名: {竞品名: {conclusion, source_url}}}
                 updates["analysis_results"] = result
                 dims = list(result.keys()) if result else []
                 logger.info("分析完成: %d 个维度", len(dims))

@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 from src.db.connection import create_pool
 from src.db.dao import ReportDAO, AgentLogDAO, EvidenceDAO, ChunkEmbeddingDAO
 from src.observability.token_usage import extract_usage
+from src.agents.analysis_shape import conclusion_text, has_missing_marker, is_placeholder
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -111,7 +112,7 @@ _QUALITY_PROMPT = """你是报告质量评审专家。对以下竞品分析报�
 overall_score 按权重计算：(完整性*0.3 + 准确性*0.3 + 可追溯性*0.2 + 可读性*0.1 + 客观性*0.1)
 
 【重要】数据缺失 vs 撰写缺陷的区分：
-  上面的"数据缺失清单"列出了 Analyze 阶段就已判定 [数据不足]/[待验证] 的 维度×竞品 单元格。
+  上面的"数据缺失清单"列出了 Analyze 阶段就已判定 [数据不足]/[待验证]/[分析失败] 的 维度×竞品 单元格。
   这些属于采集/检索层的缺口，不是 Writer 的撰写缺陷。
   对这类单元格：
     - 不扣"完整性"分（完整性只考核"已有数据是否覆盖、结构是否完整"）
@@ -140,16 +141,10 @@ _URL_RE = __import__("re").compile(
 )
 
 
-def _conclusion_text(val) -> str:
-    """从 analysis_results 单元格值中统一取出"结论文本"。
-
-    值有两种形态：结构化对象 {"conclusion": "...", "source_url": "..."} 或旧版自由文本。
-    用于 Quality 判断 [数据不足]/[待验证] 单元格时，忽略 source_url 字段，
-    避免把 URL 里的内容误判成结论的一部分。
-    """
-    if isinstance(val, dict):
-        return str(val.get("conclusion") or "")
-    return str(val or "")
+# 【2026-10-12 重构】原 `_conclusion_text` 已上移到 src/agents/analysis_shape.py。
+# 那份实现与 analyzer 的 per_dimension 判定是「同一件事的两份写法」，
+# 结果是 analyzer 那份漏改、has_data 恒为 True 而静默失真。
+# 现在口径唯一：所有取结论/判断位的地方都调 analyze_shape 的函数。
 
 
 def _extract_evidences(
@@ -192,7 +187,7 @@ def _extract_evidences(
             else:
                 # ── 形态 B：旧版自由文本（正则兜底） ──
                 text = str(val or "").strip()
-                if not text or text.startswith(("[数据不足]", "[待验证]", "[分析失败]")):
+                if not text or is_placeholder(text):
                     continue
                 urls = _URL_RE.findall(text)
                 if not urls:
@@ -200,7 +195,7 @@ def _extract_evidences(
                 url = urls[0]
                 claim = text.replace(url, " ")
 
-            if not claim or claim.startswith(("[数据不足]", "[待验证]", "[分析失败]")):
+            if not claim or is_placeholder(claim):
                 continue
 
             # 轻量清理：去掉 URL 位置残留的孤立标点/空括号/多余空白
@@ -237,10 +232,12 @@ async def quality_agent(
     这是 temperature 最恰当的用法——不是生成多样性文本，而是做判断。
 
     【2026-09-26 修复】数据缺失 vs 撰写缺陷区分
-    传入 analysis_results，把 Analyze 阶段就已 [数据不足]/[待验证] 的单元格
+    传入 analysis_results，把 Analyze 阶段就已 [数据不足]/[待验证]/[分析失败] 的单元格
     列为"数据缺失清单"注入 prompt，让 Quality 不因采集缺口扣 Writer 分、
     不生成"补数据"类 rewrite 建议 → 避免"Quality 要求 Writer 补一个 Writer
     手里没有的数据"的死循环（65→66.5→65.2 卡死就是此因）。
+    （2026-10-12：清单判定口径收敛到 analysis_shape.has_missing_marker，
+      并把 [分析失败] 也纳入——整维度分析失败同样不是 Writer 的锅。）
 
     Args:
         task: {
@@ -276,14 +273,16 @@ async def quality_agent(
         len(report),
     )
 
-    # ── 【2026-09-26】数据缺失清单：Analyze 阶段就 [数据不足]/[待验证] 的单元格 ──
+    # ── 【2026-09-26】数据缺失清单：Analyze 阶段就 [数据不足]/[待验证]/[分析失败] 的单元格 ──
     # 这些是采集/检索层缺口，不是 Writer 缺陷。注入 prompt 让 Quality 不为此扣分。
+    # 【2026-10-12】判定口径统一走 analysis_shape（此前这里用 `in`、analyzer 用 startswith，
+    #   两处各写一份 —— 正是这种"同一件事两份写法"导致 analyzer 那份漏改后静默失真）。
     missing_cells: list[str] = []
     for dim in dimensions:
         dim_data = analysis_results.get(dim, {})
         for comp in competitors:
-            text_val = _conclusion_text(dim_data.get(comp, ""))
-            if "[数据不足]" in text_val or "[待验证]" in text_val:
+            text_val = conclusion_text(dim_data.get(comp, ""))
+            if has_missing_marker(text_val):
                 missing_cells.append(f"{dim}×{comp}")
     if missing_cells:
         missing_block = (

@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING
 from src.db.connection import create_pool
 from src.db.dao import AgentLogDAO
 from src.observability.token_usage import extract_usage
+from src.agents.analysis_shape import conclusion_text
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -128,7 +129,7 @@ async def writer_agent(
     Args:
         task: {
             id, title, competitors: [str], dimensions: [str],
-            analysis_results: {dimension: {competitor: "结论"}},
+            analysis_results: {dimension: {competitor: {conclusion, source_url}}},
             rewrite_suggestions: [str] | None  ← Quality 的改写建议
         }
         mcp_server: MCP 工具服务器（仅获取 settings）
@@ -151,10 +152,12 @@ async def writer_agent(
     t0 = time.perf_counter()
 
     # ── ✏️ 输入日志 ──
+    # 【2026-10-12 修复】原来用 len(str(v))，v 已是 {conclusion, source_url} 时
+    # 统计的是 dict repr 的长度（含键名和 URL），不是结论正文长度 → 日志失真。
     analysis_snippet = {}
     for dim_name, comp_data in analysis_results.items():
         analysis_snippet[dim_name] = {
-            k: f"{len(str(v))}字符" for k, v in comp_data.items()
+            k: f"{len(conclusion_text(v))}字符" for k, v in comp_data.items()
         }
     logger.info(
         "【Writer】开始 task=%s 标题=%r 竞品=%s 维度=%s rewrite=%s 分析数据=%s",

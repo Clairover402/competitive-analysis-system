@@ -31,7 +31,7 @@ ChunkEmbeddingDAO 和 tools_rag 获取检索结果，再用 LLM 做维度分析�
   Step 1  Step 2      Step 3      Step 4      Step 5        Step 6
   ┌─────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌───────────┐ ┌──────────────┐
   │Query│→│向量检索│→│关键词检索│→│合并去重  │→│Cross-Enc   │→│LLM 生成分析  │
-  │嵌入 │ │TopK=30 │ │TopK=20  │ │(URL去重)│ │Reranker   ││(逐维度独立)  │
+  │嵌入 │ │TopK=60 │ │TopK=30  │ │(URL去重)│ │Reranker   ││(逐维度独立)  │
   └─────┘ └────────┘ └─────────┘ └─────────┘ └───────────┘ └──────────────┘
    BGE-M3   pgvector    PostgreSQL   Python       BGE-        ChatDeepSeek
    bi-enc   HNSW索引    zhparser+   set()去重    reranker     temperature
@@ -244,7 +244,7 @@ async def _retrieve_and_analyze_dimension(
     llm: ChatDeepSeek,
     settings,  # 显式传递 settings，避免隐式依赖全局配置
     usage_acc: dict[str, int] | None = None,
-) -> dict[str, str]:
+) -> dict[str, dict[str, str]]:
     """单个维度的 RAG 检索 + LLM 分析（内部函数，不抛异常）。
 
     【L5 决策】为什么用 dimension 字符串而不是向量？
@@ -258,8 +258,8 @@ async def _retrieve_and_analyze_dimension(
     analyzer_agent 的上层会检查 "error" key 并生成 [数据不足] 标记。
 
     Returns:
-        成功: {竞品名: "分析结论", ...}
-        失败: {"error": "失败原因"}
+        成功: {竞品名: {"conclusion": "分析结论", "source_url": "原文链接"}, ...}
+        失败: {"error": "失败原因"}   ← 整个维度失败，由上层展开成逐竞品的占位标记
     """
     try:
         # ─── Step 1: 维度文本嵌入 ───
@@ -273,8 +273,9 @@ async def _retrieve_and_analyze_dimension(
         # ─── Step 2: 向量检索（语义召回） ───
         # 【L3 原理】pgvector HNSW 索引在 1024 维空间做近似最近邻搜索。
         # 使用 <=> 算符（余弦距离），距离越小 = 语义越接近。
-        # 【竞品过滤决策】top_k 提到 60：因为要覆盖 N 个竞品的配额，
-        # 一次性召回全量，再在内存按 competitor 分组。
+        # 【竞品配额决策，2026-10-12 修正注释】top_k 提到 60：两条检索 SQL 都
+        # 只按 task_id 过滤（WHERE 里没有 competitor 谓词），召回的是全竞品混池，
+        # 所以配额要按「所有竞品加起来」给足，再在内存按 competitor 分组。
         vec_results = await chunk_dao.similarity_search(task_id, query_vec, top_k=60)
 
         # ─── Step 3: 关键词检索（字面召回） ───
@@ -296,12 +297,17 @@ async def _retrieve_and_analyze_dimension(
         if not merged:
             return {c: "[数据不足] 未检索到相关网页内容" for c in competitors}
 
-        # ─── Step 4.5: 按竞品分组（维度检索 + 竞品过滤的核心） ───
-        # 【L3 面试核心考点】为什么「维度检索 + 竞品过滤」而不是「竞品×维度检索」？
-        #   竞品×维度 = N×M 次向量检索（贵操作，不可接受）。
-        #   维度检索 + 竞品过滤 = M 次向量检索 + N 次内存分组（免费），复杂度 N+M。
+        # ─── Step 4.5: 按竞品分组（维度检索 + 竞品分组） ───
+        # 【L3 面试核心考点】为什么「维度检索 + 内存分组」而不是「竞品×维度检索」？
+        #   竞品×维度 = N×M 次 embedding + N×M 次 SQL 检索（贵操作，不可接受）。
+        #   维度检索 + 内存分组 = M 个维度 × (1 向量 + 1 关键词) = 2M 次 SQL + 纯内存分组。
         #   竞品名是专有名词，拼进 embed_query 对向量方向贡献极小，
-        #   正确做法是召回后用 competitor 字段（标量）做过滤/分组。
+        #   且分组是纯 CPU 的 dict 操作（免费），所以「贵调用只做 M 次、免费操作随便做」。
+        # 【2026-10-12 复核事实】两条检索 SQL 的 WHERE 只有 task_id，
+        #   competitor 只是被 SELECT 出来的一个列，**从未进入 WHERE**；
+        #   所以 SQL 侧是零过滤的，真正的归属判定全在这里的内存分组。
+        #   schema 里声明的 idx_chunk_task_competitor(task_id, competitor) 因此
+        #   当前没有任何查询命中（死索引）—— 只有改成 SQL 下推过滤时才有价值。
         by_competitor: dict[str, list[dict]] = {}
         for r in merged:
             comp = r.get("competitor")
@@ -549,29 +555,35 @@ async def analyzer_agent(
     #      → "[分析失败] {异常信息}"  ← 把异常信息暴露给报告，方便定位
     #   2. 内部标记错误（result["error"]）
     #      → "[分析失败] {错误原因}"  ← 如 embed_query 失败
-    #   3. 正常返回（dict[str, str]）
+    #   3. 正常返回（{竞品: {conclusion, source_url}}）
     #      → 直接使用
-    analysis_results: dict[str, dict[str, str]] = {}
+    # 【2026-10-12 加固】三条失败分支也产出与成功分支**完全一致的单元格形态**
+    #   （{conclusion, source_url}）。此前失败分支写成裸字符串，导致
+    #   analysis_results 里同时存在 str 和 dict 两种单元格 →
+    #   消费方必须处处 isinstance 兼容，漏一处就静默失真
+    #   （analyzer 的 per_dimension.has_data 就是这么恒为 True 的）。
+    def _fail_cell(reason: str) -> dict[str, str]:
+        return {"conclusion": f"[分析失败] {reason}", "source_url": ""}
+
+    analysis_results: dict[str, dict] = {}
     for dim, result in zip(dimensions, results_list):
         if isinstance(result, Exception):
             logger.exception("Dimension %r raised exception", dim)
-            analysis_results[dim] = {c: f"[分析失败] {result}" for c in competitors}
+            analysis_results[dim] = {c: _fail_cell(str(result)) for c in competitors}
         elif isinstance(result, dict) and "error" in result:
-            analysis_results[dim] = {c: f"[分析失败] {result['error']}" for c in competitors}
+            analysis_results[dim] = {c: _fail_cell(str(result["error"])) for c in competitors}
         elif isinstance(result, dict):
             analysis_results[dim] = result
         else:
-            analysis_results[dim] = {c: "[分析失败] 未知错误" for c in competitors}
+            analysis_results[dim] = {c: _fail_cell("未知错误") for c in competitors}
 
     duration_ms = (time.perf_counter() - t0) * 1000
     # ── 构建 per-dimension 详情（与控制台日志对齐）──
-    per_dimension = {}
-    for dim_name, comp_analyses in analysis_results.items():
-        analyzed_comps = [c for c, text in comp_analyses.items() if not str(text).startswith("[分析失败]") and not str(text).startswith("[数据不足]")]
-        per_dimension[dim_name] = {
-            "competitors_analyzed": len(analyzed_comps),
-            "has_data": len(analyzed_comps) > 0,
-        }
+    # 【2026-10-12 修复】原实现直接 `str(text).startswith("[分析失败]")`，
+    #   而 text 此时已是 dict，str(dict) 以 "{'conclusion'" 开头 → 两个 startswith
+    #   恒 False → 过滤条件恒 True → analyzed_comps 恒等于全部竞品 → has_data 恒 True。
+    #   现统一走 analyze_shape.summarize_per_dimension（口径唯一，且有单测）。
+    per_dimension = summarize_per_dimension(analysis_results)
     await log_dao.log(
         task_id=task_id,
         agent_name="analyzer",
@@ -590,10 +602,11 @@ async def analyzer_agent(
     output_lines = []
     for dim_name, comp_analyses in analysis_results.items():
         snippet = {}
-        for c, text in comp_analyses.items():
-            # LLM 返回的值可能是字符串、dict 或非字符串
-            # 统一转为 str 再截取，避免切片 dict 引发的 KeyError
-            text_str = str(text)
+        for c, val in comp_analyses.items():
+            # 【2026-10-12 修复】走 conclusion_text 取正文再统计，
+            # 此前直接 str(val)，打印的是 dict repr（含键名/source_url），
+            # 长度和"前30字"都不是结论本身，日志完全失真。
+            text_str = conclusion_text(val)
             snippet[c] = f"{len(text_str)}字符 / 前30字: {text_str[:30]}..."
         output_lines.append(f"  {dim_name}: {snippet}")
     logger.info(

@@ -173,17 +173,27 @@ class AgentState(TypedDict):
     # ══════════════════════════════════════════════════════════════════════
 
     analysis_results: dict
-    """分析结果，格式: {维度名: {竞品名: "分析结论（含 source_url）"}}。
+    """分析结果，格式: {维度名: {竞品名: {"conclusion": 结论正文, "source_url": 原文链接}}}。
+
+    单元格统一是 {"conclusion", "source_url"} 两个字段（2026-10-12 起三条失败分支
+    也产出同一形态，不再混入裸字符串）。取值请一律走 src.agents.analysis_shape，
+    不要在调用点自己 isinstance / str(...).startswith(...)。
 
     示例:
       {
         "定价策略": {
-          "飞书": "企业版¥200/人/月，2025Q1降至¥180（来源: feishu.cn/pricing）",
-          "钉钉": "专业版¥180/人/年（来源: dingtalk.com/price）"
+          "飞书": {
+            "conclusion": "企业版¥200/人/月，2025Q1降至¥180",
+            "source_url": "https://www.feishu.cn/pricing"
+          },
+          "钉钉": {
+            "conclusion": "专业版¥180/人/年",
+            "source_url": "https://www.dingtalk.com/price"
+          }
         }
       }
 
-    Analyzer 写入 → Writer 消费 → 拼入报告。
+    Analyzer 写入 → Writer 拼入报告 prompt / Quality 抽证据落 evidence_map。
     """
     
     retrieved_memories: list[dict]
