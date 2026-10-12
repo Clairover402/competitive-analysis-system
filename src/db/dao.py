@@ -390,18 +390,23 @@ class RetrievalSnapshotDAO:
         recalled_urls: list[str],
         reranked_urls: list[str],
         reranked_texts: list[str],
+        competitor: str | None = None,
     ) -> None:
-        """落一条检索快照（单个维度的检索中间结果）。"""
+        """落一条检索快照（竞品×维度粒度的检索中间结果）。
+
+        :param competitor: 该快照所属竞品名；None 表示旧「维度级」快照（历史兼容）。
+        """
         import json
 
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO retrieval_snapshot
-                   (task_id, dimension, query, recalled_urls,
+                   (task_id, dimension, competitor, query, recalled_urls,
                     reranked_urls, reranked_texts)
-                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
                 task_id,
                 dimension,
+                competitor,
                 query,
                 json.dumps(recalled_urls, ensure_ascii=False),
                 json.dumps(reranked_urls, ensure_ascii=False),
@@ -475,14 +480,15 @@ class ChunkEmbeddingDAO:
             await conn.executemany(
                 """INSERT INTO chunk_embeddings (task_id, chunk_text,
                                                  chunk_index, source_url,
-                                                 embedding)
-                   VALUES ($1, $2, $3, $4, $5::vector)""",
+                                                 competitor, embedding)
+                   VALUES ($1, $2, $3, $4, $5, $6::vector)""",
                 [
                     (
                         task_id,
                         _sanitize_text(c["chunk_text"]),
                         c["chunk_index"],
                         _sanitize_text(c["source_url"]),
+                        _sanitize_text(c.get("competitor")),
                         _vector_str(c["embedding"]),
                     )
                     for c in chunks
@@ -519,7 +525,7 @@ class ChunkEmbeddingDAO:
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT id, task_id, chunk_text, chunk_index, source_url,
+                """SELECT id, task_id, competitor, chunk_text, chunk_index, source_url,
                           embedding <=> $2::vector AS distance,
                           created_at
                    FROM chunk_embeddings
@@ -581,7 +587,7 @@ class ChunkEmbeddingDAO:
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT id, task_id, chunk_text, chunk_index, source_url,
+                """SELECT id, task_id, competitor, chunk_text, chunk_index, source_url,
                           created_at
                    FROM chunk_embeddings
                    WHERE task_id = $1

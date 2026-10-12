@@ -178,6 +178,7 @@ CREATE INDEX IF NOT EXISTS idx_evidence_dimension ON evidence_map (dimension);
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id     UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    competitor  TEXT,                       -- 该 chunk 所属竞品名（NULL=历史数据/未知归属）
     chunk_text  TEXT NOT NULL,              -- 文档分块原文（用于检索后展示）
     chunk_index INT NOT NULL,               -- 分块序号（保持原文顺序）
     source_url  TEXT NOT NULL,              -- 来源 URL（可追溯）
@@ -186,6 +187,8 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunk_task_id ON chunk_embeddings (task_id);
+-- 竞品过滤用复合索引：维度检索（HNSW）召回后按 competitor 做标量过滤/分组
+CREATE INDEX IF NOT EXISTS idx_chunk_task_competitor ON chunk_embeddings (task_id, competitor);
 -- vector_cosine_ops 指定余弦距离运算——配合 <=> 操作符使用
 CREATE INDEX IF NOT EXISTS idx_chunk_embedding_hnsw
     ON chunk_embeddings USING hnsw (embedding vector_cosine_ops);
@@ -213,7 +216,8 @@ CREATE TABLE IF NOT EXISTS retrieval_snapshot (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     dimension       VARCHAR(50) NOT NULL,     -- 所属维度（功能/定价/市场…）
-    query           TEXT NOT NULL,            -- 检索 query（通常=维度名）
+    competitor      TEXT,                     -- 所属竞品名（竞品×维度粒度快照；NULL=旧维度级数据）
+    query           TEXT NOT NULL,            -- 检索 query（精排 query = "竞品 维度"）
     recalled_urls   JSONB NOT NULL DEFAULT '[]',  -- 召回全集 URL（向量∪关键词去重后）
     reranked_urls   JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 URL（保持排序）
     reranked_texts  JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 chunk 原文（与 url 对齐）
@@ -222,6 +226,10 @@ CREATE TABLE IF NOT EXISTS retrieval_snapshot (
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_snapshot_task_dim
     ON retrieval_snapshot (task_id, dimension);
+
+-- 竞品×维度粒度快照：评估按「竞品+维度」逐条打分，需按 (task_id, dimension, competitor) 定位
+CREATE INDEX IF NOT EXISTS idx_retrieval_snapshot_task_comp
+    ON retrieval_snapshot (task_id, dimension, competitor);
 
 
 -- ============================================================
@@ -394,7 +402,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_writes (
 --   明细表存「每个指标一行」，指标集随评估类型弹性扩展，无需 DDL。
 --
 -- 【L4 工程】eval_type 三值语义：
---   generation = evaluate_task_with_ragas（成稿后，faithfulness/answer_relevancy/context_precision）
+--   generation = evaluate_task_with_ragas（成稿后，faithfulness/answer_relevancy）
 --   retrieval  = evaluate_retrieval（检索阶段，context_precision/recall_hit_rate）
 --   judge      = evaluate_with_judge（五维报告质量）
 CREATE TABLE IF NOT EXISTS eval_results (

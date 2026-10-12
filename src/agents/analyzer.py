@@ -108,6 +108,10 @@ from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO, RetrievalSnapshotDAO
 from src.mcp.tools_rag import embed_query, rerank
 from src.observability.token_usage import extract_usage, add_usage
+from src.agents.analysis_shape import (
+    conclusion_text,
+    summarize_per_dimension,
+)
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -119,28 +123,25 @@ logger = logging.getLogger(__name__)
 # Prompt 设计
 # ═════════════════════════════════════════════════════════════════════════════
 
-_ANALYSIS_PROMPT = """你是一个竞品分析专家。基于给出的网页文本片段，按指定维度分析各竞品。
+_ANALYSIS_PROMPT = """你是一个竞品分析专家。基于给出的网页文本片段，按指定维度分析【单个竞品】。
 
 当前分析维度: %s
-竞品列表: %s
+目标竞品: %s
 
-参考文本片段:
+参考文本片段（这些片段已按竞品过滤，都属于目标竞品）:
 %s
 
-请按 JSON 格式返回分析结果，每个竞品对应一个对象：
+请按 JSON 格式返回分析结果，只分析这一个竞品：
 {
-  "竞品名": {
-    "conclusion": "分析结论（禁止在 conclusion 里写 source_url 或 URL 字样）",
-    "source_url": "该结论所依据的原文来源链接（即参考文本片段里 (来源: xxx) 的 xxx，原样复制，不要写 source_url 占位符）"
-  },
-  ...
+  "conclusion": "分析结论（禁止在 conclusion 里写 source_url 或 URL 字样）",
+  "source_url": "该结论所依据的原文来源链接（即参考文本片段里 (来源: xxx) 的 xxx，原样复制，不要写 source_url 占位符）"
 }
 
 规则：
 - conclusion 里只写分析结论本身，不要把 URL 或 source_url 字样混进去
 - source_url 必须是对应结论依据的原文链接，原样来自参考文本片段里的 (来源: xxx)，若无来源填 ""
 - 不确定的信息在 conclusion 里标注 [待验证]
-- 无法找到相关信息时，该竞品的 conclusion 填 "[数据不足] 未找到相关信息"，source_url 填 ""
+- 无法找到相关信息时，conclusion 填 "[数据不足] 未找到相关信息"，source_url 填 ""
 - 禁止空话："功能强大"→"支持100人视频会议+文档实时协作"
 - 只输出 JSON，不要其他文字
 """
@@ -272,25 +273,18 @@ async def _retrieve_and_analyze_dimension(
         # ─── Step 2: 向量检索（语义召回） ───
         # 【L3 原理】pgvector HNSW 索引在 1024 维空间做近似最近邻搜索。
         # 使用 <=> 算符（余弦距离），距离越小 = 语义越接近。
-        # TopK=30：不是越多越好。30~50 是粗排的实践最优区间。
-        #   <20：可能漏掉相关 chunk
-        #   >50：Cross-encoder 精排成本太高
-        vec_results = await chunk_dao.similarity_search(task_id, query_vec, top_k=30)
+        # 【竞品过滤决策】top_k 提到 60：因为要覆盖 N 个竞品的配额，
+        # 一次性召回全量，再在内存按 competitor 分组。
+        vec_results = await chunk_dao.similarity_search(task_id, query_vec, top_k=60)
 
         # ─── Step 3: 关键词检索（字面召回） ───
         # 【L3 原理】zhparser 中文分词 + pg_bigm 2-gram 索引，
         # 能精确匹配到包含"¥180"、"SaaS订阅"等具体数字/术语的 chunk。
-        # 这些词通常不会被向量检索召回（它们在语义空间中特征不明显）。
-        # TopK=20：字面匹配的召回范围比语义窄，20 足够。
-        kw_results = await chunk_dao.keyword_search(task_id, dimension, top_k=20)
+        kw_results = await chunk_dao.keyword_search(task_id, dimension, top_k=30)
 
         # ─── Step 4: 合并去重 ───
         # 【L4 工程】为什么用 URL 而不是 chunk 文本去重？
-        #   同一页面可能产生多个 chunk（如 5 个 chunk 都来自
-        #   https://feishu.cn/pricing），如果只按文本去重，
-        #   会得到 5 个相似的 chunk（浪费 LLM token）。
-        #   按 URL 去重 → 每个页面最多保留一个 chunk 进入精排。
-        #   同时保留向量和关键词两个来源的覆盖（取并集）。
+        #   同一页面可能产生多个 chunk，按 URL 去重 → 每页面最多保留一个 chunk。
         seen: set[str] = set()
         merged: list[dict] = []
         for r in vec_results + kw_results:
@@ -302,105 +296,124 @@ async def _retrieve_and_analyze_dimension(
         if not merged:
             return {c: "[数据不足] 未检索到相关网页内容" for c in competitors}
 
-        # ─── Step 5: Cross-encoder 精排 ───
-        # 【L3 核心考点】重排（Reranking）做的是什么？
-        #
-        # Bi-encoder 粗排：cos(query_vec, doc_vec)
-        #   → 只比较两个独立向量的夹角，无法捕捉 query-doc 之间的细粒度交互
-        #
-        # Cross-encoder 精排：把 [query, doc] 拼成一对输入模型
-        #   → Self-attention 让 query 的每个 token 看到 doc 的每个 token
-        #   → 能捕捉"虽然都有'定价'，但这个 doc 讲的是竞品定价，那个讲的是内部定价策略"
-        #   → 排序质量明显优于余弦相似度
-        #
-        # 【L4 工程】top_k=15：精排在 30~50 个候选里选出最相关的 15 个。
-        # LLM 分析 15 个 chunk 是性价比最优的输入量。
-        documents = [r["chunk_text"] for r in merged]
-        ranked = await rerank(dimension, documents, top_k=15, settings=settings)
-
-        # 取最终检索文本（保留排序信息）
-        if ranked:
-            top_docs = [
-                merged[r["index"]].get("chunk_text", "")
-                for r in ranked if r["index"] < len(merged)
-            ]
-            top_sources = [
-                merged[r["index"]].get("source_url", "")
-                for r in ranked if r["index"] < len(merged)
-            ]
-        else:
-            # 重排失败 → 退回到原始合并结果
-            top_docs = documents[:15]
-            top_sources = [r["source_url"] for r in merged[:15]]
-
-        # ─── Step 6: LLM 分析 ───
-        # 【L4 工程】智能截取：跳过页面导航栏/页眉垃圾，只取正文
-        # 问题：web_fetch 提取的文本前 200 字符通常是导航栏
-        #   ("首页 搜索 登录 注册 我的 购物车 联系我们")，
-        #   直接 doc[:1500] 会把这段垃圾喂给 LLM → 判无有效信息 → [数据不足]。
-        # 修复：跳过前导短行（<50字符的导航栏文本），从第一个真正段落开始截取。
-        # 15 chunks × 1500 chars = 22500 chars ≈ 8000~12000 tokens
-        # + prompt ≈ 500 tokens → 总共 ~12K tokens
-        # 在 DeepSeek 128K 窗口内完全安全
-        chunks_text = ""
-        for i, (doc, src) in enumerate(zip(top_docs, top_sources)):
-            sliced = _smart_slice(doc, max_chars=1500)
-            chunks_text += f"[片段{i+1}] (来源: {src})\n{sliced}\n\n"
-
-        # ─── Step 5.5: 落检索快照（RAGAS 检索质量评估输入） ───
-        # 【L3/L4 核心考点】为什么在这里落快照，而不是事后从报告/证据反查？
-        #   context_precision 测「检索本身准不准」，对象必须是
-        #   精排后的原始 retrieved_contexts（top_docs），不能是 LLM 结论或
-        #   事后按 URL 反查的最长 chunk（会被 _smart_slice 丢弃信息 + 结论改写污染）。
-        #   因此这里把召回全集（recalled）和精排头部（reranked）原样落盘。
-        #   失败不阻断分析（快照是评估前置数据，不是报告组成部分）。
-        try:
-            snapshot_dao = RetrievalSnapshotDAO(chunk_dao._pool)
-            await snapshot_dao.insert_snapshot(
-                task_id=task_id,
-                dimension=dimension,
-                query=dimension,
-                recalled_urls=[r.get("source_url", "") for r in merged],
-                reranked_urls=top_sources,
-                reranked_texts=top_docs,
-            )
-        except Exception:
-            logger.exception(
-                "【Analyzer】检索快照落盘失败 task_id=%s dimension=%r",
-                task_id, dimension,
-            )
-
-        prompt = _ANALYSIS_PROMPT % (dimension, competitors, chunks_text)
-        resp = await llm.ainvoke(prompt)
-        # 【2026-10-01 可观测性】累计 token 用量到维度级累加器
-        if usage_acc is not None:
-            add_usage(usage_acc, extract_usage(resp))
-        text = resp.content.strip()
-
-        # 【L4 工程】LLM 输出防御：模型不一定遵守"只输出 JSON"
-        # 有时会包裹 ```json ... ```，预清理防 JSON parse 失败
-        if text.startswith("```"):
-            parts = text.split("```", 2)
-            if len(parts) >= 3:
-                text = parts[2].strip()
+        # ─── Step 4.5: 按竞品分组（维度检索 + 竞品过滤的核心） ───
+        # 【L3 面试核心考点】为什么「维度检索 + 竞品过滤」而不是「竞品×维度检索」？
+        #   竞品×维度 = N×M 次向量检索（贵操作，不可接受）。
+        #   维度检索 + 竞品过滤 = M 次向量检索 + N 次内存分组（免费），复杂度 N+M。
+        #   竞品名是专有名词，拼进 embed_query 对向量方向贡献极小，
+        #   正确做法是召回后用 competitor 字段（标量）做过滤/分组。
+        by_competitor: dict[str, list[dict]] = {}
+        for r in merged:
+            comp = r.get("competitor")
+            # competitor 为 None（历史数据/未知归属）→ 归入一个共享兜底组，
+            # 该组的 chunk 会分发给所有竞品分析（保守策略，保证不丢信息）。
+            if comp:
+                by_competitor.setdefault(comp, []).append(r)
             else:
-                text = parts[1].strip()
+                by_competitor.setdefault("__unattributed__", []).append(r)
+        unattributed = by_competitor.pop("__unattributed__", [])
 
-        if not text:
-            logger.error("【Analyzer】LLM 返回空响应 dimension=%r", dimension)
-            return {c: "[分析失败] LLM返回空响应" for c in competitors}
+        # ─── Step 5: 逐竞品精排 + 分析 ───
+        # 每个竞品在其专属 chunk 子集内做 Cross-encoder 精排，再单独喂 LLM。
+        final_result: dict[str, dict] = {}
+        snapshot_dao = RetrievalSnapshotDAO(chunk_dao._pool)
 
-        # 如果没以 { 开头，尝试提取 JSON 片段
-        if not text.startswith("{"):
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                text = text[start:end + 1]
+        for competitor in competitors:
+            # 该竞品专属 chunk + 无归属兜底 chunk（合并，保证兜底信息不丢）
+            group = by_competitor.get(competitor, []) + unattributed
+            if not group:
+                final_result[competitor] = {
+                    "conclusion": "[数据不足] 未找到相关信息",
+                    "source_url": "",
+                }
+                continue
 
-        result = json.loads(text)
-        if not isinstance(result, dict):
-            return {c: "[分析失败] LLM返回格式异常" for c in competitors}
-        return result
+            # Cross-encoder 精排：query 拼竞品名，让 reranker 区分「苹果是水果还是公司」
+            group_docs = [r["chunk_text"] for r in group]
+            ranked = await rerank(
+                f"{competitor} {dimension}", group_docs, top_k=15, settings=settings
+            )
+            if ranked:
+                top_docs = [
+                    group[r["index"]].get("chunk_text", "")
+                    for r in ranked if r["index"] < len(group)
+                ]
+                top_sources = [
+                    group[r["index"]].get("source_url", "")
+                    for r in ranked if r["index"] < len(group)
+                ]
+            else:
+                top_docs = group_docs[:15]
+                top_sources = [r["source_url"] for r in group[:15]]
+
+            # ─── Step 5.5: 落竞品×维度级检索快照（RAGAS 检索质量评估输入） ───
+            # 每条快照 = 一个竞品在一个维度下的精排头部，query="竞品 维度"，
+            # 使评估阶段的 user_input（=query）与线上精排 rerank("竞品 维度") 的尺子完全对齐。
+            try:
+                await snapshot_dao.insert_snapshot(
+                    task_id=task_id,
+                    dimension=dimension,
+                    competitor=competitor,
+                    query=f"{competitor} {dimension}",
+                    recalled_urls=[r.get("source_url", "") for r in merged],
+                    reranked_urls=top_sources,
+                    reranked_texts=top_docs,
+                )
+            except Exception:
+                logger.exception(
+                    "【Analyzer】检索快照落盘失败 task_id=%s dimension=%r competitor=%r",
+                    task_id, dimension, competitor,
+                )
+
+            # 智能截取 + 组装该竞品的分析上下文
+            chunks_text = ""
+            for i, (doc, src) in enumerate(zip(top_docs, top_sources)):
+                sliced = _smart_slice(doc, max_chars=1500)
+                chunks_text += f"[片段{i+1}] (来源: {src})\n{sliced}\n\n"
+
+            # 单竞品 LLM 分析
+            prompt = _ANALYSIS_PROMPT % (dimension, competitor, chunks_text)
+            resp = await llm.ainvoke(prompt)
+            if usage_acc is not None:
+                add_usage(usage_acc, extract_usage(resp))
+            text = resp.content.strip()
+
+            # LLM 输出防御：剥离 ```json 包裹 / 提取 JSON 片段
+            if text.startswith("```"):
+                parts = text.split("```", 2)
+                text = parts[2].strip() if len(parts) >= 3 else parts[1].strip()
+            if not text:
+                final_result[competitor] = {
+                    "conclusion": "[分析失败] LLM返回空响应",
+                    "source_url": "",
+                }
+                continue
+            if not text.startswith("{"):
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    text = text[start:end + 1]
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                final_result[competitor] = {
+                    "conclusion": "[分析失败] LLM返回格式异常",
+                    "source_url": "",
+                }
+                continue
+
+            if isinstance(parsed, dict) and "conclusion" in parsed:
+                final_result[competitor] = {
+                    "conclusion": str(parsed.get("conclusion", "")),
+                    "source_url": str(parsed.get("source_url", "")),
+                }
+            else:
+                final_result[competitor] = {
+                    "conclusion": "[分析失败] LLM返回格式异常",
+                    "source_url": "",
+                }
+
+        return final_result
 
     except Exception as e:
         # 【L4 工程】全面捕获，返回错误标记而不是抛异常

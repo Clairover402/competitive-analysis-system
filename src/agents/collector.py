@@ -718,6 +718,7 @@ async def collector_agent(
                 "chunk_text": chunk_text,
                 "chunk_index": idx,
                 "source_url": text_meta[meta_idx]["url"],
+                "competitor": text_meta[meta_idx]["competitor"],
                 "embedding": embedding,
             })
 
