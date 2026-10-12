@@ -26,3 +26,6 @@ frontend/node_modules/
 frontend/dist/
 frontend/_vite_err.txt
 frontend/_vite_out.txt
+
+# 项目工作区数据（记忆/Agent 笔记，不入代码库）
+.workbuddy/
