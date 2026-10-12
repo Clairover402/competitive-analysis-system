@@ -77,6 +77,33 @@ from langchain_core.runnables import RunnableConfig
 logger = logging.getLogger(__name__)
 
 
+def _strip_nul(value: Any) -> Any:
+    """递归删除任意嵌套结构中的 NUL（\\x00）字节。
+
+    【L4 工程】为什么 checkpoint 序列化前必须清洗 NUL？
+    ------------------------------------------------------------
+    PostgreSQL 的 text / jsonb 对任何编码（含 UTF-8）都拒绝 NUL 字节
+    （0x00），因为它是 C 字符串终止符。asyncpg 写入含 \\x00 的字符串会抛
+    UntranslatableCharacterError（"不支持的 Unicode 转义序列 \\u0000"）。
+
+    checkpoint 的 value 是 AgentState 的任意嵌套结构（dict/list/str），
+    其中可能包含 Collector 抓取网页正文时偶发的 \\x00（二进制残留/编码损坏），
+    经 collector/analyzer/writer 写入状态后，随 aput/aput_writes 落库时炸掉。
+
+    仅删 \\x00，不动其他合法 UTF-8 字符，不影响正常内容。
+    返回清洗后的深拷贝（新对象），避免原地修改 LangGraph 的状态引用。
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(v) for v in value)
+    return value
+
+
 class PostgresSaver(BaseCheckpointSaver):
     """PostgreSQL Checkpoint 存储 — 最小可行实现。
 
@@ -370,8 +397,8 @@ class PostgresSaver(BaseCheckpointSaver):
                 checkpoint_id,
                 parent_checkpoint_id,
                 "checkpoint",                #  type: #固定值标识这是 checkpoint 记录
-                json.dumps(checkpoint, default=str),  # JSONB 列需要 json.dumps
-                json.dumps(metadata, default=str),
+                json.dumps(_strip_nul(checkpoint), default=str),  # JSONB 列需要 json.dumps
+                json.dumps(_strip_nul(metadata), default=str),
             )
 
         return {
@@ -447,7 +474,7 @@ class PostgresSaver(BaseCheckpointSaver):
                     idx,
                     channel,
                     type(value).__name__ if value is not None else None,
-                    json.dumps(value, default=str) if value is not None else None,
+                    json.dumps(_strip_nul(value), default=str) if value is not None else None,
                 )
 
     # ══════════════════════════════════════════════════════════════════════

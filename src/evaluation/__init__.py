@@ -10,10 +10,10 @@
 from src.evaluation.golden_dataset import (  # noqa: F401
     GOLDEN_DATASET,
     GoldenCase,
-    assert_keywords,
     get_by_difficulty,
     get_pipeline_cases,
     get_reference,
+    get_reference_by_dimension,
     get_reference_domains,
     get_supervisor_cases,
 )

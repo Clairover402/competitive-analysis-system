@@ -263,7 +263,9 @@ class TestGoldenDataset:
             assert "competitors" in case
             assert "dimensions" in case
             assert "difficulty" in case
-            assert "expected" in case
+            assert "reference" in case
+            assert "reference_by_dimension" in case
+            assert "reference_domains" in case
             assert case["difficulty"] in ("easy", "medium", "hard")
 
     def test_difficulty_distribution(self):
@@ -291,24 +293,6 @@ class TestGoldenDataset:
         # Supervisor 用例 competitors 必须为空
         for case in supervisor:
             assert len(case["competitors"]) == 0
-
-    def test_assert_keywords_match(self):
-        """关键词断言函数：全部命中。"""
-        from src.evaluation.golden_dataset import assert_keywords
-
-        report = "飞书和钉钉在功能和定价方面有明显差异"
-        result = assert_keywords(report, ["飞书", "钉钉", "定价", "功能"])
-        assert result["rate"] == 1.0
-        assert result["missed"] == []
-
-    def test_assert_keywords_partial(self):
-        """关键词断言函数：部分命中。"""
-        from src.evaluation.golden_dataset import assert_keywords
-
-        report = "飞书在功能方面表现不错"
-        result = assert_keywords(report, ["飞书", "钉钉", "定价", "功能"])
-        assert result["rate"] == 0.5
-        assert len(result["missed"]) == 2
 
 
 # ═════════════════════════════════════════════════════════════════════════════

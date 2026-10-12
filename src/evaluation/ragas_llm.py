@@ -57,7 +57,6 @@ if "langchain_community.chat_models.vertexai" not in sys.modules:
 from ragas import EvaluationDataset, SingleTurnSample  # noqa: E402
 from ragas.llms import LangchainLLMWrapper  # noqa: E402
 from ragas.metrics._answer_relevance import answer_relevancy  # noqa: E402
-from ragas.metrics._context_precision import context_precision  # noqa: E402
 from ragas.metrics._faithfulness import faithfulness  # noqa: E402
 
 from langchain_deepseek import ChatDeepSeek  # noqa: E402
@@ -162,23 +161,28 @@ async def evaluate_task_with_ragas(
     task_id: str,
     dao: "TaskDAO",
     settings=None,
-    reference: str | None = None,
+    is_golden: bool = False,
 ) -> dict | None:
-    """用真 ragas 库评估已完成任务的 RAG 质量。
+    """用真 ragas 库评估已完成任务的「生成质量」（成稿后）。
+
+    本函数只评「生成质量」两个无需标准答案的指标：
+    - faithfulness（忠实度）：回答是否来源检索上下文、有无幻觉
+    - answer_relevancy（回答相关性）：回答是否紧扣用户问题
+
+    context_precision（上下文精确率）是「检索质量」指标，已移交给
+    evaluate_retrieval（吃 retrieval_snapshot、按维度打分），本函数不再重复计算。
 
     Args:
         task_id: 要评估的任务 ID
         dao: TaskDAO 实例（用于读任务/报告/证据）
         settings: 可选 Settings，默认从环境构建
-        reference: 事实级标准答案（ground truth）。评估 Golden 用例时传入
-            `get_reference(case["task_id"])`，让 context_precision 有真实
-            比对基准；为 None 时回退用报告标题（此时 precision 会因
-            reference 太宽泛而偏低甚至为 0，属预期）。
+        is_golden: 是否为 Golden 用例。仅用于落库时打 is_golden 标记，
+            不影响指标集（生成质量指标无需标准答案）。
 
     Returns:
         {
             "task_id": str,
-            "ragas": {metric_name: score},   # 真 ragas 四维分数（0~1）
+            "ragas": {metric_name: score},   # faithfulness / answer_relevancy（0~1）
             "gate": "PASS|WARN|BLOCK|SKIP",
             "judge_model": str,
         }
@@ -234,24 +238,20 @@ async def evaluate_task_with_ragas(
     )
 
     # 5. 组装 SingleTurnSample + 跑 ragas
-    #    reference：优先用调用方传入的事实级标准答案（Golden），否则回退标题。
-    #    只有 Golden 提供事实级 reference 时，context_precision 才有意义。
-    ref = reference or task.get("title", "")
-
-    # RAGAS 里【单轮问答样本的数据容器】
-    # 用来封装一条 RAG 评估所需要的全部字段，给 RAGAS 指标函数读取打分
-    # SingleTurn = 单轮对话（一问一答，没有多轮历史；对比 MultiTurnSample 多轮对话样本）
+    #    RAGAS 里【单轮问答样本的数据容器】，封装一条 RAG 评估所需的全部字段，
+    #    给指标函数读取打分。SingleTurn = 单轮对话（对比 MultiTurnSample 多轮）。
+    #    注意：生成质量指标（faithfulness / answer_relevancy）无需 reference，
+    #    故这里不传 reference——context_precision 这类「检索质量」指标已由
+    #    evaluate_retrieval 在检索阶段单独评估，不在此重复。
     sample = SingleTurnSample(
         user_input=task.get("title", ""),  # 任务标题也就是用户输入
         response=response,       #response是最终生成的report
-        retrieved_contexts=contexts,  # 召回文本
-        reference=ref,
+        retrieved_contexts=contexts,  # 召回文本（证据 source_text/claim）
     )
 
     # 批量评估的容器，存放一堆 SingleTurnSample / MultiTurnSample，
     # 专门喂给 `evaluate()` 函数做批量打分。
-    # SingleTurnSample = 单条样本；
-    # EvaluationDataset = 样本的集合（测试集）
+    # SingleTurnSample = 单条样本；EvaluationDataset = 样本的集合（测试集）
     dataset = EvaluationDataset(samples=[sample])
 
     judge = _build_judge_llm(settings)
@@ -261,33 +261,49 @@ async def evaluate_task_with_ragas(
     faithfulness.llm = judge
     answer_relevancy.llm = judge
     answer_relevancy.embeddings = embeddings
-    context_precision.llm = judge
+
+    # 生成质量只跑两个「无需标准答案」的指标。
+    # 1. faithfulness 忠实度：生成的回答是否来源于检索上下文，不允许编造信息
+    # 2. answer_relevancy 回答相关性：生成回答和用户提问的相关程度
+    metrics = [faithfulness, answer_relevancy]
 
     from ragas import aevaluate
 
     # 异步执行RAGAS批量评估
-    # dataset：EvaluationDataset，包含多条样本，每条样本需要对应字段：
-    # user_input(用户问题)、retrieved_contexts(检索上下文分片)、reference(参考标准答案)、response(模型生成回答)
-    # metrics：传入需要计算的三个指标
-    # 1. faithfulness 忠实度：生成的回答是否来源于检索上下文，不允许编造信息
-    # 2. answer_relevancy 回答相关性：生成回答和用户提问的相关程度
-    # 3. context_precision 上下文精确率(AP)：检索分片的相关性+排序质量，评估检索+重排序效果
+    metric_names = ["faithfulness", "answer_relevancy"]
     logger.info(
-        "开始跑 ragas 三维指标 task_id=%s metrics=faithfulness/answer_relevancy/context_precision",
-        task_id[:8],
+        "开始跑 ragas 指标 task_id=%s is_golden=%s metrics=%s",
+        task_id[:8], is_golden, ",".join(metric_names),
     )
     result = await aevaluate(
         dataset=dataset,
-        metrics=[faithfulness, answer_relevancy, context_precision],
+        metrics=metrics,
     )
 
     # 6. 汇总分数
+    # 【L4 工程】NaN 过滤：ragas 的 faithfulness 在「无法从回答拆出原子陈述」时
+    # 返回 np.nan（_faithfulness.py 中 statements==[] → return np.nan）。NaN 不是
+    # 合法 JSON（json.dumps 会输出非标准 NaN），且 asyncpg 写 float 列会报错。
+    # 这里统一把 NaN 跳过（不纳入 scores），让 overall/gate 只基于有效分数计算。
+    import math
+
     df = result.to_pandas()
     scores = {}
     if not df.empty:
         for col in df.columns:
-            if col in ("faithfulness", "answer_relevancy", "context_precision"):
-                scores[col] = round(float(df.iloc[0][col]), 3)
+            if col in ("faithfulness", "answer_relevancy"):
+                raw = df.iloc[0][col]
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if math.isnan(val):
+                    logger.warning(
+                        "指标 %s 返回 NaN（ragas 拆句失败），已跳过 task_id=%s",
+                        col, task_id[:8],
+                    )
+                    continue
+                scores[col] = round(val, 3)
     logger.info("生成质量分数 task_id=%s scores=%s", task_id[:8], scores)
 
     # 7. 落库（沉淀趋势/版本 diff 基础，失败不阻断评估）
@@ -304,7 +320,7 @@ async def evaluate_task_with_ragas(
             {"metric_name": name, "score": val}
             for name, val in scores.items()
         ],
-        metadata={"is_golden": reference is not None},
+        metadata={"is_golden": is_golden},
     )
 
     logger.info(
@@ -374,7 +390,7 @@ async def evaluate_retrieval(
     Returns:
         {
             "task_id": str,
-            "dimensions": {dimension: {"context_precision": x}},
+            "dimensions": {key: {"context_precision": x}},  # key = "竞品@维度" 或维度名
             "avg_context_precision": float,
             "recall_hit_rate": float,   # 0~1，仅在 reference_domains 提供时计算
             "judge_model": str,
@@ -400,25 +416,33 @@ async def evaluate_retrieval(
 
     dim_scores: dict[str, dict[str, float]] = {}
 
-    # 对每一个维度，都要进行一次RAGAS判断，毕竟一个维度一次RAG
+    # 竞品×维度粒度：每条快照 = 一个竞品在一个维度下的精排头部。
+    # user_input（=快照 query="竞品 维度"）与线上精排 rerank("竞品 维度") 的尺子对齐。
     for idx, snap in enumerate(snapshots, start=1):
         dimension = snap["dimension"]
+        competitor = snap.get("competitor") or ""
 
-        # 如果快照没有存 query，则直接拿维度名当 query；
+        # 快照 query 已落为 "竞品 维度"；历史维度级快照（competitor 为空）退化为维度名
         query = snap["query"] or dimension
         # JSONB 字段读出来可能是 str（asyncpg 返回 text），需反序列化
         contexts = _load_json_list(snap.get("reranked_texts"))
         contexts = [c for c in contexts if c and len(str(c).strip()) >= 10]
         if not contexts:
-            logger.info("跳过维度 task_id=%s dimension=%s：精排上下文为空", task_id[:8], dimension)
+            logger.info(
+                "跳过快照 task_id=%s dimension=%s competitor=%s：精排上下文为空",
+                task_id[:8], dimension, competitor or "-",
+            )
             continue
 
         # 根据维度从`reference_map`取参考文本；没有则用维度名作为参考
         reference = (reference_map or {}).get(dimension, dimension)
 
+        # 打分 key：竞品×维度（含竞品时），保证同维度多竞品不互相覆盖
+        score_key = f"{competitor}@{dimension}" if competitor else dimension
+
         logger.info(
-            "评估维度 [%d/%d] task_id=%s dimension=%s 上下文数=%d",
-            idx, len(snapshots), task_id[:8], dimension, len(contexts),
+            "评估快照 [%d/%d] task_id=%s key=%s 上下文数=%d",
+            idx, len(snapshots), task_id[:8], score_key, len(contexts),
         )
 
         # ！！！！核心调用：传入评判 LLM、用户 query、召回上下文分片、参考文本，
@@ -426,12 +450,12 @@ async def evaluate_retrieval(
         # context_precision：每条 context 是否与用户query相关，因此需要传query
         precision = await _score_context_precision(judge, query, contexts, reference)
 
-        dim_scores[dimension] = {
+        dim_scores[score_key] = {
             "context_precision": precision,
         }
         logger.info(
-            "维度打分完成 task_id=%s dimension=%s context_precision=%s",
-            task_id[:8], dimension, precision,
+            "快照打分完成 task_id=%s key=%s context_precision=%s",
+            task_id[:8], score_key, precision,
         )
 
     result: dict = {
@@ -453,12 +477,12 @@ async def evaluate_retrieval(
             task_id[:8], result["recall_hit_rate"], reference_domains,
         )
 
-    # 落库（检索评估按维度细粒度，失败不阻断）
+    # 落库（检索评估按竞品×维度细粒度，失败不阻断）
     metrics: list[dict] = []
-    for dimension, d in dim_scores.items():
+    for score_key, d in dim_scores.items():
         metrics.append({
             "metric_name": "context_precision",
-            "dimension": dimension,
+            "dimension": score_key,  # "竞品@维度" 或纯维度名（历史快照）
             "score": d["context_precision"],
         })
     if "recall_hit_rate" in result:

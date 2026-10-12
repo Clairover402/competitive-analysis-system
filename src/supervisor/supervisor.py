@@ -1166,9 +1166,29 @@ async def run_supervisor_task(
         final_state.get("quality_score", 0.0),
     )
 
+    # ─── 回写 task 状态为 completed ───
+    # 【2026-10-11 BUG修复】supervisor 路径此前从未把 task.status 更新为 completed，
+    # 导致后续 evaluate_with_judge / evaluate_task_with_ragas 因
+    # `task.get("status") != "completed"` 提前 return None —— hard 档（supervisor）
+    # 的生成质量评估和 Judge 五维评估被整体跳过（generation/judge 恒 null）。
+    # pipeline 路径在 finalize 节点有 TaskDAO.update_status("completed")，
+    # supervisor 缺失等价动作，在此补齐。
+    is_complete = final_state.get("is_complete", True)
+    if is_complete:
+        try:
+            from src.db.dao import TaskDAO
+
+            task_dao = TaskDAO(pool)
+            await task_dao.update_status(task["id"], "completed")
+            logger.info("Supervisor 已回写 task status=completed task_id=%s", task["id"][:8])
+        except Exception as e:
+            # 回写失败不阻断返回——评估器会因 status 仍为 pending 而跳过，
+            # 但至少不 crash 主流程。
+            logger.warning("Supervisor 回写 task status 失败 task_id=%s: %s", task["id"], e)
+
     return {
         "task_id": task["id"],
         "final_output": final_state.get("final_output", ""),
         "quality_score": final_state.get("quality_score", 0.0),
-        "is_complete": final_state.get("is_complete", True),
+        "is_complete": is_complete,
     }

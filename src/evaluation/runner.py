@@ -41,7 +41,8 @@ async def evaluate_task_full(
     dao: "TaskDAO",
     settings=None,
     *,
-    reference: str | None = None,
+    is_golden: bool = False,
+    reference_map: dict[str, str] | None = None,
     reference_domains: list[str] | None = None,
 ) -> dict:
     """对单个任务串起三类评估，返回结构化汇总。
@@ -50,8 +51,10 @@ async def evaluate_task_full(
         task_id: 任务 ID
         dao: TaskDAO 实例
         settings: 可选 Settings
-        reference: 事实级标准答案（Golden 用，真实任务通常为 None）
-        reference_domains: 关键来源域名锚点（Golden 用）
+        is_golden: 是否为 Golden 用例（仅用于落库打 is_golden 标记）
+        reference_map: {dimension: 该维度标准答案}，喂检索阶段 context_precision
+            （Golden 用 get_reference_by_dimension 传入；真实任务为 None，用维度名兜底）
+        reference_domains: 关键来源域名锚点（Golden 用，供检索召回 recall_hit_rate 对拍）
 
     Returns:
         {
@@ -77,7 +80,7 @@ async def evaluate_task_full(
     try:
         result["retrieval"] = await evaluate_retrieval(
             task_id, dao, settings,
-            reference_map=None,
+            reference_map=reference_map,
             reference_domains=reference_domains,
         )
     except Exception as e:
@@ -87,7 +90,7 @@ async def evaluate_task_full(
     # 2. 生成质量（依赖 report + evidence，成稿后）
     try:
         result["generation"] = await evaluate_task_with_ragas(
-            task_id, dao, settings, reference=reference,
+            task_id, dao, settings, is_golden=is_golden,
         )
     except Exception as e:
         logger.warning("生成质量评估失败 task_id=%s: %s", task_id, e)
@@ -131,14 +134,15 @@ async def run_batch(
 def run_golden_checks() -> dict:
     """Golden Dataset 数据完整性自检（不依赖真实 DB / LLM）。
 
-    校验每条 Golden Case 是否具备事实级标准答案 + 关键来源域名锚点，
-    这是 context_precision / recall_hit_rate 能归真的前提。缺失项列出，
-    供补齐 Golden 数据用。
+    校验每条 Golden Case 是否具备事实级标准答案 + 分维度标准答案 +
+    关键来源域名锚点，这是 context_precision / recall_hit_rate 能归真的前提。
+    缺失项列出，供补齐 Golden 数据用。
 
     Returns:
         {
             "total": 10,
             "missing_reference": [task_id...],
+            "missing_by_dimension": [task_id...],   # 维度键与 dimensions 不对齐的
             "missing_domains": [task_id...],
             "complete": bool,
         }
@@ -149,6 +153,10 @@ def run_golden_checks() -> dict:
         c["task_id"] for c in GOLDEN_DATASET
         if not c.get("reference")
     ]
+    missing_by_dimension = [
+        c["task_id"] for c in GOLDEN_DATASET
+        if set(c.get("reference_by_dimension", {}).keys()) != set(c["dimensions"])
+    ]
     missing_domains = [
         c["task_id"] for c in GOLDEN_DATASET
         if not c.get("reference_domains")
@@ -156,6 +164,7 @@ def run_golden_checks() -> dict:
     return {
         "total": len(GOLDEN_DATASET),
         "missing_reference": missing_reference,
+        "missing_by_dimension": missing_by_dimension,
         "missing_domains": missing_domains,
-        "complete": not missing_reference and not missing_domains,
+        "complete": not missing_reference and not missing_by_dimension and not missing_domains,
     }
