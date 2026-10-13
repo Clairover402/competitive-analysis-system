@@ -30,9 +30,13 @@ Grafana 和审计里「哪个维度没数据」彻底失真，而主流程不报
 
 【设计结论】
 ────────────
-凡是要对单元格做「取正文 / 判空 / 判占位 / 统计长度 / 汇总维度状态」的地方，
-一律调用本模块的函数，**不要在调用点自己写 isinstance 或 str(...).startswith(...)**。
-口径只有一份，改形态时只改这里，不会再出现「同一件事两个文件写法不一致」。
+读：凡是要对单元格做「取正文 / 判空 / 判占位 / 统计长度 / 汇总维度状态」的地方，
+    一律调用本模块的函数，**不要在调用点自己写 isinstance 或 str(...).startswith(...)**。
+写：凡是要造一个「无实质结论」的占位单元格，一律 placeholder_cell(reason)，
+    **不要在调用点手写 {"conclusion": ..., "source_url": ""} 字面量**。
+
+两个方向都收敛到本模块后，「单元格形态」这个不变量才真正有单一源头
+（2026-10-12 只做了读侧，写侧漏了 4 处手写字面量，2026-10-13 补齐）。
 """
 
 from __future__ import annotations
@@ -65,6 +69,34 @@ def cell_source_url(val) -> str:
     if isinstance(val, dict):
         return str(val.get("source_url") or "")
     return ""
+
+
+def placeholder_cell(reason: str) -> dict[str, str]:
+    """构造一个「无实质结论」的标准单元格 —— **产出侧**的唯一口径。
+
+    【2026-10-13 补漏 —— 为什么产出侧也要有构造函数】
+    ────────────────────────────────────────────────
+    2026-10-12 修 has_data 恒 True 时，只在 analyzer_agent 里把三条失败分支
+    统一成了 {conclusion, source_url}，**漏掉 _retrieve_and_analyze_dimension
+    内「召回为空」的提前返回分支**——那一条仍在返回裸字符串，而同文件另外几处
+    也是手写 dict 字面量。
+
+    后果不是崩溃（消费侧的 conclusion_text 能把 str 接住），而是
+    「analysis_results 单元格恒为 dict」这个**不变量被破坏**：
+    只要还有任何一处产出裸值，消费方就永远不敢删 isinstance 兼容分支，
+    下次改形态时依然要满仓库找解包点——这正是本模块想终结的循环。
+
+    所以把「造格子」也收敛到这里：占位统一 placeholder_cell(reason)，
+    reason 需自带标记前缀（[数据不足] / [分析失败] / [待验证]）。
+
+    Args:
+        reason: 完整的占位结论文本，如 "[数据不足] 未检索到相关网页内容"
+
+    Returns:
+        {"conclusion": reason, "source_url": ""}
+        source_url 恒为空——占位意味着没有可追溯的依据。
+    """
+    return {"conclusion": str(reason or ""), "source_url": ""}
 
 
 def is_placeholder(text: str) -> bool:

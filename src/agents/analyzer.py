@@ -109,7 +109,9 @@ from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO, RetrievalSnapshotDAO
 from src.mcp.tools_rag import embed_query, rerank
 from src.observability.token_usage import extract_usage, add_usage
 from src.agents.analysis_shape import (
+    cell_source_url,
     conclusion_text,
+    placeholder_cell,
     summarize_per_dimension,
 )
 
@@ -295,7 +297,14 @@ async def _retrieve_and_analyze_dimension(
                 merged.append(r)
 
         if not merged:
-            return {c: "[数据不足] 未检索到相关网页内容" for c in competitors}
+            # 【2026-10-13 补漏】此处此前返回**裸字符串**，是 analysis_results 里
+            #   唯一的 str 单元格来源——破坏了「单元格恒为 {conclusion, source_url}」
+            #   不变量（因消费侧 analysis_shape 兜底才没暴露成故障）。
+            #   统一走产出侧口径 placeholder_cell。
+            return {
+                c: placeholder_cell("[数据不足] 未检索到相关网页内容")
+                for c in competitors
+            }
 
         # ─── Step 4.5: 按竞品分组（维度检索 + 竞品分组） ───
         # 【L3 面试核心考点】为什么「维度检索 + 内存分组」而不是「竞品×维度检索」？
@@ -328,10 +337,7 @@ async def _retrieve_and_analyze_dimension(
             # 该竞品专属 chunk + 无归属兜底 chunk（合并，保证兜底信息不丢）
             group = by_competitor.get(competitor, []) + unattributed
             if not group:
-                final_result[competitor] = {
-                    "conclusion": "[数据不足] 未找到相关信息",
-                    "source_url": "",
-                }
+                final_result[competitor] = placeholder_cell("[数据不足] 未找到相关信息")
                 continue
 
             # Cross-encoder 精排：query 拼竞品名，让 reranker 区分「苹果是水果还是公司」
@@ -389,10 +395,7 @@ async def _retrieve_and_analyze_dimension(
                 parts = text.split("```", 2)
                 text = parts[2].strip() if len(parts) >= 3 else parts[1].strip()
             if not text:
-                final_result[competitor] = {
-                    "conclusion": "[分析失败] LLM返回空响应",
-                    "source_url": "",
-                }
+                final_result[competitor] = placeholder_cell("[分析失败] LLM返回空响应")
                 continue
             if not text.startswith("{"):
                 start = text.find("{")
@@ -402,22 +405,18 @@ async def _retrieve_and_analyze_dimension(
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
-                final_result[competitor] = {
-                    "conclusion": "[分析失败] LLM返回格式异常",
-                    "source_url": "",
-                }
+                final_result[competitor] = placeholder_cell("[分析失败] LLM返回格式异常")
                 continue
 
             if isinstance(parsed, dict) and "conclusion" in parsed:
+                # 成功路径也走 analysis_shape 的取值口径（取正文 / 取来源各一次），
+                # 调用点不再自己写 .get("conclusion")——形态变更只需改模块一处。
                 final_result[competitor] = {
-                    "conclusion": str(parsed.get("conclusion", "")),
-                    "source_url": str(parsed.get("source_url", "")),
+                    "conclusion": conclusion_text(parsed),
+                    "source_url": cell_source_url(parsed),
                 }
             else:
-                final_result[competitor] = {
-                    "conclusion": "[分析失败] LLM返回格式异常",
-                    "source_url": "",
-                }
+                final_result[competitor] = placeholder_cell("[分析失败] LLM返回格式异常")
 
         return final_result
 
@@ -563,7 +562,8 @@ async def analyzer_agent(
     #   消费方必须处处 isinstance 兼容，漏一处就静默失真
     #   （analyzer 的 per_dimension.has_data 就是这么恒为 True 的）。
     def _fail_cell(reason: str) -> dict[str, str]:
-        return {"conclusion": f"[分析失败] {reason}", "source_url": ""}
+        # 标记前缀在这里拼，格子本身由产出侧唯一口径 placeholder_cell 造
+        return placeholder_cell(f"[分析失败] {reason}")
 
     analysis_results: dict[str, dict] = {}
     for dim, result in zip(dimensions, results_list):

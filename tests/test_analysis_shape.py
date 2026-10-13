@@ -27,6 +27,10 @@
   7. test_回归_旧写法为什么会恒为True           — 把 bug 的复现条件钉在测试里
   8. test_summarize_per_dimension_防御非dict    — 维度级异常输入不抛异常
 
+（2026-10-13 补写侧口径后新增）
+  9. test_placeholder_cell_产出侧口径           — 造的格子形态正确 + 恒被判"无数据"
+ 10. test_回归_产出侧不变量_单元格恒为dict      — 扫源码，禁止再出现裸字符串单元格
+
 运行方式（项目未装 pytest 也能跑）：
     python tests/test_analysis_shape.py
 或用 pytest：
@@ -47,6 +51,8 @@ from src.agents.analysis_shape import (
     has_missing_marker,
     is_placeholder,
     cell_has_data,
+    cell_source_url,
+    placeholder_cell,
     summarize_per_dimension,
 )
 
@@ -177,6 +183,50 @@ def test_summarize_per_dimension_防御非dict():
     # 空输入
     assert summarize_per_dimension({}) == {}
     assert summarize_per_dimension(None) == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9~10：产出侧口径（2026-10-13 补漏后新增）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_placeholder_cell_产出侧口径():
+    """占位格子必须由 placeholder_cell 统一构造，且形态与判定口径吻合。"""
+    cell = placeholder_cell("[数据不足] 未检索到相关网页内容")
+    assert cell == {"conclusion": "[数据不足] 未检索到相关网页内容", "source_url": ""}
+    # 恒被判为「无数据」—— 这正是 summarize_per_dimension 依赖的性质
+    assert cell_has_data(cell) is False
+    assert is_placeholder(conclusion_text(cell)) is True
+    # source_url 恒空：占位意味着没有可追溯的依据
+    assert cell_source_url(cell) == ""
+    # 空值 / None 兜底不抛异常，且仍判「无数据」
+    assert placeholder_cell(None)["conclusion"] == ""
+    assert cell_has_data(placeholder_cell("")) is False
+    # 每次返回新对象，避免调用点误改到共享实例
+    a, b = placeholder_cell("[待验证] x"), placeholder_cell("[待验证] x")
+    assert a == b and a is not b
+
+
+def test_回归_产出侧不变量_单元格恒为dict():
+    """扫源码钉住不变量：analyzer 不得再产出裸字符串单元格。
+
+    `{c: "..."}` 这种 dict 推导是「裸字符串单元格」的唯一写法。
+    2026-10-12 只做了读侧统一（analysis_shape），写侧漏了 4 处；
+    2026-10-13 补齐。此处用源码扫描防回归，不必再靠人工 grep。
+    """
+    import re
+
+    ana_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "src", "agents", "analyzer.py",
+    )
+    with open(ana_path, encoding="utf-8") as f:
+        src = f.read()
+
+    bare_cell = re.findall(r"\{c:\s*[\"']", src)
+    assert bare_cell == [], (
+        f"analyzer.py 出现 {len(bare_cell)} 处裸字符串单元格（{{c: \"...\"}}）；"
+        f"占位格子必须走 analysis_shape.placeholder_cell(...)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

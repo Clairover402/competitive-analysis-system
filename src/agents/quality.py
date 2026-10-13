@@ -54,7 +54,12 @@ from typing import TYPE_CHECKING
 from src.db.connection import create_pool
 from src.db.dao import ReportDAO, AgentLogDAO, EvidenceDAO, ChunkEmbeddingDAO
 from src.observability.token_usage import extract_usage
-from src.agents.analysis_shape import conclusion_text, has_missing_marker, is_placeholder
+from src.agents.analysis_shape import (
+    cell_source_url,
+    conclusion_text,
+    has_missing_marker,
+    is_placeholder,
+)
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -178,8 +183,10 @@ def _extract_evidences(
         for comp, val in comp_data.items():
             # ── 形态 A：结构化对象 {conclusion, source_url} ──
             if isinstance(val, dict):
-                conclusion = str(val.get("conclusion") or "").strip()
-                url = str(val.get("source_url") or "").strip()
+                # 【2026-10-13】改为走 analysis_shape 取值口径，不再在本文件
+                #   自己写 .get("conclusion") / .get("source_url")——形态变更只改模块。
+                conclusion = conclusion_text(val).strip()
+                url = cell_source_url(val).strip()
                 # source_url 为空或仍是占位符 → 不可追溯，跳过
                 if not url or url in ("source_url", "（source_url）", "()"):
                     continue
