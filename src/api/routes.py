@@ -83,6 +83,60 @@ def _split_i18n_commas(items: list[str]) -> list[str]:
     return result
 
 
+def _find_duplicates(items: list[str] | None) -> list[str]:
+    """返回重复出现的元素（保持首次出现顺序，每个重复值只列一次）。
+
+    【为什么需要】analyzer 的内层循环是 `for competitor in competitors`，
+    对重复项会**再跑一遍完整的「检索 + 精排 + LLM 分析」**（白花 token）；而
+    结果写入 `analysis_results[dim][competitor]` 是 dict 赋值 → 后一次**静默覆盖**
+    前一次，用户拿到一份"少了一格"却毫无报错的报告。维度列表同理。
+    """
+    if not items:
+        return []
+    seen: set[str] = set()
+    dups: list[str] = []
+    for x in items:
+        if x in seen and x not in dups:
+            dups.append(x)
+        seen.add(x)
+    return dups
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    """保序去重（保留首次出现）。用于 LLM 抽取结果——用户没输入重复项，
+    不该因模型的重复输出被 400，静默归一即可。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _reject_duplicates(
+    competitors: list[str] | None,
+    dimensions: list[str] | None,
+) -> None:
+    """重复项校验：同任务内重复的竞品/维度 → HTTP 400（2026-10-13）。
+
+    【L5 决策】为什么是「拒绝」而不是「静默去重」？
+      — 用户列表里的重复项通常是**输入错误**（复制粘贴、中英文逗号混用导致），
+        静默去重会让用户以为"我传了两个"而实际只分析了一个；
+      — 显式 400 让用户当场发现并改正，避免拿到口径不符的报告。
+      — LLM 抽取路径的重复属模型副作用，走 `_dedupe` 静默归一（见上）。
+    """
+    problems: list[str] = []
+    dup_competitors = _find_duplicates(competitors)
+    dup_dimensions = _find_duplicates(dimensions)
+    if dup_competitors:
+        problems.append(f"竞品重复：{'、'.join(dup_competitors)}")
+    if dup_dimensions:
+        problems.append(f"维度重复：{'、'.join(dup_dimensions)}")
+    if problems:
+        raise HTTPException(400, "；".join(problems) + "。请去掉重复项后重试。")
+
+
 class TaskRequest(BaseModel):
     """创建任务请求体。
 
@@ -692,7 +746,10 @@ async def create_task(
         record_rate_limit_hit("global")
         raise HTTPException(429, "请求过多，请稍后重试")
 
-    # ── 参数校验（Pydantic model_post_init 已自动执行，不需要手动调用）──
+    # ── Layer 2: 参数校验 ──
+    # Pydantic model_post_init 已保证 competitors+dimensions 或 query 至少传一组；
+    # 这里追加**业务级**校验：同任务内重复的竞品/维度直接 400（避免重复跑 + 静默覆盖）。
+    _reject_duplicates(body.competitors, body.dimensions)
 
     # ── 构造 llm_parsed ──
     # 如果传了 competitors + dimensions → intent 明确
@@ -711,10 +768,11 @@ async def create_task(
     # → competitors=[], dimensions=[] → classify → supervisor → "待探索" → 死循环。
     if body.query and (not llm_parsed["competitors"] or not llm_parsed["dimensions"]):
         extracted = await _extract_entities_from_query(body.query, request)
+        # 去重：LLM 抽取可能重复输出同一实体，静默归一，不让用户背锅
         if extracted["competitors"]:
-            llm_parsed["competitors"] = extracted["competitors"]
+            llm_parsed["competitors"] = _dedupe(extracted["competitors"])
         if extracted["dimensions"]:
-            llm_parsed["dimensions"] = extracted["dimensions"]
+            llm_parsed["dimensions"] = _dedupe(extracted["dimensions"])
         # 重新评估 intent_is_clear（提取后有值时可能改变）
         llm_parsed["intent_is_clear"] = bool(
             llm_parsed["competitors"] and llm_parsed["dimensions"]
