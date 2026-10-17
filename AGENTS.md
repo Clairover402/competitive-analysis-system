@@ -41,6 +41,8 @@ LangGraph 1.0 竞品分析系统。四个Agent（Collector/Analyzer/Writer/Quali
 
 **禁止**：创建虚拟环境 · pip install · git操作 · 硬编码密钥/密码 · 写C盘文件
 
+**改文件**：用 `apply_patch` 工具，不要通过 shell 执行 apply_patch（Codex 会往历史里插一条 warning，DeepSeek 直接 400 `No tool output found for tool call`，整条会话作废）
+
 **数据库**：连接池通过 `src/db/connection.py` 获取 · SQL写在DAO层 · pgvector用 `<=>` · 批量写不用逐条INSERT · 事务用 `async with conn.transaction()`
 
 **全文检索**：zhparser（中文分词）+ pg_bigm（中文模糊匹配）。TS配置名 `zhparse`，仅索引 n/v/a/i/e/l 六种词性。查询用 `to_tsvector('zhparse', content) @@ to_tsquery('zhparse', keyword)`。模糊匹配用 `content % keyword`（pg_bigm 操作符）。Docker 镜像：`docker/Dockerfile` 预编译两个扩展。

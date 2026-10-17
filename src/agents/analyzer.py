@@ -108,6 +108,10 @@ from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO, RetrievalSnapshotDAO
 from src.mcp.tools_rag import embed_query, rerank
 from src.observability.token_usage import extract_usage, add_usage
+from src.agents.content_quality import (
+    clean_chunk_text,
+    is_boilerplate_chunk,
+)
 from src.agents.analysis_shape import (
     cell_source_url,
     conclusion_text,
@@ -278,23 +282,59 @@ async def _retrieve_and_analyze_dimension(
         # 【竞品配额决策，2026-10-12 修正注释】top_k 提到 60：两条检索 SQL 都
         # 只按 task_id 过滤（WHERE 里没有 competitor 谓词），召回的是全竞品混池，
         # 所以配额要按「所有竞品加起来」给足，再在内存按 competitor 分组。
-        vec_results = await chunk_dao.similarity_search(task_id, query_vec, top_k=60)
+        # 【2026-10-16】提升为配置（settings.vector_search_top_k，默认仍 60）——
+        # 它是**绝对值**，池子小时会大于池子本身，直接触发下面那条退化告警。
+        vec_top_k = settings.vector_search_top_k
+        vec_results = await chunk_dao.similarity_search(task_id, query_vec, top_k=vec_top_k)
+
+        # 【2026-10-16 新增】检索退化告警 —— 让「静默全量返回」可见
+        #  ── 为什么必须告警 ──
+        #  similarity_search 至多返回 top_k 条，故 len(vec_results) < top_k
+        #  ⟺ **池子本身小于 top_k**。此时该层检索等于「把池子全取回来」，
+        #  维度名对召回结果**零影响**（实测 golden_001：池子 32 < 60，
+        #  4 个快照的 recalled_urls 是同一个 12 URL 集合，只有顺序不同）。
+        #  这个退化此前完全静默，外部只表现为「评估分数全 0」，极易被误判为
+        #  「判据形态问题」或「模型不听话」。所以在最上游主动 WARN，暴露根因。
+        if len(vec_results) < vec_top_k:
+            logger.warning(
+                "【Analyzer】检索退化：检索池(%d) < vector top_k(%d) → 本次全量返回，"
+                "维度区分度不可用（dimension=%r）",
+                len(vec_results), vec_top_k, dimension,
+            )
 
         # ─── Step 3: 关键词检索（字面召回） ───
         # 【L3 原理】zhparser 中文分词 + pg_bigm 2-gram 索引，
         # 能精确匹配到包含"¥180"、"SaaS订阅"等具体数字/术语的 chunk。
         kw_results = await chunk_dao.keyword_search(task_id, dimension, top_k=30)
 
-        # ─── Step 4: 合并去重 ───
-        # 【L4 工程】为什么用 URL 而不是 chunk 文本去重？
-        #   同一页面可能产生多个 chunk，按 URL 去重 → 每页面最多保留一个 chunk。
-        seen: set[str] = set()
-        merged: list[dict] = []
+        # ─── Step 4: 合并去重（每 URL 最多保留 chunks_per_url 条） ───
+        # 【L4 工程】为什么按 URL 去重而不是按 chunk 文本？
+        #   同一页面会产出多个 chunk，不限制的话单个页面能霸占整个候选池。
+        # 【2026-10-16 修正】原实现是「每 URL 只留 1 条」，有两个缺陷：
+        #   ① 信息浪费：实测每 URL 平均产出 2.7 个 chunk（32 chunk / 12 URL），
+        #      只留 1 条等于丢掉约 2/3 的页面内容，而候选池本就偏小；
+        #   ② 不可复现：「留哪一条」取决于 `vec_results + kw_results` 的返回顺序，
+        #      而该顺序由 query 向量决定 → 同一页面在不同维度下留下的 chunk 不同，
+        #      给快照引入了与维度无关的随机性（实测两维度仅 4/7 文本重叠）。
+        # 【改写后的取法】按「出现顺序」取前 k 条 —— 不额外计算相似度：
+        #   vec_results 已按余弦距离升序（最相似在前）、kw_results 已按匹配度排序，
+        #   拼接后同一 URL 的 chunk 天然就是「与维度相关性从高到低」。
+        #   这样取 top-k 既与维度相关、又可复现，且**不产生任何额外 embedding 调用**。
+        # 【兼容性】k = settings.chunks_per_url，**默认 1**：
+        #   此时 [:1] 与旧的「保留首个」等价 → 默认行为与 token 预算均不变。
+        url_keep: dict[str, list[dict]] = {}
+        url_order: list[str] = []
         for r in vec_results + kw_results:
             url = r.get("source_url", "")
-            if url not in seen:
-                seen.add(url)
-                merged.append(r)
+            if url not in url_keep:
+                url_keep[url] = []
+                url_order.append(url)
+            url_keep[url].append(r)
+
+        keep_per_url = max(1, int(getattr(settings, "chunks_per_url", 1)))
+        merged: list[dict] = []
+        for url in url_order:
+            merged.extend(url_keep[url][:keep_per_url])
 
         if not merged:
             # 【2026-10-13 补漏】此处此前返回**裸字符串**，是 analysis_results 里
@@ -340,36 +380,98 @@ async def _retrieve_and_analyze_dimension(
                 final_result[competitor] = placeholder_cell("[数据不足] 未找到相关信息")
                 continue
 
-            # Cross-encoder 精排：query 拼竞品名，让 reranker 区分「苹果是水果还是公司」
-            group_docs = [r["chunk_text"] for r in group]
-            ranked = await rerank(
-                f"{competitor} {dimension}", group_docs, top_k=15, settings=settings
-            )
-            if ranked:
-                top_docs = [
-                    group[r["index"]].get("chunk_text", "")
-                    for r in ranked if r["index"] < len(group)
+            # ─── Step 4.6: 精排前清洗（2026-10-14 新增）───
+            # 【L3 面试考点】为什么清洗要放在「精排之前」而不是之后？
+            #   cross-encoder 是**逐对打分**的：把样板 chunk 一起喂进去，
+            #   它不仅不会把样板排到后面，反而会因为「导航里竞品名重复密度高、
+            #   与 query『竞品 维度』字面重合」把样板排到头部（实测精排后样板占比升高）。
+            #   → 必须在打分**之前**把候选池洗干净，而不是指望 reranker 自己识别。
+            # 【L5 设计】为什么这里做双保险（Collector 已过滤一次）？
+            #   Collector 的过滤只对**新采集**的数据生效；库里已有的历史 chunk
+            #   （旧任务/未重跑的任务）仍然是脏的。检索侧这里是「零成本兜底」：
+            #   规整 + 剔除都不花钱，且保证无论数据来自哪一批，喂给 reranker 的都干净。
+            cleaned_group: list[dict] = []
+            for r in group:
+                raw_text = r.get("chunk_text", "") or ""
+                if is_boilerplate_chunk(raw_text):
+                    continue
+                cleaned_group.append({**r, "chunk_text": clean_chunk_text(raw_text)})
+            # 兜底：若清洗后一条不剩（极端情况：整页都是样板），退回「仅规整、不剔除」，
+            # 宁可喂稍脏的内容，也不要直接判 [数据不足]。
+            if not cleaned_group:
+                cleaned_group = [
+                    {**r, "chunk_text": clean_chunk_text(r.get("chunk_text", "") or "")}
+                    for r in group
                 ]
-                top_sources = [
+            group = cleaned_group
+
+            # 【命名约定 2026-10-16】这一段的三个名字：
+            #   rerank_query       = **不是** RAGAS 的 user_input。本项目里没有 user、
+            #                        也没有人提问，这只是一个给 cross-encoder 用的
+            #                        查询串（拼竞品名，让 reranker 区分「苹果是水果
+            #                        还是公司」）。它要等到**评估阶段**才被当作
+            #                        RAGAS 的 user_input 消费（见 ragas_core.
+            #                        build_samples：user_input = snap.get("query")）。
+            #                        ⇒ 领域侧保留领域名，只在「进入 RAGAS 的边界」
+            #                          做名词转换，别把 RAGAS 的词污染到生产链路。
+            #   candidate_contexts = 精排**前**的候选 chunk（还没排过序，只是候选池）
+            #   reranked_texts     = 精排**后**的 chunk 原文 —— 才是 RAGAS
+            #                        retrieved_contexts 该吃的东西
+            # ⚠️ 区分 candidate vs reranked 很重要：评估只认 reranked，
+            #    把 candidate 当 retrieved_contexts 喂进去会高估检索质量。
+            rerank_query = f"{competitor} {dimension}"
+            candidate_contexts = [r["chunk_text"] for r in group]
+            # 【2026-10-16】top_k 提升为配置（settings.rerank_top_k，默认仍 15）。
+            rerank_top_k = settings.rerank_top_k
+            reranked = await rerank(
+                rerank_query, candidate_contexts, top_k=rerank_top_k, settings=settings
+            )
+            # 【2026-10-16 新增】精排「无筛选」告警
+            #  候选池 ≤ top_k 时，精排只改变**顺序**、不改变**集合**，
+            #  而落盘的 reranked_texts 是整个集合 → 同一竞品在不同维度下的
+            #  contexts 集合会完全相同（实测 golden_001：候选 7/5 ≤ 15）。
+            #  此时维度区分只能体现在排序上，而评估侧拿的是集合，
+            #  于是「维度区分度」在整条链路上彻底消失。
+            if reranked and len(candidate_contexts) <= rerank_top_k:
+                logger.warning(
+                    "【Analyzer】精排无筛选：候选池(%d) ≤ rerank top_k(%d) → "
+                    "只排序不截断，维度区分度无法体现在 contexts 集合上"
+                    "（competitor=%r dimension=%r）",
+                    len(candidate_contexts), rerank_top_k, competitor, dimension,
+                )
+            if reranked:
+                reranked_texts = [
+                    group[r["index"]].get("chunk_text", "")
+                    for r in reranked if r["index"] < len(group)
+                ]
+                reranked_urls = [
                     group[r["index"]].get("source_url", "")
-                    for r in ranked if r["index"] < len(group)
+                    for r in reranked if r["index"] < len(group)
                 ]
             else:
-                top_docs = group_docs[:15]
-                top_sources = [r["source_url"] for r in group[:15]]
+                # reranker 失败兜底：退回「未精排」的候选前 15 条
+                # （此时 reranked_texts 名不副实，但它仍会被当作 retrieved_contexts 落盘，
+                #   评估侧读到的分母/排序语义与正常路径不同 —— 靠 reranked 为空来识别。）
+                reranked_texts = candidate_contexts[:15]
+                reranked_urls = [r["source_url"] for r in group[:15]]
 
             # ─── Step 5.5: 落竞品×维度级检索快照（RAGAS 检索质量评估输入） ───
-            # 每条快照 = 一个竞品在一个维度下的精排头部，query="竞品 维度"，
-            # 使评估阶段的 user_input（=query）与线上精排 rerank("竞品 维度") 的尺子完全对齐。
+            # 每条快照 = 一个竞品在一个维度下的精排头部，query="竞品 维度"。
+            # 【为什么要落这条 query】让评估阶段的 user_input（= 快照 query）与
+            # 线上精排 rerank("竞品 维度") 用的是**同一把尺子**：评估不是事后另造
+            # 一个问法去考检索，而是考「线上真正拿去排序的那个串」。
+            # 【名词边界】DB 列名仍是 query / reranked_texts（历史名，未做迁移）；
+            # 「query → user_input」的转换只在评估侧边界做（ragas_core.build_samples）。
+            snapshot_id: str | None = None
             try:
-                await snapshot_dao.insert_snapshot(
+                snapshot_id = await snapshot_dao.insert_snapshot(
                     task_id=task_id,
                     dimension=dimension,
                     competitor=competitor,
-                    query=f"{competitor} {dimension}",
+                    query=rerank_query,
                     recalled_urls=[r.get("source_url", "") for r in merged],
-                    reranked_urls=top_sources,
-                    reranked_texts=top_docs,
+                    reranked_urls=reranked_urls,
+                    reranked_texts=reranked_texts,
                 )
             except Exception:
                 logger.exception(
@@ -379,7 +481,7 @@ async def _retrieve_and_analyze_dimension(
 
             # 智能截取 + 组装该竞品的分析上下文
             chunks_text = ""
-            for i, (doc, src) in enumerate(zip(top_docs, top_sources)):
+            for i, (doc, src) in enumerate(zip(reranked_texts, reranked_urls)):
                 sliced = _smart_slice(doc, max_chars=1500)
                 chunks_text += f"[片段{i+1}] (来源: {src})\n{sliced}\n\n"
 
@@ -411,10 +513,21 @@ async def _retrieve_and_analyze_dimension(
             if isinstance(parsed, dict) and "conclusion" in parsed:
                 # 成功路径也走 analysis_shape 的取值口径（取正文 / 取来源各一次），
                 # 调用点不再自己写 .get("conclusion")——形态变更只需改模块一处。
+                conclusion = conclusion_text(parsed)
                 final_result[competitor] = {
-                    "conclusion": conclusion_text(parsed),
+                    "conclusion": conclusion,
                     "source_url": cell_source_url(parsed),
                 }
+                # 回填快照 response_text：供四指标评估的生成层（faithfulness/
+                # answer_relevancy）使用；失败不阻断分析流程。
+                if snapshot_id:
+                    try:
+                        await snapshot_dao.set_response_text(snapshot_id, conclusion)
+                    except Exception:
+                        logger.exception(
+                            "【Analyzer】快照 response_text 回填失败 task_id=%s key=%s@%s",
+                            task_id, competitor, dimension,
+                        )
             else:
                 final_result[competitor] = placeholder_cell("[分析失败] LLM返回格式异常")
 

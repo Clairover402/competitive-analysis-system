@@ -59,6 +59,12 @@ from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO
 from src.mcp.tools_rag import embed_texts
 from src.observability.token_usage import extract_usage, add_usage
+from src.agents.content_quality import (
+    clean_chunk_text,
+    is_boilerplate_chunk,
+    normalize_text,
+    readable_char_count,
+)
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
@@ -66,9 +72,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 【2026-07-29】内容质量门禁阈值：正文中文字数（CJK Unified Ideographs）低于此值视为 SPA 骨架页，丢弃
+# 【2026-07-29】内容质量门禁阈值 —— 正文「可读字符数」（CJK 汉字 + 拉丁字母）低于此值
+# 视为 SPA 骨架页 / 空壳页，丢弃。常量名 2026-10-14 由 _MIN_CJK_CHARS 改名：
+#   旧口径只数 CJK 汉字 → 英文官方文档（CJK=0）被整页误杀（Notion/Atlassian 官方英文页采不到，
+#   是「官方源覆盖不足」的一条隐藏成因）。改为「CJK + 拉丁字母」后可同时覆盖中英文正文。
 # 【2026-09-26】提升为模块级常量——_fetch_one（步骤3）需在分块前用它判断 Tavily 预取正文是否达标
-_MIN_CJK_CHARS = 200
+_MIN_READABLE_CHARS = 200
 
 # ═════════════════════════════════════════════════════════════════════════════
 # §1 搜索关键词生成
@@ -76,9 +85,154 @@ _MIN_CJK_CHARS = 200
 
 _KEYWORD_PROMPT = """你是一个搜索专家。根据竞品名称和分析维度，生成 3-5 个精准的搜索 query。
 要求：每个 query 要具体，结合竞品名+维度+时间限定，不同 query 覆盖不同角度。
+另外给出该竞品的**官方网站域名**（official_domains）：只写注册域或产品子域本身，
+如 feishu.cn / dingtalk.com / notion.com；**不确定就留空数组，不要猜**。
 
 输入: {competitor: "%s", dimensions: %s}
-输出: ["query1", "query2", ...]"""
+输出: {"queries": ["query1", "query2", ...], "official_domains": ["domain1", ...]}"""
+
+
+def _extract_json_payload(text: str) -> str:
+    """从 LLM 原始输出里剥出 JSON 主体（容忍 markdown 包裹 / 前后有解释文字）。
+
+    【为什么单独抽成函数】这段剥离逻辑此前内联在 _generate_keywords 里、
+    且**只认 `[...]`（列表）**。2026-10-14 起关键词生成改为输出对象
+    `{"queries": [...], "official_domains": [...]}`，故必须同时认 `{...}`。
+    抽出来后可单测，避免再出现「格式变体没覆盖 → 静默降级模板」。
+    """
+    import re as _re
+
+    if not text:
+        return ""
+    t = text.strip()
+    # 去 markdown 代码块围栏（```json ... ``` / ``` ... ```）
+    if t.startswith("```"):
+        t = t[3:]
+        nl = t.find("\n")
+        if nl >= 0:
+            t = t[nl:]
+        t = t.strip()
+        if t.endswith("```"):
+            t = t[:-3].strip()
+    if t[:1] in ("{", "["):
+        return t
+    # 前后有解释文字 → 从最早出现的 { 或 [ 截到对应的最后一个 } 或 ]
+    m = _re.search(r"[\[{]", t)
+    if not m:
+        return t
+    opener = m.group(0)
+    closer = "}" if opener == "{" else "]"
+    start = m.start()
+    end = t.rfind(closer)
+    if end > start:
+        return t[start:end + 1]
+    return t
+
+
+# 每竞品最多抓取的页面数（配额）—— **仅作 select_competitor_urls 的默认值**。
+# 【2026-10-16】实际取值已提升为配置 settings.per_competitor_page_cap（默认同为 8），
+# 由 collector_agent 显式传入，便于按诊断结果调整而不必改代码。
+# 历史依据：2026-10-14 复核实测 38 个 (任务,竞品) 组合里 32 个正好采满 8 页
+# = 上限 100% 触顶，当时的结论是「真瓶颈是怎么选而不是选几条」，故只改选取策略。
+# 但 2026-10-16 实测 golden_001 最终只采到 12 URL / 32 chunk，远低于设计预期
+# （40 URL / 80~120 chunk）→「采满 8」并非普遍情况；是否扩容须先看采集漏斗日志。
+_PER_COMPETITOR_PAGE_CAP = 8
+
+
+def _host_of(url: str) -> str:
+    """取 URL 的主机名（小写、去端口）；非法输入返回空串。"""
+    from urllib.parse import urlparse
+
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except (ValueError, TypeError):
+        return ""
+    return host
+
+
+def _is_official_host(url: str, official_domains) -> bool:
+    """URL 的主机是否落在「官网域」下（含子域）。
+
+    ⚠️ 官网域由 LLM 顺带产出，**可能不准**。这里只把它当**排序提示**，
+    不做过滤——猜错时最坏情况是「没有提示」，等价于纯轮转，不会误删候选。
+    """
+    host = _host_of(url)
+    if not host:
+        return False
+    for d in official_domains or ():
+        d = (d or "").strip().lower().lstrip(".")
+        if d and (host == d or host.endswith("." + d)):
+            return True
+    return False
+
+
+def select_competitor_urls(
+    candidates: list[dict],
+    cap: int = _PER_COMPETITOR_PAGE_CAP,
+    official_domains=(),
+) -> list[dict]:
+    """从某竞品的候选搜索结果中选出 cap 条 —— 「每 query 内官网优先 + 跨 query 轮转」。
+
+    【为什么必须改掉原来的「顺序拼接取前 8」】
+    ───────────────────────────────────────
+    `all_queries` 是按「竞品 → 关键词」顺序拼的，候选也按这个顺序 append，
+    再直接 `[:8]`。后果是**第一个 query 的结果会吃掉整个配额**：
+      · 实测 golden_002「语雀」采到的 8 页来自 8 个**不同第三方域名**，
+        官网 yuque.com 一页都没有；
+      · 38 个 (任务,竞品) 组合里 32 个正好采满 8 页（上限 100% 触顶），
+        但其中 13 个组合「官方域零覆盖」——可见瓶颈是**怎么选**而不是「选几条」，
+        单纯把 8 提到 12 只会多抓第三方页。
+
+    【两条规则的分工】
+      ① 轮转（round-robin）：保证每个 query 都进候选，单条 query 不再垄断配额；
+      ② 官网优先（**组内**稳定排序）：官网原文是 context_precision / faithfulness
+         的 ground truth 来源，让它在自己那条 query 的候选里排到最前。
+         注意是「组内优先」而非「全局置顶」——若全局置顶，像飞书这种
+         50+ 个 feishu.cn 结果的竞品又会退回「8 页全同一个站」，丢掉多 query 的信息量。
+
+    Args:
+        candidates: 候选 dict 列表，每项须含 "url"，且应含 "query"（用于分组轮转）。
+        cap: 最终保留条数。
+        official_domains: LLM 顺带产出的官网域（仅作提示，不做过滤）。
+
+    Returns:
+        选中的候选（保序），长度 ≤ cap。
+    """
+    if cap <= 0 or not candidates:
+        return []
+
+    # ① 按 query 分组（保序：首次出现顺序即 query 顺序），组内官网优先
+    groups: list[list[dict]] = []
+    index_of: dict[str, int] = {}
+    for c in candidates:
+        q = c.get("query") or ""
+        if q not in index_of:
+            index_of[q] = len(groups)
+            groups.append([])
+        groups[index_of[q]].append(c)
+    for g in groups:
+        off = [c for c in g if _is_official_host(c.get("url", ""), official_domains)]
+        rest = [c for c in g if not _is_official_host(c.get("url", ""), official_domains)]
+        g[:] = off + rest
+
+    # ② 跨 query 轮转取满 cap
+    picked: list[dict] = []
+    depth = 0
+    while len(picked) < cap:
+        progressed = False
+        for g in groups:
+            if depth < len(g):
+                picked.append(g[depth])
+                progressed = True
+                if len(picked) >= cap:
+                    break
+        if not progressed:
+            break
+        depth += 1
+
+    return picked
 
 
 # 【L4 工程】错误信息提取——降级日志只打根因，不打完整堆栈
@@ -103,7 +257,7 @@ async def _generate_keywords(
     dimensions: list[str],
     llm: ChatDeepSeek,
     usage_acc: dict[str, int] | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """LLM 生成多样化搜索关键词（伪布尔检索问题 → 语义化 query）。
 
     【L3 核心考点】为什么不用简单的 "{竞品} {维度}" 模板？
@@ -127,6 +281,18 @@ async def _generate_keywords(
     try/except 捕获一切异常 → 模板拼接兜底：
       "{竞品} {维度1}", "{竞品} {维度2}", ...
     保证至少每个维度有一条 query，不会出现零搜索结果。
+
+    【2026-10-14 新增】顺带产出「官网域」official_domains
+    ───────────────────────────────────────────────
+    为什么复用这次调用而不是新加一次？—— 竞品官网域是「这句话的常识」，
+    同一 prompt 里多要一个字段，零额外调用成本。
+    它只被用作 select_competitor_urls 的**排序提示**（猜错最坏等于没提示），
+    不做候选过滤，故 LLM 偶发幻觉不会误删结果。
+
+    Returns:
+        (keywords, official_domains)
+        keywords          搜索 query 列表（非空；LLM 失败时退化为模板拼接）
+        official_domains  竞品官网域列表（可能为空——空即「无提示」）
     """
     dims_str = json.dumps(dimensions, ensure_ascii=False)
     prompt = _KEYWORD_PROMPT % (competitor, dims_str)
@@ -146,44 +312,28 @@ async def _generate_keywords(
             if not text:
                 raise ValueError("LLM returned empty response (attempt %d)" % (attempt + 1))
 
-            # 清理可能的 markdown 代码块包裹
-            # 【2026-07-29 强化】兼容更多格式变体：```json\n...```、```list\n...```、
-            # 甚至直接 ```[...]```（无语言标识）
-            if text.startswith("```"):
-                # 去掉开头的 ``` 及可选的语言标识行
-                # 格式: ```json\n...\n``` 或 ```\n...\n``` 或 ```[...]```
-                cleaned = text[3:]  # 去掉前3个反引号
-                newline_idx = cleaned.find("\n")
-                if newline_idx >= 0:
-                    cleaned = cleaned[newline_idx:].strip()
-                else:
-                    # 无换行：结尾是 ``` → 去掉
-                    if cleaned.endswith("```"):
-                        cleaned = cleaned[:-3].strip()
-                    else:
-                        cleaned = cleaned.strip()
-                # 去掉结尾的 ```
-                if cleaned.endswith("```"):
-                    cleaned = cleaned[:-3].strip()
-                text = cleaned
-
-            # 【2026-07-29 强化】兼容 "前面解释+JSON" 格式
-            # 在 LLM 不遵守"只输出 JSON"时，从文本中提取 [ 到 ] 部分
-            if not text.startswith("["):
-                bracket_idx = text.find("[")
-                if bracket_idx >= 0:
-                    bracket_end = text.rfind("]")
-                    if bracket_end > bracket_idx:
-                        text = text[bracket_idx:bracket_end + 1]
-
+            # 剥出 JSON 主体（兼容 markdown 围栏 / 前后有解释文字 / 对象或数组两种形态）
+            text = _extract_json_payload(text)
             # 【2026-07-29 强化】空值二次防御 + JSONDecodeError 重试
             if not text or not text.strip():
                 raise ValueError("LLM output became empty after extraction (attempt %d)" % (attempt + 1))
 
-            keywords = json.loads(text)
+            payload = json.loads(text)
+            # 新格式：{"queries": [...], "official_domains": [...]}
+            # 旧格式：裸列表 ["query1", ...]（兼容历史 prompt / LLM 简化输出）
+            if isinstance(payload, dict):
+                keywords = payload.get("queries") or []
+                domains = payload.get("official_domains") or []
+            else:
+                keywords, domains = payload, []
+            domains = [d.strip() for d in domains if isinstance(d, str) and d.strip()]
+
             if isinstance(keywords, list) and len(keywords) > 0:
-                logger.info("日志：LLM为 %r 生成了 %d 个关键词", competitor, len(keywords))
-                return keywords
+                logger.info(
+                    "日志：LLM为 %r 生成了 %d 个关键词，官网域=%s",
+                    competitor, len(keywords), domains or "（未提供）",
+                )
+                return keywords, domains
             else:
                 raise ValueError("LLM returned non-list or empty list (attempt %d)" % (attempt + 1))
 
@@ -221,7 +371,7 @@ async def _generate_keywords(
     "飞书 技术架构"
     ]
     """
-    return [f"{competitor} {dim}" for dim in dimensions]
+    return [f"{competitor} {dim}" for dim in dimensions], []
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -356,10 +506,15 @@ async def collector_agent(
     # 不并行化（llm.ainvoke 不支持同时多请求，除非用多 key 池）
     all_queries: list[tuple[str, str]] = []  # (competitor, query)
     per_competitor_keywords: dict[str, list[str]] = {}  # 记录每个竞品的关键词生成结果
+    # 【2026-10-14】每个竞品的官网域（LLM 顺带产出）→ 供 URL 选取做「官网优先」排序提示
+    official_domains_by_competitor: dict[str, list[str]] = {}
     gen_usage: dict[str, int] = {}  # 【2026-10-01】累计关键词生成的 token 用量
     for competitor in competitors:
-        keywords = await _generate_keywords(competitor, dimensions, llm, gen_usage)
+        keywords, official_domains = await _generate_keywords(
+            competitor, dimensions, llm, gen_usage
+        )
         per_competitor_keywords[competitor] = keywords
+        official_domains_by_competitor[competitor] = official_domains
         # 每个关键词搜索一次（不去重，留给后面的 seen_urls 处理）
         for kw in keywords:
             all_queries.append((competitor, kw))
@@ -371,7 +526,11 @@ async def collector_agent(
         response={
             "total_queries": len(all_queries),
             "per_competitor": {
-                c: {"keyword_count": len(kws), "keywords": kws}
+                c: {
+                    "keyword_count": len(kws),
+                    "keywords": kws,
+                    "official_domains": official_domains_by_competitor.get(c, []),
+                }
                 for c, kws in per_competitor_keywords.items()
             },
         },
@@ -409,15 +568,17 @@ async def collector_agent(
             # （5 关键词 × 3 = 15 候选，再被相关性过滤砍到个位数），采集覆盖不足。
             resp = await mcp_server.call_tool("web_search", {"query": query, "max_results": 10})
             # 【L4 工程】MCP 错误处理：不因为单条搜索失败而阻塞整个 gather
+            # 【2026-10-14】返回值带上 query —— 后续 URL 选取要按 query 轮转，
+            #   必须知道每个候选来自哪条 query（否则还是会退回「先到先得」）。
             if resp.get("isError"):
-                return (competitor, [])
+                return (competitor, query, [])
             try:
                 results = json.loads(resp["content"][0]["text"])
-                return (competitor, results)
+                return (competitor, query, results)
             except Exception as e:
                 logger.warning("搜索结果 JSON 解析失败 competitor=%s query=%s: %s",
                                 competitor, query[:50], e)
-                return (competitor, [])
+                return (competitor, query, [])
 
     search_tasks = [_search_one(c, q) for (c, q) in all_queries]
     t_search = time.perf_counter()
@@ -426,7 +587,7 @@ async def collector_agent(
     # ── ✏️ 日志：搜索完成（含每个竞品的搜索结果明细）──
     search_detail: dict[str, dict] = {}
     total_results = 0
-    for competitor, results in search_results:
+    for competitor, _q, results in search_results:
         if competitor not in search_detail:
             search_detail[competitor] = {"total": 0, "sample_urls": []}
         search_detail[competitor]["total"] += len(results)
@@ -514,9 +675,29 @@ async def collector_agent(
     competitor_urls: dict[str, list[dict]] = {c: [] for c in competitors}
     skipped_dead: int = 0  # 跳过的死链域名计数（反爬/境外双抓不到）
     skipped_irrelevant: int = 0  # 跳过的无关搜索结果计数
-    for competitor, results in search_results:
+
+    # 【2026-10-16 新增】采集漏斗计数（按竞品）——用于定位「检索池为什么这么小」
+    #  ── 为什么需要它 ──
+    #  实测（task 33a0856e，golden_001）最终只采到 12 URL / 32 chunk，而设计注释
+    #  预期 40 URL / 80~120 chunk。但从**最终结果**反推不出瓶颈在哪一步，而四种
+    #  可能性的修复动作、成本、收益完全不同：
+    #    · Tavily 本身没返回够候选   → 调 TAVILY_MAX_RESULTS
+    #    · 全局 URL 去重吃掉候选     → 改去重范围（见下方 ⚠️）
+    #    · 死链/相关性过滤砍多了     → 调黑名单或匹配口径
+    #    · select_competitor_urls 截断 → 调 _PER_COMPETITOR_PAGE_CAP
+    #  所以必须把中间量落成日志——这也是唯一零成本拿到该数据的方式。
+    #  ⚠️ 本埋点顺带暴露的隐患：seen_urls 是**全局**的，而该循环按 (竞品, query)
+    #    串行处理 → **先处理的竞品优先占用 URL**，后处理的竞品可能因「同一 URL 已
+    #    被前面竞品拿走」而候选不足。funnel 的 dup 列即为此项。
+    funnel: dict[str, dict[str, int]] = {
+        c: {"raw": 0, "dup": 0, "dead": 0, "irrelevant": 0, "kept": 0}
+        for c in competitors
+    }
+
+    for competitor, _q, results in search_results:
         filter_terms = _build_relevance_filter(competitor)
         for r in results:
+            funnel[competitor]["raw"] += 1
             url = r.get("url", "")
             raw = r.get("raw_content", "")
             if url and url not in seen_urls:
@@ -528,38 +709,93 @@ async def collector_agent(
                     host = ""
                 if not raw and _is_dead_domain(host):
                     skipped_dead += 1
+                    funnel[competitor]["dead"] += 1
                     continue
                 # 结果相关性过滤：标题+snippet不包含竞品关键词 → 跳过
                 if not _result_relevant(
                     r.get("title", ""), r.get("snippet", ""), filter_terms
                 ):
                     skipped_irrelevant += 1
+                    funnel[competitor]["irrelevant"] += 1
                     continue
                 seen_urls.add(url)
+                funnel[competitor]["kept"] += 1
                 competitor_urls[competitor].append({
                     "url": url,
                     "title": r.get("title", ""),
                     "snippet": r.get("snippet", ""),
                     "raw_content": r.get("raw_content", ""),  # Tavily 预取正文（SPA 已渲染）
+                    # 【2026-10-14】记录候选来自哪条 query —— URL 选取要按 query 轮转
+                    "query": _q,
                 })
+            elif url:
+                # URL 已被占用：可能来自本竞品的前一条 query，也可能来自
+                # **先处理的竞品**（seen_urls 是全局集合）——后者会随 competitors
+                # 的传入顺序放大不公平，是「某个竞品池子莫名偏小」的候选成因。
+                funnel[competitor]["dup"] += 1
     if skipped_dead:
         logger.info("日志：跳过 %d 个死链域名URL（zhihu/pinterest/google/reddit等，双抓不到）", skipped_dead)
     if skipped_irrelevant:
         logger.info("日志：跳过 %d 个不相关搜索结果（标题不包含竞品关键词）", skipped_irrelevant)
 
     # ── ✏️ 日志：最终保留待抓取的 URL ──
-    # 这些 URL 已通过完整过滤链：全局去重 → 反爬域名黑名单 → 相关性过滤 → 每竞品截断8条
+    # 过滤链：全局去重 → 反爬域名黑名单 → 相关性过滤 → **每 query 官网优先 + 跨 query 轮转选 8 条**
+    # 【2026-10-14】最后一步由「按顺序取前 8」改为 select_competitor_urls：
+    #   旧实现让第一条 query 的结果吃掉整个配额（实测 38 个组合里 32 个采满 8 页，
+    #   却有 13 个官方域零覆盖）——瓶颈在「怎么选」，不在「选几条」。
+    selected_urls: dict[str, list[dict]] = {
+        c: select_competitor_urls(
+            competitor_urls[c],
+            # 【2026-10-16】配额提升为配置（默认 8，与原常量一致）。
+            # 是否调大取决于「采集漏斗」日志：若 候选池 大而 配额选中 小 → 配额是瓶颈；
+            # 若 候选池 本身就小 → 瓶颈在上游，调配额无效。
+            cap=settings.per_competitor_page_cap,
+            official_domains=official_domains_by_competitor.get(c, ()),
+        )
+        for c in competitors
+    }
+
     final_url_lines: list[str] = []
     final_total: int = 0
     for c in competitors:
-        kept = [u["url"] for u in competitor_urls[c][:8]]
+        kept = [u["url"] for u in selected_urls[c]]
         final_total += len(kept)
+        off_hit = sum(
+            1 for u in selected_urls[c]
+            if _is_official_host(u["url"], official_domains_by_competitor.get(c, ()))
+        )
         final_url_lines.append(
-            f"  {c}({len(kept)}条): " + (" | ".join(kept) if kept else "无")
+            f"  {c}({len(kept)}条,官网{off_hit}条): "
+            + (" | ".join(kept) if kept else "无")
         )
     logger.info(
         "【Collector】最终保留URL task=%s 共%d条\n%s",
         task_id, final_total, "\n".join(final_url_lines),
+    )
+
+    # ── ✏️ 日志：采集漏斗（按竞品）—— 回答「池子为什么这么小」 ──
+    # 读法（从左往右逐层砍）：
+    #   raw        = Tavily 返回的原始候选（未去重）
+    #   dup        = URL 已被占用而跳过（全局去重；含被先处理竞品抢走的部分）
+    #   dead       = 反爬/境外黑名单且无预取正文
+    #   irrelevant = 标题+snippet 不含竞品关键词
+    #   kept       = 进入候选池（交给 select_competitor_urls）
+    #   配额选中    = 截断之后（这才是真正送去抓的）
+    # 【怎么用这张表】
+    #   · kept 本身就小              → 瓶颈在上游（搜索候选不足 / 过滤过严），调配额无用
+    #   · kept 大而「配额选中」小     → 瓶颈是 _PER_COMPETITOR_PAGE_CAP，调配额有效
+    #   · dup 显著偏大               → 全局去重 + 竞品顺序在吃候选，该改去重范围而非配额
+    funnel_lines = [
+        (
+            f"  {c}: 原始{funnel[c]['raw']} → 重复跳过{funnel[c]['dup']}"
+            f" / 死链{funnel[c]['dead']} / 无关{funnel[c]['irrelevant']}"
+            f" → 候选池{funnel[c]['kept']} → 配额选中{len(selected_urls[c])}"
+        )
+        for c in competitors
+    ]
+    logger.info(
+        "【Collector】采集漏斗 task=%s\n%s",
+        task_id, "\n".join(funnel_lines),
     )
 
     # ──────────── 步骤3: 并发抓取网页内容 ────────────
@@ -583,11 +819,12 @@ async def collector_agent(
         """
         url = page_info["url"]
 
-        # ── Tavily 预取正文：CJK 足够时直接使用，不调 web_fetch ──
+        # ── Tavily 预取正文：可读正文足够时直接使用，不调 web_fetch ──
         raw = page_info.get("raw_content", "")
         if raw:
-            cjk = sum(1 for ch in raw if '\u4e00' <= ch <= '\u9fff')
-            if cjk >= _MIN_CJK_CHARS:
+            # 【2026-10-14】门禁口径与步骤4统一：先规整再数「可读字符」（CJK+拉丁），
+            # 使英文正文（Notion/Atlassian 等）也能走直通，不再被 CJK-only 口径拒之门外。
+            if readable_char_count(normalize_text(raw)) >= _MIN_READABLE_CHARS:
                 return (competitor, {
                     "url": url,
                     "title": page_info["title"],
@@ -615,8 +852,8 @@ async def collector_agent(
                 return (competitor, {"url": url, "title": page_info["title"], "text": ""})
 
     fetch_tasks = []
-    for competitor, urls in competitor_urls.items():
-        for u in urls[:8]:  # 每竞品最多 8 条 URL
+    for competitor, urls in selected_urls.items():
+        for u in urls:  # 已由 select_competitor_urls 截到 per_competitor_page_cap 条
             fetch_tasks.append(_fetch_one(competitor, u))
 
     t_fetch = time.perf_counter()
@@ -653,23 +890,28 @@ async def collector_agent(
     #  httpx 只能拿到 HTML 源码，不能执行 JS → 现代 SPA 网站（pvp.qq.com、douban）
     #  返回的 text 只有导航栏、页脚、loading 文案等 20~100 字符的骨架。
     #  这些页面嵌入后变成噪音向量，污染 RAG 检索结果 → Analyzer [数据不足]。
-    #  修复：统计中文汉字密度（CJK Unified Ideographs），< 200 汉字 → 丢弃。
+    # 【2026-10-14 升级】门禁口径从「CJK 汉字数」改为「可读字符数（CJK + 拉丁字母）」：
+    #  ① 旧口径把英文官网页（CJK=0）整页误杀，是官方源覆盖不足的隐藏成因；
+    #  ② 在门禁前先做 normalize（剥离 URL/图片/data URI 标记），
+    #     使「被一屏图片路径撑满、实际无正文」的页也能被正确判空。
     all_texts: list[str] = []
     text_meta: list[dict] = []  # {competitor, url, title, chunk_texts: [...]}
     discarded_pages: int = 0
+    dropped_chunks: int = 0  # 【2026-10-14】被 chunk 级质控剔除的样板块数
     for competitor, page in fetch_results:
         result[competitor]["pages"].append(page)
         if page["text"]:
-            # ── 内容质量门禁：统计有效汉字数 ──
-            cjk_count = sum(1 for ch in page["text"] if '\u4e00' <= ch <= '\u9fff')
-            if cjk_count < _MIN_CJK_CHARS:
+            # ── 内容质量门禁：规整后统计有效可读字符 ──
+            norm_text = normalize_text(page["text"])
+            readable = readable_char_count(norm_text)
+            if readable < _MIN_READABLE_CHARS:
                 discarded_pages += 1
                 logger.info(
-                    "日志：丢弃低质量页面 competitor=%r url=%s CJK=%d（阈值=%d）",
-                    competitor, page["url"], cjk_count, _MIN_CJK_CHARS,
+                    "日志：丢弃低质量页面 competitor=%r url=%s 可读=%d（阈值=%d）",
+                    competitor, page["url"], readable, _MIN_READABLE_CHARS,
                 )
                 continue  # 跳过 SPA 骨架页面，不进入分块和嵌入
-            all_texts.append(page["text"])
+            all_texts.append(norm_text)
             text_meta.append({
                 "competitor": competitor,
                 "url": page["url"],
@@ -681,8 +923,45 @@ async def collector_agent(
 
     for i, text in enumerate(all_texts):
         chunks = _chunk_text(text)
-        if chunks:
-            text_meta[i]["chunk_texts"] = chunks
+        # 【2026-10-14 新增】chunk 级质控（写库前的最后一道门）
+        #  ── 为什么页面级门禁不够？──
+        #  一个页面 = 正文 + 导航 + 页脚 + 目录树。页面整体可读字符达标（能过页级门禁），
+        #  但其中「导航/页脚/目录/图片墙」切出来的 chunk 是纯样板。
+        #  实测（baseline=runs/20261013-230903，1352 chunk）：样板块占 14%，
+        #  且 cross-encoder 精排后样板占比不降反升（导航里竞品名重复密度高，
+        #  与 query「竞品 维度」字面重合）→ 近 6 成喂给 LLM 的证据是垃圾。
+        #  ── 为什么在「嵌入之前」剔除？──
+        #  embedding 按 token 计费：样板块入库 = 白花钱 + 永久占用检索池 + 污染召回。
+        #  在源头剔除，成本与噪音双降。
+        kept_chunks = [c for c in chunks if not is_boilerplate_chunk(c)]
+        dropped_chunks += len(chunks) - len(kept_chunks)
+        if kept_chunks:
+            # 规整化后再落库：DB 里存的就是「可读正文」，检索/精排/评估全链路受益。
+            text_meta[i]["chunk_texts"] = [clean_chunk_text(c) for c in kept_chunks]
+    if dropped_chunks:
+        logger.info(
+            "日志：chunk 级质控剔除 %d 个样板 chunk（导航/页脚/目录/图片墙）",
+            dropped_chunks,
+        )
+
+    # ── ✏️ 日志：最终落库规模（按竞品）—— 这就是 Analyzer 的检索池 ──
+    # 【为什么要单独打这条】
+    #  Analyzer 的向量检索 top_k=60 是**绝对值**，而检索池是按 task 混池
+    #  （similarity_search 的 WHERE 里只有 task_id）。当池子 < top_k 时，
+    #  向量检索退化为「全量返回」→ 维度区分度归零（详见 analyzer.py 对应注释）。
+    #  所以「池子规模」是判断检索是否已退化的关键输入，必须可见——
+    #  这类退化此前一直是静默的，正是问题能潜伏至今的原因。
+    per_comp_chunks: dict[str, int] = {c: 0 for c in competitors}
+    for meta in text_meta:
+        per_comp_chunks[meta["competitor"]] = (
+            per_comp_chunks.get(meta["competitor"], 0) + len(meta["chunk_texts"])
+        )
+    logger.info(
+        "【Collector】最终落库规模 task=%s 合计 %d chunk（Analyzer 检索池）\n%s",
+        task_id,
+        sum(per_comp_chunks.values()),
+        "\n".join(f"  {c}: {n} chunk" for c, n in per_comp_chunks.items()),
+    )
 
     # ──────────── 步骤5+6: 批量嵌入 + 批量写入 ────────────
     # 【L4 工程】为什么分两步（embed + insert）而不是边 embed 边 insert？

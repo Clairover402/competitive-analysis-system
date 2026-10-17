@@ -208,7 +208,10 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embedding_hnsw
 --       （2026-10-12 校正：与 analyzer.py 实际传参一致；此前注释写 30/20 是过期值）
 --     - reranked_urls/texts = Cross-encoder 精排后 TopK=15 的 url/text
 --   reranked_texts 才是 RAGAS context_precision 该吃的 retrieved_contexts。
---   recalled_urls 则用于 recall_hit_rate（召回覆盖度）的域名对拍。
+--   recalled_urls 则用于 source_coverage（关键来源覆盖率）的域名对拍。
+--     （该指标 2026-10-14 由 recall_hit_rate 改名：原名易被误读为 ragas
+--      context_recall，实际度量的是「标准答案的域名锚点有多少进了候选池」。
+--      改名前的历史行 metric_name 仍是 recall_hit_rate。）
 --
 -- 【L4 工程】为什么 recalled 和 reranked 都要存？
 --   评估「召回」和「精排」是两个不同问题：recalled_urls 测召回是否漏，
@@ -222,8 +225,12 @@ CREATE TABLE IF NOT EXISTS retrieval_snapshot (
     recalled_urls   JSONB NOT NULL DEFAULT '[]',  -- 召回全集 URL（向量∪关键词去重后）
     reranked_urls   JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 URL（保持排序）
     reranked_texts  JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 chunk 原文（与 url 对齐）
+    response_text   TEXT,                         -- 该 (竞品@维度) 的 LLM 分析结论（RAGAS response 输入）
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- 兼容已存在的 retrieval_snapshot 表：新增列不会由 CREATE TABLE IF NOT EXISTS 自动补齐。
+ALTER TABLE retrieval_snapshot ADD COLUMN IF NOT EXISTS response_text TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_snapshot_task_dim
     ON retrieval_snapshot (task_id, dimension);
@@ -404,7 +411,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_writes (
 --
 -- 【L4 工程】eval_type 三值语义：
 --   generation = evaluate_task_with_ragas（成稿后，faithfulness/answer_relevancy）
---   retrieval  = evaluate_retrieval（检索阶段，context_precision/recall_hit_rate）
+--   retrieval  = evaluate_retrieval（检索阶段，context_precision/source_coverage）
 --   judge      = evaluate_with_judge（五维报告质量）
 CREATE TABLE IF NOT EXISTS eval_results (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -446,7 +453,8 @@ CREATE INDEX IF NOT EXISTS idx_eval_results_trend ON eval_results (eval_type, is
 CREATE TABLE IF NOT EXISTS eval_metric_scores (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     eval_id      UUID NOT NULL REFERENCES eval_results(id) ON DELETE CASCADE,
-    metric_name  VARCHAR(50) NOT NULL,     -- faithfulness / context_precision / recall_hit_rate / 完整性…
+    metric_name  VARCHAR(50) NOT NULL,     -- faithfulness / context_precision / source_coverage / 完整性…
+                                           -- ⚠️ 2026-10-14 前的历史行用 recall_hit_rate（同指标旧名）
     dimension    VARCHAR(50),              -- 所属维度（检索评估用），任务级指标为 NULL
     score        FLOAT NOT NULL,           -- 0~1（RAGAS）或 0~100（Judge 五维）
     weight       FLOAT,                    -- 该指标在总分中的权重（Judge 用，RAGAS 平均可 NULL）

@@ -376,7 +376,7 @@ class RetrievalSnapshotDAO:
     对象必须是检索阶段原始产出的 retrieved_contexts（精排后的原文），
     不能是「LLM 结论」或「事后按 URL 反查的 chunk」。故 analyzer 在
     精排完成、喂 LLM 前，把召回全集 + 精排 TopK 原样落 retrieval_snapshot。
-    召回全集 recalled_urls 另用于 recall_hit_rate（域名对拍）度量召回是否漏。
+    召回全集 recalled_urls 另用于 source_coverage（域名对拍）度量关键来源是否覆盖。
     """
 
     def __init__(self, pool: asyncpg.Pool) -> None:
@@ -391,19 +391,21 @@ class RetrievalSnapshotDAO:
         reranked_urls: list[str],
         reranked_texts: list[str],
         competitor: str | None = None,
-    ) -> None:
+    ) -> str | None:
         """落一条检索快照（竞品×维度粒度的检索中间结果）。
 
         :param competitor: 该快照所属竞品名；None 表示旧「维度级」快照（历史兼容）。
+        :return: 新快照的 id（str）；落盘失败由调用方捕获，不在此返回。
         """
         import json
 
         async with self._pool.acquire() as conn:
-            await conn.execute(
+            snapshot_id = await conn.fetchval(
                 """INSERT INTO retrieval_snapshot
                    (task_id, dimension, competitor, query, recalled_urls,
                     reranked_urls, reranked_texts)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING id""",
                 task_id,
                 dimension,
                 competitor,
@@ -411,6 +413,18 @@ class RetrievalSnapshotDAO:
                 json.dumps(recalled_urls, ensure_ascii=False),
                 json.dumps(reranked_urls, ensure_ascii=False),
                 json.dumps(reranked_texts, ensure_ascii=False),
+            )
+            return str(snapshot_id) if snapshot_id else None
+
+    async def set_response_text(self, snapshot_id: str, response_text: str) -> None:
+        """回填快照的 response_text（该 (竞品@维度) 的 LLM 分析结论）。"""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE retrieval_snapshot
+                   SET response_text = $2
+                   WHERE id = $1""",
+                snapshot_id,
+                response_text,
             )
 
     async def get_by_task(self, task_id: str) -> list[dict]:

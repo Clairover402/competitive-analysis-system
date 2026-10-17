@@ -487,7 +487,7 @@
             "uid": "cas-postgres"
           },
           "format": "table",
-          "rawSql": "SELECT $__timeGroup(m.created_at,'1d') AS time, m.metric_name AS metric, ROUND(AVG(m.score)::numeric,3) AS value FROM eval_metric_scores m JOIN eval_results e ON m.eval_id = e.id WHERE m.metric_name IN ('faithfulness','context_precision','answer_relevancy','recall_hit_rate') AND $__timeFilter(m.created_at) GROUP BY 1,2 ORDER BY 1",
+          "rawSql": "SELECT $__timeGroup(m.created_at,'1d') AS time, m.metric_name AS metric, ROUND(AVG(m.score)::numeric,3) AS value FROM eval_metric_scores m JOIN eval_results e ON m.eval_id = e.id WHERE m.metric_name IN ('faithfulness','context_precision','answer_relevancy','recall_hit_rate','source_coverage') AND $__timeFilter(m.created_at) GROUP BY 1,2 ORDER BY 1",
           "editorMode": "code"
         }
       ],

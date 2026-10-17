@@ -44,12 +44,31 @@ def main() -> None:
 
     # 【L4 工程】全局日志配置——INFO 级别才能看到 Pipeline 节点日志
     # 默认 WARNING 过滤掉所有 INFO，导致中间节点静默执行
+    _log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=_log_fmt,
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
+    # 【2026-10-16 修复】此前 observability/logging.py 的 setup_logging() 带文件落盘
+    # 但全仓库无人调用，导致 logs/ 恒为空、跑完任务无法事后 grep 排查。
+    # 这里直接在 root 上追加 RotatingFileHandler：控制台 + 文件双通道。
+    try:
+        from logging.handlers import RotatingFileHandler
+        _log_dir = _os.environ.get("LOG_DIR", "logs")
+        _os.makedirs(_log_dir, exist_ok=True)
+        _fh = RotatingFileHandler(
+            _os.path.join(_log_dir, "app.log"),
+            maxBytes=10 * 1024 * 1024,  # 10MB
+            backupCount=5,
+            encoding="utf-8",
+        )
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(logging.Formatter(_log_fmt, datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(_fh)
+    except Exception as _e:  # 日志落盘失败不应阻断服务启动
+        print(f"[warn] 日志文件落盘初始化失败: {_e}")
     parser = argparse.ArgumentParser(
         description="竞品分析多Agent协作系统",
     )

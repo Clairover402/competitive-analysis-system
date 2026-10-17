@@ -1,34 +1,37 @@
 # -*- coding: utf-8 -*-
-"""评估体系 — 公开导出。
+"""评估体系 — 上线前的回归测试，不是生产运行时的一环。
 
-评估模块负责竞品分析系统的质量门禁：
-  — golden_dataset: 10 条 Golden Case（easy/medium/hard 三档）
-  — ragas_llm: 真 ragas 库评估（LLM-as-Judge，检索质量 + 生成质量）
-  — judge_eval: LLM-as-Judge 五维评分 + 模型隔离
+═══════════════════════════════════════════════════════════════════════════════
+                              【模块结构（只有三个）】
+═══════════════════════════════════════════════════════════════════════════════
+
+  golden_dataset.py  10 条 Golden Case（easy/medium/hard）+ 分维度/分 cell 标准答案
+  llm_factory.py     judge / embeddings / RunConfig 构造 + reference 解析
+  ragas_core.py      四指标唯一实现（context_precision / context_recall /
+                     faithfulness / answer_relevancy）+ CLI
+
+  ⚠️ 本模块**刻意不做 re-export**：直接 `from src.evaluation.ragas_core import ...`。
+     旧版 `__init__.py` 把所有符号再导出一次，导致任何一个 import 都会把
+     ragas / langchain 全链路（含 DB、Prometheus）拖进来。评估是离线工具，
+     不配当"包级门面"。
+
+═══════════════════════════════════════════════════════════════════════════════
+                            【定位：回归测试，不是运行时】
+═══════════════════════════════════════════════════════════════════════════════
+
+  发版前显式跑 `python -m src.evaluation.ragas_core --golden`，生产链路零评估开销。
+
+  为什么不能自动跑：
+    1. 语义错位——RAGAS 核心是拿标准答案对拍；真实用户任务没有标准答案，
+       打出来的是无参照系的分数，只在**版本回归**（和上一版对比）里才有意义。
+    2. 成本错配——评估要额外调 LLM 做裁判，每个生产任务都付一次，
+       换来的是用户根本不看的数字。
+    3. 观测误导——生产自动产生的分数与发版前 Golden 回归分数是两种口径，
+       画在同一条曲线上会误读涨跌。
+
+  【2026-10-17 架构简化】旧链路（ragas_llm 四指标双实现 / golden_run 归档 diff /
+  runner 编排与 Prometheus 上报 / judge_eval 五维报告评分 / cli 旧入口）已整体删除。
+  被删能力的共同点：**从未真正投入使用**（趋势面板无历史数据、门禁未卡过发布、
+  归档目录没有一次真实 baseline）。留着只会让"改一处算法要动六个文件"的老问题复活。
+  详见 竞品分析系统_RAGAS评估重构总纲_2026-10-17.md。
 """
-
-from src.evaluation.golden_dataset import (  # noqa: F401
-    GOLDEN_DATASET,
-    GoldenCase,
-    get_by_difficulty,
-    get_pipeline_cases,
-    get_reference,
-    get_reference_by_dimension,
-    get_reference_domains,
-    get_supervisor_cases,
-)
-from src.evaluation.judge_eval import (  # noqa: F401
-    JudgeScores,
-    build_judge_prompt,
-    evaluate_with_judge,
-)
-from src.evaluation.ragas_llm import (  # noqa: F401
-    JUDGE_MODEL as RAGAS_JUDGE_MODEL,
-    evaluate_retrieval,
-    evaluate_task_with_ragas,
-)
-from src.evaluation.runner import (  # noqa: F401
-    evaluate_task_full,
-    run_batch,
-    run_golden_checks,
-)

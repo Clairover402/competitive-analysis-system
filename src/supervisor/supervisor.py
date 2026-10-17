@@ -1173,6 +1173,9 @@ async def run_supervisor_task(
     # 的生成质量评估和 Judge 五维评估被整体跳过（generation/judge 恒 null）。
     # pipeline 路径在 finalize 节点有 TaskDAO.update_status("completed")，
     # supervisor 缺失等价动作，在此补齐。
+    # （2026-10-15 注：评估已不再是生产任务完成后的自动钩子，但 status 正确
+    #   回写仍然必要——发版前的 CLI / Golden 回归评估同样按
+    #   `status == "completed"` 取任务，否则照样整体跳过。）
     is_complete = final_state.get("is_complete", True)
     if is_complete:
         try:

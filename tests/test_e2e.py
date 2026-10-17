@@ -263,9 +263,9 @@ class TestGoldenDataset:
             assert "competitors" in case
             assert "dimensions" in case
             assert "difficulty" in case
-            assert "reference" in case
             assert "reference_by_dimension" in case
-            assert "reference_domains" in case
+            # 整段 `reference` 已于 2026-10-13 删除（零代码消费），不应回潮
+            assert "reference" not in case
             assert case["difficulty"] in ("easy", "medium", "hard")
 
     def test_difficulty_distribution(self):
@@ -293,95 +293,3 @@ class TestGoldenDataset:
         # Supervisor 用例 competitors 必须为空
         for case in supervisor:
             assert len(case["competitors"]) == 0
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Judge 评估测试（离网 —— 不依赖 LLM API）
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestJudgeEval:
-    """LLM-as-Judge 评估函数正确性验证。"""
-
-    def test_judge_scores_weighted(self):
-        """五维加权公式：完整性×30+准确性×30+可追溯性×20+可读性×10+客观性×10。"""
-        from src.evaluation.judge_eval import JudgeScores
-
-        scores = JudgeScores(完整性=80, 准确性=90, 可追溯性=70, 可读性=85, 客观性=75)
-        expected = 80 * 0.30 + 90 * 0.30 + 70 * 0.20 + 85 * 0.10 + 75 * 0.10
-        assert abs(scores.final_score - expected) < 0.01
-
-    def test_all_above_true(self):
-        """所有维度 >= 60 时返回 True。"""
-        from src.evaluation.judge_eval import JudgeScores
-
-        scores = JudgeScores(完整性=75, 准确性=80, 可追溯性=65, 可读性=70, 客观性=60)
-        assert scores.all_above(60) is True
-
-    def test_all_above_false(self):
-        """有维度 < 60 时返回 False。"""
-        from src.evaluation.judge_eval import JudgeScores
-
-        scores = JudgeScores(完整性=75, 准确性=80, 可追溯性=55, 可读性=70, 客观性=60)
-        assert scores.all_above(60) is False
-
-    def test_build_judge_prompt_format(self):
-        """Judge prompt 包含所有必需字段。"""
-        from src.evaluation.judge_eval import build_judge_prompt
-
-        prompt = build_judge_prompt(
-            title="测试任务",
-            competitors=["飞书", "钉钉"],
-            dimensions=["功能"],
-            report="这是一份测试报告",
-        )
-        assert "测试任务" in prompt
-        assert "飞书" in prompt
-        assert "钉钉" in prompt
-        assert "功能" in prompt
-        assert "测试报告" in prompt
-
-    def test_parse_judge_response_valid_json(self):
-        """解析有效的 JSON 评分响应。"""
-        from src.evaluation.judge_eval import _parse_judge_response
-
-        content = '{"完整性": 80, "准确性": 90, "可追溯性": 70, "可读性": 85, "客观性": 75, "摘要": "不错"}'
-        scores = _parse_judge_response(content)
-        assert scores.完整性 == 80
-        assert scores.准确性 == 90
-
-    def test_parse_judge_response_markdown_wrapped(self):
-        """解析有 markdown 代码块包裹的 JSON。"""
-        from src.evaluation.judge_eval import _parse_judge_response
-
-        content = '```json\n{"完整性": 60, "准确性": 70, "可追溯性": 50, "可读性": 80, "客观性": 90}\n```'
-        scores = _parse_judge_response(content)
-        assert scores.完整性 == 60
-        assert scores.准确性 == 70
-
-    def test_parse_judge_response_malformed(self):
-        """解析格式不完整的 JSON——正则兜底。"""
-        from src.evaluation.judge_eval import _parse_judge_response
-
-        content = '部分数据："完整性": 75, "准确性": 85'
-        scores = _parse_judge_response(content)
-        assert scores.完整性 == 75
-        assert scores.准确性 == 85
-
-    def test_heuristic_judge_fallback(self):
-        """启发式兜底——无 LLM 时返回有效评分。"""
-        from src.evaluation.judge_eval import _heuristic_judge
-
-        task = {
-            "title": "飞书 vs 钉钉",
-            "competitors": ["飞书", "钉钉"],
-            "dimensions": ["功能", "定价"],
-        }
-        report = "飞书在功能方面表现优秀 [来源1] https://example.com 定价方面钉钉更便宜"
-        result_str = _heuristic_judge(task, report)
-        result = json.loads(result_str)
-
-        assert 0 <= result["完整性"] <= 100
-        assert 0 <= result["准确性"] <= 100
-        assert 0 <= result["可追溯性"] <= 100
-        assert 0 <= result["可读性"] <= 100
-        assert 0 <= result["客观性"] <= 100
