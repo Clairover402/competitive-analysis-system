@@ -277,8 +277,11 @@ async def lifespan(app: FastAPI):
     app.state.log = BoundLogger(logger)
 
     # ── MCP Server + 连接池（全局单例）──
+    # audit 注入：让 5 个工具（含绕过 call_tool 的 3 个检索工具）的每次调用
+    # 都落 agent_logs，action='tool_call' —— 轨迹评估的 L2 数据源。
     from src.mcp import create_mcp_server
-    mcp_server = create_mcp_server(settings)
+    from src.db.dao import AgentLogDAO
+    mcp_server = create_mcp_server(settings, audit=AgentLogDAO(pool))
     app.state.mcp_server = mcp_server
 
     # ── Pipeline 图（预编译，所有 Pipeline 任务复用）──

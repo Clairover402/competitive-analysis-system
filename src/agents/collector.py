@@ -57,7 +57,6 @@ import tiktoken
 
 from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO
-from src.mcp.tools_rag import embed_texts
 from src.observability.token_usage import extract_usage, add_usage
 from src.agents.content_quality import (
     clean_chunk_text,
@@ -566,17 +565,21 @@ async def collector_agent(
         async with semaphore:
             # 【2026-09-26】max_results 由 3 → 10：原硬编码 3 导致候选池过小
             # （5 关键词 × 3 = 15 候选，再被相关性过滤砍到个位数），采集覆盖不足。
-            resp = await mcp_server.call_tool("web_search", {"query": query, "max_results": 10})
-            # 【L4 工程】MCP 错误处理：不因为单条搜索失败而阻塞整个 gather
+            # 【2026-10-19】改走 invoke 统一管控层：白名单/参数校验/审计过一遍，
+            #   且直接拿原生 list，不再手工 json.loads MCP 的 content 包装。
             # 【2026-10-14】返回值带上 query —— 后续 URL 选取要按 query 轮转，
             #   必须知道每个候选来自哪条 query（否则还是会退回「先到先得」）。
-            if resp.get("isError"):
-                return (competitor, query, [])
             try:
-                results = json.loads(resp["content"][0]["text"])
-                return (competitor, query, results)
+                results = await mcp_server.invoke(
+                    "web_search",
+                    {"query": query, "max_results": 10},
+                    task_id=task_id,
+                    agent_name="collector",
+                )
+                return (competitor, query, results or [])
             except Exception as e:
-                logger.warning("搜索结果 JSON 解析失败 competitor=%s query=%s: %s",
+                # 【L4 工程】不因为单条搜索失败而阻塞整个 gather
+                logger.warning("搜索失败 competitor=%s query=%s: %s",
                                 competitor, query[:50], e)
                 return (competitor, query, [])
 
@@ -832,24 +835,27 @@ async def collector_agent(
                 })
 
         async with semaphore:
-            resp = await mcp_server.call_tool("web_fetch", {"url": url, "max_chars": 15000})
-            if resp.get("isError"):
-                logger.warning("Fetch failed for %s", url)
-                return (competitor, {
-                    "url": url,
-                    "title": page_info["title"],
-                    "text": "",
-                    "error": resp["content"][0]["text"],
-                })
+            # 【2026-10-19】同 web_search：改走 invoke，拿原生 dict
             try:
-                data = json.loads(resp["content"][0]["text"])
+                data = await mcp_server.invoke(
+                    "web_fetch",
+                    {"url": url, "max_chars": 15000},
+                    task_id=task_id,
+                    agent_name="collector",
+                )
                 return (competitor, {
                     "url": url,
                     "title": data.get("title", page_info["title"]),
                     "text": data.get("text_content", ""),
                 })
-            except Exception:
-                return (competitor, {"url": url, "title": page_info["title"], "text": ""})
+            except Exception as e:
+                logger.warning("Fetch failed for %s: %s", url, e)
+                return (competitor, {
+                    "url": url,
+                    "title": page_info["title"],
+                    "text": "",
+                    "error": str(e),
+                })
 
     fetch_tasks = []
     for competitor, urls in selected_urls.items():
@@ -986,7 +992,15 @@ async def collector_agent(
         BATCH = 12
         for i in range(0, len(all_chunks), BATCH):
             batch = all_chunks[i:i + BATCH]
-            emb = await embed_texts(batch, settings)
+            # 【2026-10-19】embed_texts 此前是直接 import 调函数，绕过了
+            #   MCP 的白名单/参数校验/审计；改走 invoke 后与其他工具口径一致，
+            #   同时拿到「embedding 调了几次、每批多少条」的轨迹数据。
+            emb = await mcp_server.invoke(
+                "embed_texts",
+                {"texts": batch},
+                task_id=task_id,
+                agent_name="collector",
+            )
             embeddings.extend(emb)
 
         # 构造批量写入记录

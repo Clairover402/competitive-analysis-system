@@ -28,7 +28,7 @@ from src.mcp.tools_web import web_search, web_fetch
 from src.mcp.tools_rag import embed_texts, embed_query, rerank
 
 
-def create_mcp_server(settings: Settings | None = None) -> MCPServer:
+def create_mcp_server(settings: Settings | None = None, audit=None) -> MCPServer:
     """创建并注册全部 5 个工具的 MCP Server。
 
     【L4 工程】为什么用工厂函数不用类？
@@ -43,11 +43,13 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
 
     Args:
         settings: 配置实例，为 None 时使用默认值。
+        audit: 工具调用审计出口（AgentLogDAO 或鸭子类型对象），
+            None 时不记审计（测试/离线脚本场景）。
 
     Returns:
         已注册 5 个工具的 MCPServer 实例。
     """
-    server = MCPServer(settings=settings)
+    server = MCPServer(settings=settings, audit=audit)
 
     # 1. web_search —— 联网搜索
     server.register(

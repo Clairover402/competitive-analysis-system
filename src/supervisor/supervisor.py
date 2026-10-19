@@ -104,7 +104,7 @@ from typing import TYPE_CHECKING
 from langgraph.graph import StateGraph, END
 
 from src.supervisor.state import SupervisorState
-from src.supervisor.a2a import A2ATask, A2ARouter, TaskStatus
+from src.supervisor.a2a import A2ATask, A2ARouter
 from src.pipeline.checkpoint import PostgresSaver
 from src.db.dao import AgentLogDAO
 from src.observability.token_usage import extract_usage
@@ -205,6 +205,33 @@ _SUPERVISOR_SKELETON = (
   Rule 8   → 单 Agent 执行（防止笛卡尔爆炸）
   Rule 9   → 纯 JSON 输出（解析要求）
 """
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §0 _digest_decision_args — 决策参数压缩（轨迹埋点用）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _digest_decision_args(arguments: dict, max_str: int = 80) -> dict:
+    """把 Supervisor 决策的 arguments 压成可落库摘要。
+
+    必须压：writer 的 arguments 里带整份 analysis_results（几万字）、
+    quality 的带整份 report_markdown —— 原样落库一条日志就能到 MB 级。
+    压完仍保留「有哪些键、列表多长」，足够判「是不是原样重复调用同一份参数」。
+    """
+    if not isinstance(arguments, dict):
+        return {"_type": type(arguments).__name__}
+
+    digest: dict = {}
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            digest[key] = value if len(value) <= max_str else f"{value[:max_str]}…(len={len(value)})"
+        elif isinstance(value, (list, tuple)):
+            digest[key] = f"list(len={len(value)})"
+        elif isinstance(value, dict):
+            digest[key] = f"dict(len={len(value)})"
+        else:
+            digest[key] = value
+    return digest
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,6 +464,11 @@ def _make_node_think(
                                 "agent": decision.get("action", ""),
                                 "thought": decision.get("thought", ""),
                                 "reason": decision.get("reason", ""),
+                                # 【2026-10-19】参数摘要入日志，用于轨迹评估判
+                                # 「参数是否合法 / 是否原样重复调用」
+                                "arguments": _digest_decision_args(
+                                    decision.get("arguments", {})
+                                ),
                             },
                             prompt_tokens=usage.get("prompt_tokens"),
                             completion_tokens=usage.get("completion_tokens"),
@@ -681,6 +713,7 @@ def _make_node_act(router: A2ARouter):
 def _make_node_observe(
     summarizer: MemorySummarizer | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
+    log_dao: AgentLogDAO | None = None,
 ):
     """创建 observe 节点函数——注入 MemorySummarizer + LongTermMemoryEngine。
 
@@ -878,6 +911,27 @@ def _make_node_observe(
         if trace_obs:
             updates["reasoning_trace"] = [trace_obs]
 
+        # ─── 步骤⑩: 轨迹埋点 —— observation 落库（2026-10-19 新增）──
+        # 为什么不能只靠 reasoning_trace：那个列表只活在内存里，
+        # 任务结束就没了；轨迹评估要能事后按 task_id 重建
+        # 「第几轮想了什么 → 调了谁 → 结果如何」的完整链路。
+        if log_dao is not None:
+            try:
+                await log_dao.log(
+                    task_id=state.get("task_id", ""),
+                    agent_name="supervisor",
+                    action="observe",
+                    request={
+                        "round": current_round,
+                        "agent": agent_name,
+                        "status": status,
+                    },
+                    response={"observation": trace_obs.get("observation", "")},
+                )
+            except Exception:
+                # 观测属辅助链路，不能阻断主循环（与 AgentLogDAO 的 fire-and-forget 口径一致）
+                logger.exception("Supervisor observe 埋点写入失败")
+
         return updates
 
     return node_observe
@@ -1007,7 +1061,7 @@ async def build_supervisor_graph(
         llm_supervisor, router, retrieval_strategy, memory_engine, log_dao
     )
     node_act = _make_node_act(router)
-    node_observe = _make_node_observe(summarizer, memory_engine)
+    node_observe = _make_node_observe(summarizer, memory_engine, log_dao)
 
     # ─── 步骤①: 创建 StateGraph ───
     graph = StateGraph(SupervisorState)

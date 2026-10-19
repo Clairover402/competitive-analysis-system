@@ -106,7 +106,6 @@ from typing import TYPE_CHECKING
 
 from src.db.connection import create_pool
 from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO, RetrievalSnapshotDAO
-from src.mcp.tools_rag import embed_query, rerank
 from src.observability.token_usage import extract_usage, add_usage
 from src.agents.content_quality import (
     clean_chunk_text,
@@ -247,6 +246,7 @@ async def _retrieve_and_analyze_dimension(
     competitors: list[str],
     dimension: str,
     chunk_dao: ChunkEmbeddingDAO,
+    mcp_server: MCPServer,
     llm: ChatDeepSeek,
     settings,  # 显式传递 settings，避免隐式依赖全局配置
     usage_acc: dict[str, int] | None = None,
@@ -272,7 +272,14 @@ async def _retrieve_and_analyze_dimension(
         # 【L3 原理】embed_query 调用 BGE-M3 bi-encoder 将维度名转为 1024 维向量。
         # "定价策略" → [0.12, -0.34, 0.56, ...] （1024个float32）
         # 这个向量在 1024 维空间中靠近所有与"定价"相关的 chunk 向量。
-        query_vec = await embed_query(dimension, settings)
+        # 【2026-10-19】改走 invoke：embed_query 此前直接 import 调函数，
+        #   绕过了 MCP 的白名单/参数校验/审计（3/5 工具漏管之一）。
+        query_vec = await mcp_server.invoke(
+            "embed_query",
+            {"query": dimension},
+            task_id=task_id,
+            agent_name="analyzer",
+        )
         if not query_vec:
             return {"error": f"文本向量化失败，维度不匹配 {dimension!r}"}
 
@@ -423,8 +430,17 @@ async def _retrieve_and_analyze_dimension(
             candidate_contexts = [r["chunk_text"] for r in group]
             # 【2026-10-16】top_k 提升为配置（settings.rerank_top_k，默认仍 15）。
             rerank_top_k = settings.rerank_top_k
-            reranked = await rerank(
-                rerank_query, candidate_contexts, top_k=rerank_top_k, settings=settings
+            # 【2026-10-19】改走 invoke：rerank 此前绕过统一入口，
+            #   精排是检索层最贵的一步（cross-encoder 逐对打分），必须纳入审计。
+            reranked = await mcp_server.invoke(
+                "rerank",
+                {
+                    "query": rerank_query,
+                    "documents": candidate_contexts,
+                    "top_k": rerank_top_k,
+                },
+                task_id=task_id,
+                agent_name="analyzer",
             )
             # 【2026-10-16 新增】精排「无筛选」告警
             #  候选池 ≤ top_k 时，精排只改变**顺序**、不改变**集合**，
@@ -604,8 +620,9 @@ async def analyzer_agent(
 ) -> dict:
     """Analyzer Agent — 对每个维度执行 RAG 检索 + LLM 分析。
 
-    【L5 架构】Analyzer 仅依赖 ChunkEmbeddingDAO + tools_rag，
-    不调用 mcp_server 的 web_search/web_fetch（那是 Collector 的事）。
+    【L5 架构】Analyzer 依赖 ChunkEmbeddingDAO + MCP 的 embed_query/rerank。
+    不调用 web_search/web_fetch（那是 Collector 的事）；检索类工具同样走
+    mcp_server.invoke 统一管控入口，而不是直接 import 函数（2026-10-19 修复）。
 
     【L5 决策】温度 temperature=0.1（不是默认的 0.3）
     分析任务需要稳定、可复现的结论，不是创意写作。
@@ -649,7 +666,7 @@ async def analyzer_agent(
     dim_usage_accs: list[dict[str, int]] = [{} for _ in dimensions]
     tasks_coros = [
         _retrieve_and_analyze_dimension(
-            task_id, competitors, dim, chunk_dao, llm, settings,
+            task_id, competitors, dim, chunk_dao, mcp_server, llm, settings,
             dim_usage_accs[i],
         )
         for i, dim in enumerate(dimensions)
