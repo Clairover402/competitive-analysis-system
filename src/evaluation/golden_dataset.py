@@ -1,50 +1,40 @@
 # -*- coding: utf-8 -*-
-"""Golden Dataset — 离线评估黄金标准数据集。
+"""Golden Dataset：离线评估的标准答案集（10 条，easy/medium/hard 三档）。
 
-═══════════════════════════════════════════════════════════════════════════════
-                        【L4 工程 — Golden Dataset 设计原则】
-═══════════════════════════════════════════════════════════════════════════════
+【职责】
+  做   提供「跑什么」（title / competitors / dimensions）与「对什么答案」
+       （两层粒度的 reference）。
+  不做 打分、跑链路——本文件是纯数据 + 三个查询函数。
 
-  1. 三级难度分档（easy/medium/hard）覆盖不同场景应力
-  2. 字段精简——每条只保留「被评估链路真实消费」的字段，无死字段
-     （2026-10-13 已删除零代码消费的整段 `reference`；剩余字段全部有下游接线）
-  3. 标准答案是「可验证事实点」而非「固定数值」——对时效不敏感
-  4. 与系统真实竞品/维度正交——name + dimensions 来自业务场景，非编造
+【两层 ground truth，新链路必须用 cell 级】
+  ① `reference_by_cell["竞品@维度"]`（cell 级、单竞品）
+     → ragas_core 四指标走这条。评估单元是 (竞品, 维度)，基准就必须只讲该竞品。
+  ② `reference_by_dimension[维度]`（维度级、跨竞品复合）
+     → 真实任务兜底（llm_factory.resolve_reference 的第三级回退）。
 
-  ⚠️ 评估链路的 ground truth 有两层粒度，**新链路必须用 cell 级**：
+  ⚠️ 拿维度级复合句当某个 cell 的判据，必然有一半讲对方竞品、按定义不可能被支持
+     ⇒ cr 天花板钉死 0.5（实测 飞书@功能 cr=0.500，正好半句）。
 
-     ① `reference_by_cell["竞品@维度"]`（**cell 级，单竞品**）
-        —— ragas_core 的四指标走这条。评估单元是 (竞品, 维度)，基准就必须只讲
-        该竞品；若拿维度级复合句（含对方竞品）当基准，每个 cell 必然有一半
-        讲的是别人，**context_recall 天花板被钉死在 0.5**（2026-10-16 实测：
-        `飞书@功能 cr=0.500` 正是"正好半句"）。
+【六条写作纪律（写 reference 前必读）】
+  1. 必须是事实点，不能是占位模板（"XX 维度关键事实：…等能力"），也不能是
+     元描述（"两者的定价档位有差异"——只说有差异、不说差异是什么）。
+  2. 必须事实点化、≥3 个「；」分隔的独立事实点 ← context_recall 的分母 =
+     judge 切出的句子数；单句 → 分母恒 1 → 取值域只有 {0,1}，抖一次整格翻转
+     （实测 [0,1,0]）。
+  3. cell 级与维度级必须**事实一致**：cell 级由维度级复合句按竞品机械拆分而来，
+     不新增、不虚构。
+  4. 改写必须**独立于被测 contexts**：只写公开可核验的事实，不得照着 contexts
+     反写——否则 cr 变成自证，失去评估意义。
+  5. 不用「以…见长 / 主打 / 偏向」这类判断词 ← 它们需要全市场对比才成立，
+     单页材料按定义支撑不了，judge 判 0 是对的。改写成「提供 / 面向 / 包含」。
+     ⚠️ 现状：仍有 15 处 cell 值保留「以…见长」（EASY 的腾讯文档/石墨、MEDIUM 的
+     飞书/钉钉/企业微信等），属未清的存量，别照抄。
+  6. 键对不上时 llm_factory.resolve_reference 会显式 warning，不静默退化
+     （静默拿维度名当标准答案属静默失真，比报错危险）。
 
-     ② `reference_by_dimension[维度]`（**维度级，跨竞品复合**）
-        —— 供真实任务兜底（`llm_factory.resolve_reference`）。
-
-     无论哪一层，**文本都必须是事实点**，不能写成"XX 维度关键事实：…等能力"
-     这类模板占位，也不能写成"两者的定价档位差异"这类只说有差异、不说差异
-     是什么的元描述——喂给 judge 都等于没有 ground truth，分数不可信。
-     另：Golden 模式下键对不上时 `_resolve_reference` 会**显式 warning**
-     （v2026-10-14 前是静默退化成用维度名当标准答案，属静默失真）。
-
-  ⚠️ cell 级与维度级必须**事实一致**：`reference_by_cell` 由 `reference_by_dimension`
-     的复合句按竞品**机械拆分**而来（不新增、不虚构事实），拆分后各自仍是事实点。
-
-  ⚠️ **必须事实点化（多句），不能写成单句**（2026-10-17）：
-     `context_recall` 的分母 = judge 切出的句子数（`_context_recall.py` 用
-     "analyze each sentence in the answer"，且 `generate_multiple(n=1)` 不投票）。
-     单句 reference → 分母恒为 1 → cr 取值域只有 {0,1}，judge 抖一次整格翻转，
-     表现为「同一格同一输入跑两次 0 / 1」（2026-10-17 实测 `[0,1,0]`）。
-     故每条 cell reference 至少 3 个「；」分隔的独立事实点。
-     ⚠️ 改写**必须独立于被测 contexts**：只写该产品公开可核验的事实，
-     不得照着 contexts 反写，否则 cr 变成自证、失去评估意义。
-
-  为什么需要 Golden Dataset？
-  — 评估不能只在 CI 里跑一遍 E2E 就说"通过"
-  — 必须有标准答案级别的对照集，验证输出是否符合预期覆盖率/关键词/引用
-  — 类比 ML 里的 test set：不是看一次结果，是持续回归的标尺
-═══════════════════════════════════════════════════════════════════════════════
+【为什么需要它】
+  评估不能只在 CI 里跑一遍 E2E 就说过；必须有标准答案级的对照集，
+  类比 ML 的 test set——不是看一次结果，是持续回归的标尺。
 """
 
 from __future__ import annotations
@@ -79,32 +69,19 @@ class GoldenCase(TypedDict):
     reference_by_cell: dict[str, str]
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Golden Dataset — 10 条，分三档
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Golden Dataset：10 条，分三档 ──────────────────────────────────────────
 
 GOLDEN_DATASET: list[GoldenCase] = [
-    # ────────────────────────── EASY (4 条) ────────────────────────────
-    # Easy = 竞品明确 + 维度常见 + 覆盖面窄，Pipeline 直达
+    # ── EASY (4 条) ── 竞品明确 + 维度常见 + 覆盖面窄，Pipeline 直达
     {
         "task_id": "golden_001",
         "title": "飞书基础功能分析",
         "competitors": ["飞书", "钉钉"],
         "dimensions": ["功能", "定价"],
         "difficulty": "easy",
-        # 事实级标准答案：覆盖「功能」与「定价」两个维度下飞书/钉钉的关键事实。
-        # 具体数字因时效会变，故锚定的是「可验证事实点」而非固定数值。
-        #
-        # 【事实点化（2026-10-17）】每格 3~4 个独立可核验事实，用「；」分隔。
-        #   为什么必须拆：context_recall 的分母 = judge 切出的句子数
-        #   （`_context_recall.py` 用 "analyze each sentence in the answer"，n=1 不投票）。
-        #   单句 reference → 分母恒为 1 → cr 取值域只有 {0,1}，judge 抖一次整格翻转
-        #   （2026-10-17 实测 `[0,1,0]` 抛硬币正是此机制）；拆成 N 句 → 分母 N，
-        #   才有 0.25/0.5/0.75 的中间台阶。
-        #   铁律：只写该产品**公开可核验**的事实，不得参照被测 contexts 反写 ——
-        #   否则 cr 退化成自证（与 faithfulness 同病），分数再好看也没有意义。
-        #   另：去掉「以…见长」这类需要全市场对比才能成立的判断词，改写为
-        #   「提供/包含 X」这类单页材料就能支撑的硬陈述。
+        # 事实级标准答案：锚定可验证事实点而非固定数值（数字有时效）。
+        # 每格 3~4 个独立事实、用「；」分隔；为什么必须多句、为什么不能照 contexts
+        # 反写，见模块头「写作纪律 2 / 4」。
         "reference_by_dimension": {
             "功能": "飞书提供即时通讯、云文档、多维表格、日历与会议协同；钉钉提供 OA 审批、考勤管理、考勤打卡等办公流程能力",
             "定价": "飞书提供免费版，企业版按席位订阅并按每人/月或每人/年计价；钉钉提供免费版，另有专业版与专属版订阅档位，同样按每人/月或每人/年计价",
@@ -167,8 +144,7 @@ GOLDEN_DATASET: list[GoldenCase] = [
         },
     },
 
-    # ──────────────────────── MEDIUM (3 条) ──────────────────────────
-    # Medium = 多竞品/多维度，走 Pipeline 但需要 richer 的采集和分析
+    # ── MEDIUM (3 条) ── 多竞品/多维度，Pipeline 但采集与分析更重
     {
         "task_id": "golden_005",
         "title": "三大协同办公软件全维度对比",
@@ -252,8 +228,7 @@ GOLDEN_DATASET: list[GoldenCase] = [
         # （tongyi.aliyun.com 是通义千问对话站），文心快码官网是 comate.baidu.com
     },
 
-    # ───────────────────────── HARD (3 条) ────────────────────────────
-    # Hard = 意图模糊，没有明确的竞品 → 走 Supervisor 探索模式
+    # ── HARD (3 条) ── 意图模糊、无明确竞品 → Supervisor 探索模式
     {
         "task_id": "golden_008",
         "title": "哪些产品在协同办公领域有竞争力？",
@@ -341,34 +316,19 @@ GOLDEN_DATASET: list[GoldenCase] = [
 ]
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 工具函数
-# ═════════════════════════════════════════════════════════════════════════════
+# ── 工具函数 ────────────────────────────────────────────────────────────────
 
 def get_by_difficulty(difficulty: str) -> list[GoldenCase]:
-    """按难度筛选 Golden 用例。
-
-    Args:
-        difficulty: easy / medium / hard
-
-    Returns:
-        筛选后的用例列表，难度不匹配返回空列表
-    """
+    """按难度（easy / medium / hard）筛选用例；难度不匹配返回空列表。"""
     return [case for case in GOLDEN_DATASET if case["difficulty"] == difficulty]
 
 
 def get_reference_by_dimension(task_id: str) -> dict[str, str]:
-    """按 task_id 查 Golden Case 的「分维度标准答案」（reference_by_dimension）。
+    """按 task_id 取「分维度标准答案」；找不到返回空 dict。
 
-    用于检索质量评估 evaluate_retrieval 的 context_precision —— 该指标需要
-    每个维度各自的 ground truth（reference_map），把该维度的检索上下文与之
-    比对。标准答案按维度组织，每个维度给出该维度的关键事实点。
-
-    Args:
-        task_id: Golden Case 的 task_id（如 "golden_001"）
-
-    Returns:
-        {dimension: 该维度的标准答案}；找不到返回空 dict
+    这是**维度级、跨竞品复合**的兜底口径：真实任务（非 Golden）没有 cell 表时用它，
+    cr 天花板约 0.5。Golden 跑分必须同时传 cell 级（见 get_reference_by_cell），
+    两级都传时 resolve_reference 优先 cell 级。
     """
     for case in GOLDEN_DATASET:
         if case["task_id"] == task_id:
@@ -377,27 +337,16 @@ def get_reference_by_dimension(task_id: str) -> dict[str, str]:
 
 
 def get_reference_by_cell(task_id: str) -> dict[str, str]:
-    """按 task_id 查 Golden Case 的「分 cell 标准答案」（reference_by_cell）。
+    """按 task_id 取「分 cell 标准答案」（键 `"竞品@维度"`，值只讲该竞品）。
 
-    键 = `"竞品@维度"`，值 = **只讲该竞品**在该维度上的事实点。
+    为什么必须有 cell 级：ragas_core 的评估单元是 (竞品, 维度)，拿维度级复合句
+    当某个 cell 的判据，必然有一半讲对方竞品 ⇒ cr 天花板钉在 0.5
+    （实测 飞书@功能 cr=0.500，正好半句）。
 
-    【为什么必须有 cell 级，而不是复用维度级】
-      ragas_core 的评估单元是 (竞品, 维度)——每条 retrieval_snapshot 就是
-      一个 cell。维度级 `reference_by_dimension[维度]` 是**跨竞品复合句**
-      （"飞书…；钉钉…"），把它喂给某个 cell，判据里必然有一半讲的是**对方
-      竞品**、按定义不可能被检索结果支持 → **context_recall 天花板被钉在
-      0.5**，context_precision 也系统性趋 0。
-      2026-10-16 实测：`飞书@功能 cr=0.500` 正是"正好半句"的直接证据。
+    ⚠️ hard 档 competitors 为空（Supervisor 探索模式），无法在数据期枚举 cell 键：
+    此时按标准答案点名的产品写键，命中即用，未命中由 resolve_reference 回退维度级。
 
-    ⚠️ 无法在数据期枚举 cell 键的情形：`competitors` 为空的 hard 档
-    （Supervisor 探索模式）。此时按标准答案点名的产品写 cell 键，
-    探索出的竞品名命中即用、未命中由 `_resolve_reference` 回退维度级。
-
-    Args:
-        task_id: Golden Case 的 task_id（如 "golden_001"）
-
-    Returns:
-        {"竞品@维度": 该 cell 的标准答案}；找不到返回空 dict
+    找不到 task_id 返回空 dict。
     """
     for case in GOLDEN_DATASET:
         if case["task_id"] == task_id:
@@ -406,16 +355,10 @@ def get_reference_by_cell(task_id: str) -> dict[str, str]:
 
 
 def get_pipeline_cases() -> list[GoldenCase]:
-    """获取所有 Pipeline 模式用例（competitors 非空 → 走确定性流程）。
-
-    对应 IntentRouter.classify() 中 competitors≥1 AND dimensions≥1 → Pipeline 路径。
-    """
+    """competitors 非空的用例（= IntentRouter 走确定性 Pipeline 的形态）。"""
     return [case for case in GOLDEN_DATASET if len(case["competitors"]) > 0]
 
 
 def get_supervisor_cases() -> list[GoldenCase]:
-    """获取所有 Supervisor 探索模式用例（competitors 为空 → 走 ReAct 探索）。
-
-    对应 IntentRouter.classify() 中 competitors=0 → Supervisor 路径。
-    """
+    """competitors 为空的用例（= IntentRouter 走 ReAct 探索的形态）。"""
     return [case for case in GOLDEN_DATASET if len(case["competitors"]) == 0]

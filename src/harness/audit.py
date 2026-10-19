@@ -18,10 +18,9 @@
        │                                            request, response, error,
        │                                            duration_ms)
        │
-       └── Phase 9 Dashboard 查询
-              └── AuditLogger.get_task_trail(task_id)
-                    └── SELECT * FROM agent_logs WHERE task_id=$1 ORDER BY created_at ASC
-                          → 完整的 Agent 调用时间线（每一步谁做了什么、花了多久、出没出错）
+       └── Phase 9 Dashboard 查询（SSE 轮询，见 src/api/sse.py）
+              └── SELECT * FROM agent_logs WHERE task_id=$1 ORDER BY created_at ASC
+                    → 完整的 Agent 调用时间线（每一步谁做了什么、花了多久、出没出错）
 
   【L5 决策】AuditLogger 为什么是一层独立包装？
   DAO 只管 SQL INSERT，AuditLogger 管"什么时候记、记什么、失败怎么办"。
@@ -37,7 +36,9 @@
 
   §1 AuditLogger.__init__()  — DAO 注入 + 资源管理
   §2 AuditLogger.log()       — fire-and-forget 写入（try/except 兜底）
-  §3 AuditLogger.get_task_trail() — 完整调用链查询（按时间升序）
+
+  ⚠️ 原 §3 `get_task_trail()` 已于 2026-10-19 删除：全仓库零调用。
+     调用链查询由 SSE 直接读 agent_logs 完成（src/api/sse.py），不需要这层包装。
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -90,7 +91,6 @@ class AuditLogger:
     | 方法 | 功能 | 容错 |
     |------|------|------|
     | `log(event)` | 写入一条审计日志 | try/except，失败不抛异常 |
-    | `get_task_trail(task_id)` | 查询完整调用链 | try/except，失败返回空列表 |
     """
 
     def __init__(self, pool) -> None:
@@ -151,43 +151,3 @@ class AuditLogger:
             # 【L5 决策】记自己的失败日志，但不往上抛
             # 如果连 logger.exception 也失败了（几乎不可能），静默吞掉
             logger.exception("审计日志写入失败")
-
-    async def get_task_trail(self, task_id: str) -> list[dict]:
-        """查询完整调用链日志（按时间升序）。
-
-        【L4 工程】Phase 9 可观测性展示：
-        — Dashboard 用此方法画 Agent 调用时间线
-        — 质检 Agent 复盘："哪一步花了最长时间？哪一步出错？"
-        — 故障排查："collector 为什么被拦截了？" → 查 agent_logs.error
-
-        ▎执行步骤：
-
-        | 步骤 | 做什么 | 说明 |
-        |:--:|------|------|
-        | 1 | `self._dao.get_by_task(task_id)` | SELECT * FROM agent_logs ORDER BY created_at ASC |
-        | 2 | 返回结果列表 | Python 原生 dict（asyncpg 已转换） |
-        | 3 | 数据库异常 → 返回空列表 | 不抛异常，调用方检查空列表即可 |
-
-        Args:
-            task_id: 任务 UUID（如 "abc-123-def"）
-
-        Returns:
-            [
-                {
-                    task_id, agent_name, action,
-                    request: dict,   # JSONB → Python dict
-                    response: dict,  # JSONB → Python dict
-                    error: str | None,
-                    duration_ms: float,
-                    created_at: datetime,
-                },
-                ...
-            ]
-            按 created_at 升序排列 → 直接就是"时间线"
-            失败时返回空列表 []
-        """
-        try:
-            return await self._dao.get_by_task(task_id)
-        except Exception:
-            logger.exception("查询调用链失败: task_id=%s", task_id)
-            return []

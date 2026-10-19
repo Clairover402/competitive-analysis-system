@@ -51,8 +51,8 @@ def main() -> None:
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
-    # 【2026-10-16 修复】此前 observability/logging.py 的 setup_logging() 带文件落盘
-    # 但全仓库无人调用，导致 logs/ 恒为空、跑完任务无法事后 grep 排查。
+    # 【2026-10-16 修复】此前日志落盘依赖一个从未被调用的初始化函数，
+    # 导致 logs/ 恒为空、跑完任务无法事后 grep 排查。
     # 这里直接在 root 上追加 RotatingFileHandler：控制台 + 文件双通道。
     try:
         from logging.handlers import RotatingFileHandler

@@ -47,7 +47,6 @@
   AuditLogger 也可独立使用（Phase 9 服务化时写其他审计事件）:
     audit = AuditLogger(pool)
     await audit.log({"task_id": "...", "agent_name": "...", ...})
-    trail = await audit.get_task_trail(task_id)
 """
 
 from __future__ import annotations

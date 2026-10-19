@@ -71,7 +71,6 @@ A2A（Agent-to-Agent）= AgentCard（名片） + A2ATask（任务单） + A2ARou
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -290,38 +289,6 @@ class A2ARouter:
         self._handlers[card.name] = handler
         self._llms[card.name] = llm
         logger.info("Registered agent: %s (capabilities: %s)", card.name, card.capabilities)
-
-    # ────────────────────────────────────────────────────────────────────────
-    # 公开方法: get_card — 按名称查名片
-    # ────────────────────────────────────────────────────────────────────────
-
-    def get_card(self, agent_name: str) -> AgentCard | None:
-        """按名称查询 AgentCard。
-
-        【L4 工程】为什么返回 AgentCard | None 而不是抛异常？
-        ──────────────────────────────────────────────
-        Supervisor 可能在 LLM 幻觉出了不存在的 agent_name 时调用此方法。
-        返回 None 让调用方自行判断（重试/fallback），比抛异常更优雅。
-        send_task 内部会检查 None 并标记 FAILED。
-
-        Args:
-            agent_name: Agent 名称（"collector"|"analyzer"|"writer"|"quality"）
-
-        Returns:
-            对应的 AgentCard，未注册返回 None
-        """
-        return self._cards.get(agent_name)
-
-    # ────────────────────────────────────────────────────────────────────────
-    # 公开方法: list_agents — 列所有注册的 Agent 名片
-    # ────────────────────────────────────────────────────────────────────────
-
-    def list_agents(self) -> list[AgentCard]:
-        """列出所有已注册的 AgentCard 列表。
-
-        用途: 外部调试/显示，不建议用于 Supervisor Prompt（用 list_capabilities）。
-        """
-        return list(self._cards.values())
 
     # ────────────────────────────────────────────────────────────────────────
     # 公开方法: list_capabilities — 格式化给 Supervisor Prompt 的能力清单

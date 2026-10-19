@@ -10,19 +10,17 @@
   — 无外部依赖，省去 1 次 install
 
 使用方式：
-  logger = get_logger().bind(task_id="abc", agent="collector")
-  logger.info("web_search", extra={"action": "web_search", "results": 15})
+  logger = BoundLogger(logging.getLogger(__name__)).bind(task_id="abc", agent="collector")
+  logger.info("web_search", action="web_search", results=15)
 
-输出格式：
-  [2026-07-21T19:30:00] [INFO] [task_abc] [collector] [web_search] 搜索完成, results=15
+输出格式（字段由调用方在 extra 里给出，本模块只负责绑定与透传）：
+  [task_abc] [collector] 搜索完成, results=15
 """
 
 from __future__ import annotations
 
 import logging
-import sys
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -41,53 +39,6 @@ class LogContext:
     task_id: str = ""
     agent: str = ""
     action: str = ""
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# §2 自定义 Formatter — 结构化输出
-# ═════════════════════════════════════════════════════════════════════════════
-
-class StructuredFormatter(logging.Formatter):
-    """输出格式：[ISO时间戳] [级别] [task_id] [agent] [action] 消息 + 扩展字段"""
-
-    def format(self, record: logging.LogRecord) -> str:
-        # ── 提取绑定字段 ──
-        task_id = getattr(record, "task_id", "") or ""
-        agent = getattr(record, "agent", "") or ""
-        action = getattr(record, "action", "") or ""
-
-        # ── 构造时间戳 ──
-        ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-
-        # ── 基础格式 ──
-        parts = [f"[{ts}]", f"[{record.levelname}]"]
-        if task_id:
-            parts.append(f"[{task_id}]")
-        if agent:
-            parts.append(f"[{agent}]")
-        if action:
-            parts.append(f"[{action}]")
-
-        # ── 消息体 ──
-        msg = record.getMessage()
-        parts.append(msg)
-
-        # ── 附加扩展字段（extra 中除了标准字段之外的键） ──
-        extras = {}
-        for key, val in record.__dict__.items():
-            if key not in {
-                "name", "msg", "args", "levelname", "levelno",
-                "pathname", "filename", "module", "exc_info",
-                "exc_text", "stack_info", "created", "msecs",
-                "relativeCreated", "thread", "threadName",
-                "process", "processName", "task_id", "agent", "action",
-            }:
-                extras[key] = val
-        if extras:
-            extra_str = ", ".join(f"{k}={v}" for k, v in extras.items())
-            parts[-1] = f"{parts[-1]}, {extra_str}"
-
-        return " ".join(parts)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -143,54 +94,3 @@ class BoundLogger:
         # 同步 print traceback（标准 logging 的 exc_info 方式）
         import traceback
         self._logger.error(f"{msg}\n{traceback.format_exc()}")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# §4 初始化函数
-# ═════════════════════════════════════════════════════════════════════════════
-
-def setup_logging(level: int = logging.INFO) -> BoundLogger:
-    """配置并返回根日志器。
-
-    标准 logging 配置：
-    — Handler: StreamHandler → stdout
-    — Formatter: StructuredFormatter
-    — Level: 可配置（默认 INFO）
-
-    Returns:
-        BoundLogger: 包装好的日志器，支持 .bind().info() 链式调用。
-    """
-    root = logging.getLogger("competitive_analysis")
-    root.setLevel(level)
-
-    # 修复 Windows 控制台 GBK 编码导致中文日志乱码
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
-    # 避免重复添加 handler（多次调用 setup_logging 时）
-    if not root.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(level)
-        handler.setFormatter(StructuredFormatter())
-        root.addHandler(handler)
-
-        # ── 文件落盘：日志持久化，进程重启不丢失（可观测性必备）──
-        # 轮转：单文件 10MB × 最多保留 5 个，避免日志无限膨胀
-        import os
-        from logging.handlers import RotatingFileHandler
-        log_dir = os.environ.get("LOG_DIR", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            os.path.join(log_dir, "app.log"),
-            maxBytes=10 * 1024 * 1024,   # 10MB
-            backupCount=5,               # 保留 app.log.1 ~ app.log.5
-            encoding="utf-8",
-        )
-        file_handler.setLevel(level)
-        file_handler.setFormatter(StructuredFormatter())
-        root.addHandler(file_handler)
-
-    return BoundLogger(root)

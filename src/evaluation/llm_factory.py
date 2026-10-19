@@ -1,33 +1,24 @@
 # -*- coding: utf-8 -*-
 """评估用的 judge / embeddings / RunConfig 构造器 + reference 解析（唯一实现）。
 
-═══════════════════════════════════════════════════════════════════════════════
-                         【为什么单独一个模块】
-═══════════════════════════════════════════════════════════════════════════════
+【职责】
+  做   把「评估需要的外部资源」构造出来：judge LLM、embeddings、RunConfig，
+       以及把 (竞品, 维度) 解析成 ground truth。
+  不做 跑指标、落库、上报——本模块只是被 ragas_core 依赖的纯构造层。
 
-  2026-10-17：本模块从 ragas_llm.py 抽出，随后 ragas_llm.py 整体删除。
+【关键决策】
+  · 单独成模块 ← 旧链路把构造 judge 与落库/门禁/归档/上报焊在一个 938 行文件里，
+    任何只想跑指标的地方（诊断脚本、单测）都得连带启动 DB 与 Prometheus。
+    抽出后模型名、超时口径、reference 规则只有一处定义。
+  · judge 与生成模型隔离（deepseek-chat vs deepseek-v4-flash）← 裁判和运动员
+    不能是同一个人，否则"自己评自己"有系统性偏好。
 
-  老链路把「构造 judge」和「落库 + 门禁 + 归档 + 趋势上报」焊在同一个 938 行文件里，
-  于是任何只想跑指标的地方（新引擎、诊断脚本、单测）都得 import 一整个工程外壳，
-  还得连带启动 DB 连接与 Prometheus。抽出后：
-
-    · ragas_core（四指标唯一实现）只依赖本模块，不碰任何落库/上报逻辑；
-    · 模型名、超时口径、reference 解析规则**只有一处定义**，不会两条链路各写一份；
-    · 删掉老链路时，这些被真实使用的纯函数有了明确归宿，不必跟着一起删。
-
-═══════════════════════════════════════════════════════════════════════════════
-                      【两个 ragas 0.4.3 的兼容坑（已处理）】
-═══════════════════════════════════════════════════════════════════════════════
-
-  1. ragas 顶层硬 import `langchain_community.chat_models.vertexai`，
-     但该模块在新版 langchain-community 已移除 → 注入占位模块兜底。
+【两个 ragas 0.4.3 兼容坑（已处理，别"顺手修"）】
+  1. ragas 顶层硬 import `langchain_community.chat_models.vertexai`，新版
+     langchain-community 已移除该模块 → 注入占位模块兜底。
      ⚠️ 必须在 `import ragas` **之前**执行，故本模块的 import 顺序不能重排。
-
-  2. ragas 0.4.3 有两套指标：collections（新式，SimpleBaseMetric）与
-     _ 下划线模块（旧式，Metric）。`aevaluate()` 的 isinstance 检查只认旧式，
-     collections 指标会报 "All metrics must be initialised"。
-     → 指标侧统一用旧式（见 ragas_core.py），本模块只负责构造 judge，不受影响。
-═══════════════════════════════════════════════════════════════════════════════
+  2. ragas 有两套指标：collections（新式）与 _ 下划线模块（旧式）。
+     aevaluate 的 isinstance 检查只认旧式，新式会报 "All metrics must be initialised"。
 """
 
 from __future__ import annotations
@@ -100,22 +91,16 @@ def build_embeddings(settings) -> LangchainEmbeddingsWrapper:
 def build_run_config(settings) -> RunConfig:
     """按配置构造 ragas 的 RunConfig（单作业超时 + 并发上限）。
 
-    【为什么必须显式传，不能用 ragas 默认】
-      ragas 默认 `RunConfig(timeout=180, max_workers=16)`。那个 180s 是**单个
-      (样本, 指标) 作业**的上限，而 `context_precision` 对 retrieved_contexts 是
-      **串行**逐条判定的（ragas 0.4.3 `LLMContextPrecisionWithReference._ascore`
-      里就是 `for context in retrieved_contexts:`）。于是「12 条 contexts 的长样本」
-      必须在 180s 内接连跑完 12 次 judge 调用才不超时 —— 实际跑不完，整个作业被
-      `asyncio.wait_for` 掐断，分数归档为 np.nan。
-      2026-10-16 的 `钉钉@功能 cp=NaN` + 日志 `Job[12]: TimeoutError()` 正是此机制
-      （12 是全局作业号，16 个作业里第 12 个正好是该 cell 的 context_precision）。
+    ⚠️ 必须显式传给每个 aevaluate，不能靠 ragas 默认（timeout=180 / workers=16）：
+      180s 是**单个 (样本,指标) 作业**的上限，而 context_precision 对 contexts 是
+      **串行**逐条判 LLM（`for context in retrieved_contexts:`）。12 条 contexts
+      的长样本要连跑 12 次 judge 才不超时，实际跑不完 → 作业被 wait_for 掐断 → NaN
+      （2026-10-16 钉钉@功能 cp=NaN 即此）。
 
-      两处调整：
-        · timeout 180 → 配置值（默认 600）：宁可慢，不可静默丢一格分。
-          （ragas 会把这个值同时写进 langchain_llm.request_timeout，
-           故它也覆盖了 build_judge_llm 里那个 120s 的 HTTP 超时。）
-        · max_workers 16 → 8：4 样本 × 4 指标 = 16 个作业同时在打 judge，
-          并发过高容易触发上游限流 → 重试 → 更慢 → 反而更容易撞 timeout。
+    两处调整：timeout 180 → 配置值（默认 600，宁可慢不可静默丢分）；workers 16 → 8
+    （16 个作业同时打 judge 易触发限流 → 重试 → 更慢 → 更容易撞 timeout）。
+    注：ragas 会把 timeout 同时写进 langchain_llm.request_timeout，故它覆盖了
+    build_judge_llm 里那个 120s 的 HTTP 超时，两处不必分别调。
     """
     timeout = int(getattr(settings, "ragas_eval_timeout", 600.0) or 600.0)
     max_workers = int(getattr(settings, "ragas_eval_max_workers", 8) or 8)
@@ -132,25 +117,14 @@ def resolve_reference(
 ) -> str:
     """取该 cell 的 ground truth 文本（**优先 cell 级**，缺失回退维度级）。
 
-    【为什么基准必须优先切到 cell 级】
-    ──────────────────────────────
-    评估单元是 (竞品, 维度) —— 每条 retrieval_snapshot 就是一个 cell。
-    `reference_map` 是**维度级**且**跨竞品复合**（"飞书…；钉钉…"），把它喂给
-    某个 cell，判据里必然有一半讲的是**对方竞品**、按定义不可能被检索结果支持
-    ⇒ `context_recall` 天花板被钉死 0.5、`context_precision` 系统性趋 0。
-    2026-10-16 实测：`飞书@功能 cr=0.500` —— 正好"半句"，即此机制的直接证据。
-    故首选 `reference_cell_map["竞品@维度"]`（只讲该竞品）；
-    真实任务 / 历史数据没有 cell 表 → 回退维度级 → 再退化维度名。
+    评估单元是 (竞品, 维度)，而维度级 map 是**跨竞品复合句**（"飞书…；钉钉…"）。
+    拿它判某个 cell，判据里必然有一半讲对方竞品、按定义不可能被支持 ⇒
+    cr 天花板钉死 0.5、cp 系统性趋 0（实测 飞书@功能 cr=0.500，正好半句）。
 
-    【为什么必须告警，不能静默兜底】
-    ──────────────────────────────
-    原实现是 `(reference_map or {}).get(dimension, dimension)`：维度名只要差一个字
-    （hard 档的维度来自 Supervisor/LLM 生成，无强一致保证），就会**静默**退化成
-    「拿维度名本身当标准答案」——judge 拿 "功能" 两个字去判上下文是否支撑，分数
-    彻底失真，而且不报错、不打日志，跑出来和正常的一模一样。
-    这类「静默失真」比直接抛错危险得多，故此处显式 warning。
-
-    ⚠️ 真实任务（两级 map 都为 None）本来就用维度名兜底，属设计本意，不告警。
+    ⚠️ 缺键必须告警、不能静默兜底：原实现是 `(map or {}).get(dim, dim)`，
+    维度名差一个字（hard 档维度由 LLM 生成，无强一致保证）就会静默退化成
+    「拿维度名当标准答案」，分数彻底失真且毫无痕迹——比直接抛错危险得多。
+    真实任务（两级 map 都为 None）本来就用维度名兜底，属设计本意，不告警。
     """
     cell_key = f"{competitor}@{dimension}" if competitor else dimension
     # ① 首选：cell 级标准答案（单竞品，与评估单元同粒度）。

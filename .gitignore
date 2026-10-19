@@ -36,3 +36,6 @@ logs/
 # Golden 回归产物（每次跑归档在 phase_report/runs/，不入库；
 # 里程碑 baseline 想留档可 git add -f 单独提交）
 phase_report/
+
+# 评估 run 归档（ragas_core 每次跑自动落 run.json/summary.md/TREND.md，不入库）
+evaluation_runs/

@@ -9,18 +9,21 @@
   2. 每个 Counter 都有 status/type 标签 — 支持按维度下钻
   3. 指标采集在 HTTP 入口 + Harness 阻断点 — 不改动编排引擎
 
-七项指标：
+五项指标：
 ┌──────────────────────────────┬──────────┬─────────────────────────────────┐
 │ 指标名                        │ 类型      │ 说明                             │
 ├──────────────────────────────┼──────────┼─────────────────────────────────┤
 │ ca_tasks_total               │ Counter  │ 任务数按 status 分桶             │
 │ ca_task_duration_seconds     │ Histogram│ 任务耗时按 route 分桶            │
 │ ca_agent_calls_total         │ Counter  │ Agent 调用按 agent/action/status │
-│ ca_quality_score             │ Histogram│ 质检分数分布                     │
-│ ca_rag_recall                │ Gauge    │ RAG 召回率（当前值）             │
 │ ca_rate_limit_hits           │ Counter  │ 限流触发按 layer 分              │
 │ ca_harness_blocks            │ Counter  │ Harness 阻断按 check_type 分     │
 └──────────────────────────────┴──────────┴─────────────────────────────────┘
+
+⚠️ 2026-10-19 删除了 ca_quality_score / ca_rag_recall / ca_eval_* 两批指标：
+   前者从未有调用点（质检分数、召回率都只落 DB/日志，没人 observe/set），
+   后者是旧「评估结果落库 + 推 Prometheus」链路，ragas 重构后已改为文件归档、
+   不再上报 Prometheus。Grafana 面板未引用它们，删除不影响既有看板。
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from __future__ import annotations
 # > 一句话：在 Python 应用内部生成监控指标，暴露给 Prometheus 采集
 
 
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, REGISTRY
+from prometheus_client import Counter, Histogram
 
 # 核心 4 种指标类型（面试高频）
 #
@@ -73,21 +76,6 @@ ca_agent_calls_total = Counter(
     "Agent 调用次数",
     ["agent", "action", "status"],  # agent: collector/analyzer/writer/quality/supervisor
 )                                   # status: success / error
-
-ca_quality_score = Histogram(
-    "ca_quality_score",
-    "质检分数分布",
-    buckets=[0, 50, 60, 70, 75, 80, 85, 90, 95, 100],
-)
-
-
-#  Gauge：仪表盘类型，代表一个瞬时、可任意读写的数值，可以 set、inc、dec。
-#  用来记录当前状态、当前计算出来的浮点数。
-ca_rag_recall = Gauge(
-    "ca_rag_recall",
-    "RAG 检索召回率（当前任务值）",
-    ["dimension"],
-)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -149,19 +137,6 @@ def record_agent_call(agent: str, action: str, success: bool) -> None:
     ca_agent_calls_total.labels(agent=agent, action=action, status=status).inc()
 
 
-def record_quality_score(score: float) -> None:
-    """记录质检分数。"""
-    ca_quality_score.observe(score)
-
-
-def record_rag_recall(dimension: str, recall: float) -> None:
-    """记录某维度的 RAG 召回率。
-
-    ▸ 注意：Gauge 是"当前值"语义，每次 set 会覆盖。
-    """
-    ca_rag_recall.labels(dimension=dimension).set(recall)
-
-
 def record_rate_limit_hit(layer: str, agent: str = "") -> None:
     """记录一次限流触发。
 
@@ -180,44 +155,3 @@ def record_harness_block(check_type: str) -> None:
     """
     ca_harness_blocks.labels(check_type=check_type).inc()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# §5 评估指标（2026-10-06 评估体系自动落库 → 暴露 Prometheus 供 Grafana 面板）
-# ═════════════════════════════════════════════════════════════════════════════
-# 评估分数落库到 eval_results 后，同步推一份到 Prometheus（Gauge 当前值 + Counter
-# 计数），Grafana 面板就能实时看到 faithfulness/context_precision/judge 五维等趋势。
-
-ca_eval_scores = Gauge(
-    "ca_eval_scores",
-    "评估指标分数（当前值，按 metric_name 分桶）",
-    ["metric_name", "eval_type"],  # metric_name: faithfulness/answer_relevancy/context_precision/完整性…
-)                                  # eval_type: generation/retrieval/judge
-
-ca_eval_evals_total = Counter(
-    "ca_eval_evals_total",
-    "评估执行次数，按 eval_type 分桶",
-    ["eval_type"],
-)
-
-ca_eval_regressions_total = Counter(
-    "ca_eval_regressions_total",
-    "评估回归告警次数（单指标回撤超过容差）",
-    ["metric_name"],
-)
-
-
-def record_eval_scores(eval_type: str, metrics: dict[str, float]) -> None:
-    """上报一次评估的各指标分数（Gauge set 覆盖 + Counter 计数）。
-
-    Args:
-        eval_type: generation / retrieval / judge
-        metrics: {metric_name: score}
-    """
-    ca_eval_evals_total.labels(eval_type=eval_type).inc()
-    for name, score in metrics.items():
-        ca_eval_scores.labels(metric_name=name, eval_type=eval_type).set(score)
-
-
-def record_eval_regression(metric_name: str) -> None:
-    """记录一次评估回归告警。"""
-    ca_eval_regressions_total.labels(metric_name=metric_name).inc()

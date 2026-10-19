@@ -1,98 +1,41 @@
 # -*- coding: utf-8 -*-
-"""RAGAS 四指标评估（唯一实现）。
+"""RAGAS 四指标评估（唯一实现）：跑分 → 分数表 → 自动留痕。
 
-═══════════════════════════════════════════════════════════════════════════════
-                           【目标形态】
-═══════════════════════════════════════════════════════════════════════════════
+【职责】
+  做   把 retrieval_snapshot 展开成 (竞品@维度) 样本，一次 aevaluate 跑齐四指标，
+       打印分数表，并默认落一个不可变 run 目录。
+  不做 落库、门禁、Prometheus 上报、锁 contexts 重打——那套工程外壳 2026-10-17 已删，
+       留痕与版本对比在 run_archive.py（跑完自动 begin_run / finish_run）。
 
-  一次 `aevaluate` 跑齐四个 ragas 指标，输出「分数表」，不落库、不判门禁、
-  不归档、不 diff。四个指标落在同一行 (竞品@维度) 样本上：
+【输入 → 输出】
+  retrieval_snapshot ─build_samples()
+  → [SampleRow] ─evaluate_four()
+  → FourMetricResult─render_markdown()/to_dict()
+  → 分数表（人读 / JSON）·─run_archive→ run.json + summary.md
 
-    - 检索层：context_precision / context_recall
-    - 生成层：faithfulness / answer_relevancy
+【四指标的输入契约】★ cp 与 cr 的 required_columns 完全相同，故能一行同评
+  指标                     需要字段                              本模块的数据来源
+  context_precision (检索) user_input + contexts + reference      query / reranked_texts / reference
+  context_recall    (检索) user_input + contexts + reference      同上
+  faithfulness      (生成) user_input + response + contexts      + response_text
+  answer_relevancy  (生成) user_input + response (+ embeddings)  + response_text
 
-  context_recall 当前为「先实测再定」：跑出首次数字后，按三种结果决定去留
-  （NaN=技术层失败可修；稳定低分=有据弃用；合理分=保留）。
+【关键决策】
+  · 一行样本喂四指标
+  · reference 优先 cell 级 ← 维度级是跨竞品复合句，判据里有一半讲对方竞品、按定义
+    不可能被支持，cr 天花板钉死 0.5、cp 系统性趋 0（实测 飞书@功能 cr=0.500，正好半句）。
+    三级回退在 llm_factory.resolve_reference，任一级缺键都显式告警、不静默兜底。
+  · 按 response 有无分两批跑 ← 无 response 的样本喂生成层只会换回 NaN 与白花的调用。
+  · 多轮取均值而非中位 ← cr/faithfulness 是比例型，judge 抖动是二值不是离群：
+    [0,1,0] 的中位是 0（把 1/3 支持率抹成一个 bit），均值才是真实比例。
 
-  【2026-10-17 起本模块是唯一的评估实现】老链路（ragas_llm.py / golden_run.py /
-  runner.py / judge_eval.py / cli.py）已整体删除，不再有并行实现。
-  judge / embeddings / RunConfig 的构造与 reference 解析抽在 llm_factory.py，
-  本模块只依赖它，不依赖任何落库 / 上报 / 归档逻辑。
-
-═══════════════════════════════════════════════════════════════════════════════
-                    【为什么要有这个模块（它在治什么病）】
-═══════════════════════════════════════════════════════════════════════════════
-
-  被删掉的旧链路，问题不是「指标变多」，而是「指标定义」和「工程外壳」焊死在一起：
-  改一个指标的算法，要同步改落库 metadata、Grafana 上报、baseline 渲染、diff 列
-  —— 一个函数干六件事。更麻烦的是四个指标分散在两个函数、两个数据源上，
-  根本没法在同一行样本上对齐看：
-
-    旧 · context_precision      ← retrieval_snapshot.reranked_texts（检索原始 chunk）
-    旧 · faithfulness           ← evidence.source_text（LLM 质量 Agent 二次落库的产物）
-    旧 · answer_relevancy       ← 整篇报告正文（response）
-    旧 · (context_recall 缺席，被规则式 source_coverage 顶替)
-
-  于是本模块只做一件事：把 (竞品@维度) 展开成 N 行样本，一行样本同时喂四个指标，
-  **同一份 retrieved_contexts + 同一个 response + 同一个 reference**。
-
-  ── 数据流（本模块内部）────────────────────────────────────────────────
-    retrieval_snapshot 表（analyzer Step 5.5 落盘，成稿前）
-        │  ├─ dimension / competitor / query（="竞品 维度"）
-        │  ├─ reranked_texts（精排 TopK 原始 chunk）→ retrieved_contexts
-        │  └─ response_text（该维度 LLM 结论，回填）→ response
-        ▼
-    build_samples()  ──►  list[SampleRow]（纯函数，可离线测）
-        │
-        ▼
-    evaluate_four()  ──►  一次（或两次）aevaluate ──►  FourMetricResult
-        │                    ├─ 有 response 样本：四指标全跑
-        │                    └─ 无 response 样本：只跑检索层 cp / cr
-        ▼
-    render_markdown() / to_dict()  ──►  分数表（人读 / JSON）
-
-  reference 由 Golden 的 `reference_by_cell["竞品@维度"]` 提供
-  （`get_reference_by_cell`）——**评估单元是 (竞品, 维度)，基准必须同粒度**。
-  取不到 cell 级时回退维度级 `reference_by_dimension`（跨竞品复合句），
-  再回退维度名；三级回退均在 llm_factory.resolve_reference 里显式告警。
-  ⚠️ 用维度级复合句当基准时 cr 天花板约 0.5（每个 cell 有一半讲对方竞品），
-  2026-10-16 实测 `飞书@功能 cr=0.500` 即此。
-
-═══════════════════════════════════════════════════════════════════════════════
-                        【四个指标各自的输入契约】
-═══════════════════════════════════════════════════════════════════════════════
-
-  指标                    | 需要字段                                       | 本模块的数据来源
-  ────────────────────────┼────────────────────────────────────────────────┼──────────────────────────
-  context_precision (检索)| user_input + retrieved_contexts + reference     | query / reranked_texts / reference
-  context_recall    (检索)| user_input + retrieved_contexts + reference     | 同上（★与 cp 同源，故能一行同评）
-  faithfulness      (生成)| user_input + response + retrieved_contexts      | + response_text
-  answer_relevancy  (生成)| user_input + response（+ embeddings）           | + response_text
-
-  ★ 关键洞察：cp 与 cr 的 required_columns 完全相同（都不需要 response）。
-    这直接证伪了旧 docstring 里「没有整段 reference 列 → context_recall 喂不进去」
-    的理由① —— 既然 reference_by_dimension 能当 cp 的 reference，就能当 cr 的 reference。
-    「先实测再定」正是为了用一次真跑，把「cr 恒判 0」从**推断**升级为**实测结论**。
-
-═══════════════════════════════════════════════════════════════════════════════
-                          【四指标的口径（读分数前必看）】
-═══════════════════════════════════════════════════════════════════════════════
-
-  本模块的数据源是 `retrieval_snapshot`，口径固定为：
-
-    · retrieved_contexts = reranked_texts（精排后的原始 chunk）
-    · response           = 该 (竞品, 维度) 的**维度级结论**，不是整篇报告
-    · reference          = Golden 的 reference_by_cell["竞品@维度"]
-
-  ⚠️ 这决定了两件事：
-    1. faithfulness 测的是「这条维度结论有没有越出它自己的 contexts」，
-       不是「整篇报告有没有幻觉」。它只当护栏，不能当分析质量分——
-       复述得分、归纳扣分，而归纳正是分析的价值所在。
-    2. cp / cr 的分母随该 cell 的 n_contexts 变化（3 条和 15 条不可直接比）。
-       所以每行分数都必须带着 n_contexts 一起读。
-
-  真实任务（非 Golden）没有 reference，cp / cr 会退化为「维度名当 ground truth」，
-  分数无参照系、只能看相对变化——这是由评估本身的语义决定的，不是实现缺陷。
+【读分数前必看】
+  · response 是**该维度的结论**，不是整篇报告 ⇒ faithfulness 只当护栏，
+    复述得分、归纳扣分，不能当分析质量分。
+  · cp / cr 的分母 = 该 cell 的 n_contexts（3 条与 15 条不可直接比），
+    每行分数必须带着 n_contexts 一起读。
+  · 真实任务没有 reference，会退化为「维度名当 ground truth」，分数无参照系、
+    只能看相对变化——这是评估语义决定的，不是实现缺陷。
 """
 
 from __future__ import annotations
@@ -109,9 +52,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 # ── monkey-patch：ragas 0.4.3 顶层 import 了不存在的 vertexai 模块 ──
-# 幂等补丁，必须在 import ragas 之前注入；llm_factory.py 里也有一份同款。
-# 为什么幂等：两个模块可能先后被 import，用 `not in sys.modules` 守卫，
-# 保证占位模块只注入一次（谁先 import 谁注入，后来者跳过）。
+# 必须在 import ragas 之前注入；用 sys.modules 守卫保证多处 import 只注入一次
+# （llm_factory.py 里有同款，谁先 import 谁注入）。
 if "langchain_community.chat_models.vertexai" not in sys.modules:
     _vertexai_stub = types.ModuleType("langchain_community.chat_models.vertexai")
 
@@ -121,25 +63,16 @@ if "langchain_community.chat_models.vertexai" not in sys.modules:
     _vertexai_stub.ChatVertexAI = _ChatVertexAI
     sys.modules["langchain_community.chat_models.vertexai"] = _vertexai_stub
 
-#    这里刻意用「旧式指标」（ragas.metrics 顶层 / _ 下划线模块），而不是
-#    ragas.metrics.collections 的新式指标。原因见 llm_factory.py 模块 docstring 的
-#    「两个 ragas 0.4.3 兼容坑」第 2 条：aevaluate() 的 isinstance 检查只认旧式
-#    Metric，collections 指标会报 "All metrics must be initialised"。
-#    代价：`from ragas.metrics import context_precision` 会触发 DeprecationWarning
-#    （提示迁移到 collections）——这是可接受的，因为迁移过去反而跑不起来。
+# 指标刻意用「旧式」（ragas.metrics 顶层 / _ 下划线模块）而非 collections 新式：
+# aevaluate 的 isinstance 检查只认旧式 Metric，新式会报 "All metrics must be initialised"。
+# 代价是 DeprecationWarning——可接受，迁过去反而跑不起来（详见 llm_factory 模块头）。
 from ragas import EvaluationDataset, SingleTurnSample, aevaluate  # noqa: E402
 from ragas.metrics import context_precision, context_recall  # noqa: E402
 from ragas.metrics._answer_relevance import answer_relevancy  # noqa: E402
 from ragas.metrics._faithfulness import faithfulness  # noqa: E402
 
-# ── 复用旧模块的「纯函数 / 构造器」，不引入其落库与编排 ──
-#   build_judge_llm     : 构造 DeepSeek judge（LangchainLLMWrapper 包装）
-#   build_embeddings     : 构造 BGE-M3 embeddings（answer_relevancy 需要）
-#   build_run_config     : 构造 ragas RunConfig（超时/并发，两套链路共用一份口径）
-#   resolve_reference    : cell → ground truth（优先 cell 级，回退维度级/维度名，
-#                           任一级对不上都显式告警）
-#   load_json_list       : 反序列化 JSONB 字段（asyncpg 可能返回 str）
-#   JUDGE_MODEL           : judge 模型名常量（与生成模型隔离）
+# 本模块对外部能力的全部依赖都在这里：judge / embeddings / RunConfig / reference 解析。
+# 口径只此一处定义，不与其他链路各写一份。
 from src.evaluation.llm_factory import (  # noqa: E402
     JUDGE_MODEL,
     build_embeddings,
@@ -148,6 +81,9 @@ from src.evaluation.llm_factory import (  # noqa: E402
     load_json_list,
     resolve_reference,
 )
+# 留痕：默认开，--no-archive 才关。依赖方向单向——run_archive 不 import 本模块，
+# 因为本模块 import 期会拉起 ragas，而对比/趋势必须在无 ragas 环境也能跑。
+from src.evaluation.run_archive import begin_run, finish_run  # noqa: E402
 
 if TYPE_CHECKING:
     # 仅类型标注用，运行时不导入，避免与 src.db 形成循环依赖。
@@ -168,55 +104,55 @@ _METRIC_NAMES = (
 
 @dataclass(frozen=True)
 class SampleRow:
-    """一条 (竞品@维度) 评估样本的输入与元信息（未打分）。
+    """一条 (竞品@维度) 样本的输入与元信息（未打分）。
 
-    「未打分」是刻意的分层：build_samples() 只负责把数据库快照**翻译**成
-    ragas 能吃的样本，不碰任何 LLM —— 这样它可以被单元测试离线覆盖
-    （见 tests/test_ragas_core.py），打分失败也不会污染样本构造逻辑。
+    「未打分」是刻意的分层：build_samples() 只做「数据库快照 → ragas 样本」的翻译，
+    不碰任何 LLM，因而可被单测离线覆盖，打分失败也不会污染样本构造。
 
-    为什么 frozen：样本一旦构造完成，四个指标读的是同一份不可变输入，
-    避免某个指标的计算过程「就地改样本」导致其余指标读到脏数据。
+    frozen：四个指标读同一份不可变输入，避免某个指标就地改样本、让其余指标读到脏数据。
     """
 
     key: str                 # 打分键 = "竞品@维度"（无竞品时退化为维度名），唯一标识该行
-    competitor: str          # 竞品名（可能为空字符串，历史维度级快照无此字段）
+    competitor: str          # 竞品名（可能为空，历史维度级快照无此字段）
     dimension: str           # 维度名
     user_input: str          # = 快照 query（"竞品 维度"），与线上精排 rerank 同尺
-    response: str | None     # 该维度的 LLM 结论；历史快照可能为空 → None（生成层不跑）
-    retrieved_contexts: list[str]  # 精排后 TopK 的原始 chunk（过滤掉 <10 字符的）
-    reference: str           # 该 cell ground truth（优先 reference_by_cell["竞品@维度"]，回退维度级）
-    n_contexts: int          # 本行实际参与评分的 context 条数 = cp/cr 的**分母**
+    response: str | None     # 该维度的 LLM 结论；历史快照为空 → None（生成层不跑）
+    retrieved_contexts: list[str]  # 精排后 TopK 的原始 chunk（已滤掉 <10 字符的）
+    reference: str           # 该 cell ground truth（优先 reference_by_cell，回退维度级）
+    n_contexts: int          # 实际参与评分的 context 条数 = cp/cr 的**分母**
 
 
 @dataclass
 class FourMetricResult:
-    """一次四指标评估的输出：逐样本分数 + 均值 + 分母分布。
+    """一次评估的输出：逐样本分数 + 均值 + 分母分布 + 每轮原始分。
 
-    这里把「分数」与「分母」放在同一个结构体里，而不是像旧链路那样把
-    n_contexts 散落到 result 字典 / 落库 metadata / Grafana 上报 / 表格单元格 /
-    diff 列五个地方。理由：context_precision 是对**实际检索到的那几条**求
-    Average Precision，分母会波动（实测 1~8），「分母小 ⇒ 分数系统性偏高」。
-    一个指标要拆成「分数 + 分母」两个数、靠纪律保证同时出现，就说明它本该是
-    一个复合值 —— 本结构体就是那个复合值。
+    「分数」与「分母」放在同一个结构体里，因为 cp 是对实际检索到的那几条求 AP，
+    分母会波动且「分母小 ⇒ 分数系统性偏高」——两者必须同时出现才读得对。
     """
 
     task_id: str
-    # 逐样本分数行：每行 {"key","competitor","dimension","n_contexts", <四个指标…>}
+    # 逐样本分数行：每行 {"key","competitor","dimension","n_contexts","reference", <四指标…>}
     rows: list[dict] = field(default_factory=list)
-    # {指标名: 均值}；无有效分数的指标为 None（严格忽略 None/NaN，不静默计 0）
+    # {指标名: 均值}；无有效分数的指标为 None（严格忽略 None/NaN，不按 0 补）
     aggregates: dict[str, float | None] = field(default_factory=dict)
     # cp/cr 分母的分布：{"avg": x, "min": n, "max": n}（跨任务比较前必看）
     n_contexts: dict[str, float | int | None] = field(default_factory=dict)
-    # 被跳过的快照数（无有效上下文，未能构成样本）
+    # 被跳过的快照数（无有效上下文，构不成样本）
     skipped: int = 0
-    # 每个 (样本,指标) 实际跑了多少轮、分数取均值（1 = 单轮，与旧行为等价）。
-    # 必须随分数一起暴露：repeat=1 与 repeat=3 的分数期望与方差不同，不标注会让
-    # 「两轮 cr 从 0.5 变 1.0」被误读成回归。
+    # 每个 (样本,指标) 跑了几轮、分数取均值。必须随分数暴露：repeat=1 与 3 的期望
+    # 与方差不同，不标注会让「cr 从 0.5 变 1.0」被误读成回归。
     repeat: int = 1
-    # 每指标的跨样本极差（max-min）；repeat=1 时为 None。
-    # 用途：均值告诉你「期望多少」，极差告诉你「这个数有多可信」。
-    # cr 的极差常为 1.000（二值抖动），此时均值只能当「支持率」读，不能当精确度。
+    # 每指标的跨样本极差（max-min），repeat=1 时为 None。
+    # 均值说「期望多少」，极差说「多可信」；cr 极差常为 1.000（二值抖动），
+    # 此时均值只能当支持率读，不能当精确度。
     repeat_spread: dict[str, float | None] = field(default_factory=dict)
+    # {cell key: {指标名: [每轮原始分]}}（repeat=1 时每项是单元素列表）。
+    # 不能只留「均值 + 跨样本极差」：跨版本判定阈值是**该 cell 自己**的跨轮极差，
+    # 而跨样本 max-min 分不清「两轮 0/1」和「两轮 0.4/0.6」。
+    # 落档后逐 cell 才有噪声尺子（见 run_archive._cell_spread）。
+    scores_by_repeat: dict[str, dict[str, list[float | None]]] = field(
+        default_factory=dict
+    )
 
 
 def build_samples(
@@ -225,54 +161,36 @@ def build_samples(
     task_id: str = "",
     reference_cell_map: dict[str, str] | None = None,
 ) -> list[SampleRow]:
-    """把 retrieval_snapshot 行展开为 (竞品@维度) 评估样本（纯函数）。
+    """把 retrieval_snapshot 行展开为 (竞品@维度) 评估样本（纯函数，不碰 LLM）。
 
-    - user_input = 快照 query（= 线上精排 query「竞品 维度」）
-    - retrieved_contexts = reranked_texts 中 ≥10 字符的原始 chunk
-    - reference = **优先 cell 级** reference_cell_map["竞品@维度"]（只讲该竞品），
-      缺失回退 reference_map[dimension]（维度级复合句），再缺省退化用维度名
-    - response = response_text（细粒度维度结论；历史快照可能为空）
-    - n_contexts = 实际参与评分的 context 条数（cp/cr 的分母）
+    字段映射：
+      user_input         = 快照 query（= 线上精排 query「竞品 维度」）
+      retrieved_contexts = reranked_texts 中 ≥10 字符的原始 chunk
+      reference          = 优先 cell 级（只讲该竞品），回退维度级，再退维度名
+      response           = response_text（维度级结论；历史快照可能为空）
+      n_contexts         = 实际参与评分的 context 条数（cp/cr 的分母）
 
-    【为什么 reference 首选 cell 级，而不是维度级】
-      评估单元是 (竞品, 维度)，而 `reference_map`（= Golden 的
-      reference_by_dimension）是**维度级、跨竞品复合**（"飞书…；钉钉…"）。
-      把它喂给某个 cell，判据里必然有一半讲的是**对方竞品**、按定义不可能
-      被支持 ⇒ **context_recall 天花板被钉死 0.5**。
-      2026-10-16 实测：`飞书@功能 cr=0.500` = 正好"半句"，即此机制的直接证据。
-      故基准粒度必须与评估单元对齐 → 传 `reference_cell_map`
-      （= `get_reference_by_cell(golden_id)`）。
-
-    【为什么 user_input 要用「快照 query」而不是「维度名」】
-      context_precision / context_recall 都在判「检索到的 context 是否支撑
-      该 ground truth」，而线上精排 reranker 的 query 是 `"竞品 维度"`。
-      评估时如果只用维度名当 query，等于拿「维度」这把尺子去量一条用
-      「竞品 维度」尺子排出来的结果，两把尺子错配 → 分数不可比。
-      快照里已把 query 原样落盘，直接取用即可保持同尺。
-
-    【为什么 response 可能为 None】
-      response_text 是 analyzer 成功路径**回填**的（见 analyzer.py Step 5.5）。
-      历史快照（该列刚加、或分析失败）没有值。此时生成层指标无从评起，
-      但检索层 cp/cr 与 response 无关 —— 所以这里不丢样本，只把 response 置 None，
-      由 evaluate_four 把样本分流到「只跑检索层」的分支。
+    两个非显然的选择：
+      · user_input 用「快照 query」而非维度名 ← 精排 reranker 的 query 是「竞品 维度」，
+        用维度名当 query 会让评估尺子与检索尺子错配，分数不可比。
+      · reference 首选 cell 级 ← 维度级是跨竞品复合句，判据一半讲对方竞品，
+        cr 天花板被钉死 0.5（实测 飞书@功能 cr=0.500，正好半句）。
     """
     rows: list[SampleRow] = []
     for snap in snapshots:
-        # 用 .get() 而非 snap["dimension"]：历史 / 异常快照可能缺字段，
-        # 缺字段时宁可退化成空串也不要 KeyError 打断整批评分。
+        # .get() 而非下标：历史 / 异常快照可能缺字段，宁可退化成空串，
+        # 也不要 KeyError 打断整批评分。
         dimension = snap.get("dimension") or ""
         competitor = snap.get("competitor") or ""
 
-        # 【命名对照】DB 列名仍是 query / reranked_texts / response_text（历史名，未随改），
-        # 这里立刻转成 RAGAS 官方字段名 user_input / retrieved_contexts / response，
-        # 让下游（_to_ragas_sample → SingleTurnSample）逐字对齐、无需再做心智翻译。
-        # 快照 query 已落为 "竞品 维度"；老快照可能为空 → 退化为维度名。
+        # DB 列名（query / reranked_texts / response_text）保持历史命名，
+        # 在这里一次性转成 RAGAS 官方字段名，下游逐字对齐、不再做心智翻译。
         user_input = snap.get("query") or dimension
 
-        # reranked_texts 是 JSONB：asyncpg 读出来可能是 str（需反序列化）也可能是 list。
+        # reranked_texts 是 JSONB：asyncpg 读出可能是 str（需反序列化）也可能是 list。
         retrieved_contexts = load_json_list(snap.get("reranked_texts"))
-        # 过滤 <10 字符的碎片：导航文本、单字标题等既不含事实也无法被 judge 判读，
-        # 留着只会虚增分母（让 cp 的 AP 分母变大、分数被系统性压低）。
+        # 滤掉 <10 字符的碎片：导航文本、单词标题既无事实也判读不出，
+        # 留着只会虚增分母、把 cp 系统性压低。
         retrieved_contexts = [
             c for c in retrieved_contexts if c and len(str(c).strip()) >= 10
         ]
@@ -326,13 +244,11 @@ def _to_ragas_sample(row: SampleRow) -> SingleTurnSample:
 
 
 def _fmt(value) -> str:
-    """分数渲染：None / NaN 统一为「—」，否则保留 3 位小数。
+    """分数渲染：None / NaN → 「—」，否则保留 3 位小数。
 
-    【为什么 None 和 NaN 要渲染成同一个符号「—」】
-      对读者而言两者语义相同：「这一格没有可用分数」。NaN 是 ragas 内部
-      拆句失败 / 请求失败时的产物，None 是我们主动跳过的产物 —— 区分它们
-      只对调试有意义，对基线表没意义，且 NaN 直接打印会变成 "nan" 这种
-      非分数噪音。
+    None 与 NaN 统一成「—」：对读者语义相同（这格没有可用分数）。NaN 是 ragas
+    内部拆句/请求失败的产物，None 是主动跳过；区分只对调试有意义，且 nan 直接
+    打印出来是噪音而非分数。
     """
     if value is None:
         return "—"
@@ -346,12 +262,10 @@ def _fmt(value) -> str:
 
 
 def _aggregate_scores(rows: list[dict]) -> dict[str, float | None]:
-    """各指标有效分数均值（忽略 None / NaN，不静默计入）。
+    """各指标有效分数的均值（忽略 None / NaN，绝不按 0 补）。
 
-    【为什么必须忽略而不是按 0 计】
-      把「拿不到分」按 0 计入均值，会得出一个「看起来很低」但并不存在的分数
-      —— 读者无法区分「真的差」和「没测到」。忽略后若全部为空则返回 None，
-      表里显式显示「—」，把信息缺失暴露出来而不是抹平。
+    按 0 补会造出一个「看起来很低」但并不存在的分数，读者无法区分「真的差」
+    和「没测到」。全为空时返回 None，表里显式显示「—」，把缺失暴露出来。
     """
     buckets: dict[str, list[float]] = {name: [] for name in _METRIC_NAMES}
     for row in rows:
@@ -375,23 +289,13 @@ def _aggregate_scores(rows: list[dict]) -> dict[str, float | None]:
 def _mean_score(values: list[float | None]) -> float | None:
     """多轮重复打分取均值（忽略 None / NaN）；无有效值返回 None。
 
-    【为什么是均值而不是中位数（2026-10-17 改，推翻原实现）】
-      原来用中位数，理由是「judge 非确定性产生的偏差是离群」。实测证伪了这一点：
-      cr 的方差不是离群，而是**二值抖动** —— 同一个 cell 三轮跑出 [0, 1, 0]
-      （2026-10-17 `ragas_repeat_probe`：钉钉@定价 / 钉钉@功能 均为此形态）。
+    ★ 用均值而不是中位数（2026-10-17 推翻原实现）：
+      judge 的抖动是**二值抖动**而不是离群。同一 cell 三轮跑出 [0,1,0] 时，
+      中位数（排序后 [0,0,1]）取 0，把「1/3 轮支持」抹成一个 bit；
+      均值取 0.333，才是真实支持率。连续型指标用均值同样无损。
+      稳定性另看极差：FourMetricResult.repeat_spread。
 
-      对这种形态：
-        · 中位数 [0,1,0] → 排序 [0,0,1] → **0**，把「1/3 的支持率」直接抹平成一个 bit，
-          信息全丢；
-        · 均值 [0,1,0] → **0.333**，正是「3 轮里 1 轮判定被支持」的真实比例。
-
-      ⇒ 二值/比例型指标（cr、faithfulness）必须看均值；连续型（cp、ar）用均值也
-        无损（REPEAT 的目的是估计期望值，均值即无偏估计）。
-        稳定性另看极差：`FourMetricResult.repeat_spread` 给出每指标 max-min。
-
-    【repeat=1 时与改动前逐位等价】
-      单元素的均值就是该元素本身，且取整位数相同（round(value, 3)），
-      故默认不重复时行为不变。
+    repeat=1 时与改动前逐位等价：单元素均值即自身，取整位数相同。
     """
     valid: list[float] = []
     for v in values:
@@ -417,28 +321,18 @@ async def evaluate_four(
 ) -> FourMetricResult:
     """一次（或 repeat 次）aevaluate 跑齐四指标（不落库）。
 
-    - 有 response 的样本：四指标全跑。
-    - 无 response 的历史快照：只跑检索层 cp / cr，生成层留「—」。
+    · 有 response 的样本：四指标全跑。
+    · 无 response 的历史快照：只跑检索层 cp / cr，生成层留「—」。
 
-    【为什么要按 response 有无分成两批，而不是一批全跑四指标】
-      faithfulness / answer_relevancy 都必须吃 response。若把所有样本混成一批
-      提交四指标，ragas 会对「response 为 None」的样本生成层返回 NaN/报错，
-      白白把生成层的 LLM 调用（faithfulness 要拆句、answer_relevancy 要反推
-      问题）浪费在无意义的样本上。分两批 = 生成层只对真正有结论的样本花钱。
-      （代价：理想中「一次 aevaluate」在最坏情况下变成两次 —— 但两次都是
-       批量调用，相对旧链路「逐 (竞品,维度) 循环各调一次」仍是数量级收敛。）
+    两批而不是一批 ← faithfulness / answer_relevancy 必须吃 response，
+    混批会让生成层对空样本返回 NaN/报错，白花拆句与反推问题的调用。
 
-    【repeat 参数：压 judge 方差，代价是成本线性 ×N】
-      n=4 的样本量下，judge 的非确定性大于指标效应本身（同输入两轮 cr 可差
-      0.5），单轮分数不具备可读性。repeat>1 时每个 (样本,指标) 收 N 个分数
-      取**均值**（见 _mean_score）。默认 1 = 与改动前逐位等价；
-      要压方差必须显式传（CLI `--repeat 3`），因为它把 LLM 成本乘以 N。
+    repeat > 1 时每个 (样本,指标) 收 N 个分数取均值（见 _mean_score），
+    成本线性 ×N，故默认 1；要压方差必须显式传（CLI `--repeat 3`）。
 
-    【⚠️ 全局单例：本函数会就地改写 ragas 的模块级指标对象】
-      ragas 的旧式指标是**预实例化单例**，llm/embeddings 必须就地赋值（不能传参）。
-      后果：任何 import 方共享同一份状态，测试无法隔离，并发调用会互相踩。
-      ragas 旧式指标是**预实例化单例**，llm/embeddings 只能就地赋值、无法传参，
-      故本函数会改写模块级状态（测试里需 monkeypatch 隔离）。已知坏味道，不在指标层翻修。
+    ⚠️ 本函数会**就地改写** ragas 的模块级指标对象：旧式指标是预实例化单例，
+    llm/embeddings 只能就地赋值、不能传参。后果是 import 方共享状态、测试需
+    monkeypatch 隔离、并发调用会互相踩。已知坏味道，不在指标层翻修。
     """
     result = FourMetricResult(task_id=task_id)
     if not samples:
@@ -455,33 +349,31 @@ async def evaluate_four(
     judge = build_judge_llm(settings)
     embeddings = build_embeddings(settings)
 
-    # ragas 旧式/顶层指标均为全局单例，就地赋值（与旧模块一致）。
-    # judge 统一用 deepseek-chat，四个指标同一把尺子，分数口径一致。
+    # 旧式指标是模块级单例，llm/embeddings 只能就地赋值（见本函数 docstring 的 ⚠️）。
+    # 四个指标共用同一把 judge，分数口径才一致。
     context_precision.llm = judge
     context_recall.llm = judge
     faithfulness.llm = judge
     answer_relevancy.llm = judge
     answer_relevancy.embeddings = embeddings
-    # strictness 必须为 1：DeepSeek 不支持 n>1，否则 answer_relevancy 恒 NaN。
-    # （ragas 把 strictness 当 `n` 透传给 LLM；n>1 → 400 Bad Request →
-    #  内部重试耗尽 → 恒 NaN。实测 strictness=3 耗时 48.7s 后失败，
-    #  =1 后 11.7s 返回有效分。）
+    # strictness 必须为 1：ragas 把它当 `n` 透传给 LLM，而 DeepSeek 不支持 n>1
+    # （n>1 → 400 → 重试耗尽 → ar 恒 NaN。实测 strictness=3 跑 48.7s 后失败，
+    #  =1 时 11.7s 出有效分）。
     answer_relevancy.strictness = 1
 
     # 按 response 有无分流（理由见 docstring）。
     with_response = [s for s in samples if s.response]
     without_response = [s for s in samples if not s.response]
 
-    # key → {指标名: [每轮分数]}；repeat 轮跑完后逐指标取中位（_median_score）。
-    # 结构从「单值」升级为「列表」，是为了让「重复→中位」这件事只发生在**回填**这一步，
-    # 各轮之间互不覆盖（若仍用单值 dict，后一轮会静默盖掉前一轮）。
+    # key → {指标名: [每轮分数]}；repeat 轮跑完后逐指标取**均值**（_mean_score）。
+    # 用列表而非单值：聚合只发生在回填这一步，各轮互不覆盖
+    # （单值 dict 会让后一轮静默盖掉前一轮）。
     scores_by_key: dict[str, dict[str, list[float | None]]] = {}
 
     async def _run(subset: list[SampleRow], metrics: list) -> None:
-        """对一批样本跑 repeat 轮同一组指标，逐轮把分数追加进 scores_by_key。
+        """对一批样本跑 repeat 轮，逐轮把分数追加进 scores_by_key。
 
-        内嵌闭包而非独立函数：它直接消费外层的 task_id / scores_by_key，
-        抽出去反而要多传参、且只有本函数用。
+        内嵌闭包：直接消费外层的 task_id / scores_by_key，抽出去反而多传参。
         """
         if not subset:
             return
@@ -526,10 +418,10 @@ async def evaluate_four(
                     except (TypeError, ValueError):
                         value = None
                     if value is not None and math.isnan(value):
-                        # NaN 不是合法 JSON，且写 float 列会报错 —— 统一归 None，
-                        # 并打 warning 留下「这里丢过一个分」的痕迹（不静默）。
-                        # ⚠️ NaN 常见成因是 run_config.timeout 被撞穿（长 contexts 样本
-                        #    串行判定），故把分母一并打出来，方便判断是不是这个原因。
+                        # NaN 不是合法 JSON，写 float 列也会报错 → 统一归 None，
+                        # 但打 warning 留下「这里丢过一个分」的痕迹（不静默）。
+                        # 常见成因是 timeout 被撞穿（长 contexts 串行判定），
+                        # 故把分母一并打出来，便于判断是不是这个原因。
                         logger.warning(
                             "指标 %s 返回 NaN key=%s contexts=%d 轮次=%d/%d "
                             "（若伴随 TimeoutError，调大 RAGAS_EVAL_TIMEOUT）",
@@ -549,13 +441,9 @@ async def evaluate_four(
     # 第二批：只跑检索层两指标（无 response 的历史快照，不浪费生成层 LLM 调用）。
     await _run(without_response, [context_precision, context_recall])
 
-    # 按原始 samples 顺序回填 rows（保证输出顺序 = 样本顺序，便于逐条比对）。
-    # 每个指标取 repeat 轮的**均值**（repeat=1 时即该值本身，行为与改动前等价）。
-    # 均值而非中位：cr/faithfulness 是比例型，[0,1,0] 的真实含义是 1/3 支持率，
-    # 中位会把它抹成 0（详见 _mean_score docstring）。
-    # ⚠️ scores_by_key 以 sample.key 为键：若两行样本 key 相同（同竞品同维度重复），
-    #    会互相覆盖（后者胜），且所有同 key 行共享同一分数。当前维度/竞品去重后
-    #    不会出现；若将来放开重复，需要把 key 换成「行唯一 id」。
+    # ① 极差：把**全部**有效分数（跨样本 × 跨轮）拉平求 max-min，看这一轮跑的离散程度。
+    #    ⚠️ 这不是「每格自己的跨轮极差」——那个在 run_archive._cell_spread。
+    #    对比判定必须用后者：这里混入了样本间差异，当噪声阈值会放大或吞掉真实变化。
     spread: dict[str, float | None] = {}
     for name in _METRIC_NAMES:
         vals: list[float] = []
@@ -572,6 +460,10 @@ async def evaluate_four(
         spread[name] = round(max(vals) - min(vals), 3) if len(vals) >= 2 else None
     result.repeat_spread = spread
 
+    # ② 按原始 samples 顺序回填 rows（输出顺序 = 样本顺序，便于逐条比对），
+    #    每格取 repeat 轮均值（repeat=1 即该值本身，与改动前等价）。
+    #    ⚠️ scores_by_key 以 sample.key 为键：同 key 两行会互相覆盖（后者胜）。
+    #    当前竞品/维度已去重不会出现；将来放开重复需换成行唯一 id。
     for sample in samples:
         buckets = scores_by_key.get(sample.key, {})
         row = {
@@ -579,10 +471,20 @@ async def evaluate_four(
             "competitor": sample.competitor,
             "dimension": sample.dimension,
             "n_contexts": sample.n_contexts,  # 分母随行携带，读者一眼可见
+            # reference 一起落档：它是这格分数的判据，留着才能解释「为什么只有 0.33」。
+            # 不留 contexts（体积大，且明确不做锁 contexts 重打）。
+            "reference": sample.reference,
         }
         for name in _METRIC_NAMES:
             row[name] = _mean_score(buckets.get(name, []))
         result.rows.append(row)
+
+    # 每轮原始分原样带出（对比时靠它算「这一格自己的噪声尺子」，见 run_archive）。
+    # 只读拷贝：不把内部可变结构直接暴露出去（调用方后续若改它，不该影响下一次评估）。
+    result.scores_by_repeat = {
+        key: {name: list(vals) for name, vals in bucket.items()}
+        for key, bucket in scores_by_key.items()
+    }
 
     result.aggregates = _aggregate_scores(result.rows)
     # cp/cr 分母分布（跨任务比较前必看；见 SampleRow.n_contexts 的说明）。
@@ -605,6 +507,8 @@ def to_dict(result: FourMetricResult) -> dict:
         "skipped": result.skipped,
         "repeat": result.repeat,
         "repeat_spread": result.repeat_spread,
+        # 每格每轮原始分：对比判定的阈值来源，缺了就只剩「看 Δ 不判噪声」。
+        "scores_by_repeat": result.scores_by_repeat,
     }
 
 
@@ -616,8 +520,7 @@ def render_markdown(result: FourMetricResult) -> str:
         "| 样本 | n_contexts | context_precision | context_recall | faithfulness | answer_relevancy |",
         "|---|---|---|---|---|---|",
     ]
-    # 逐样本行：key = "竞品@维度"；n_contexts 与四个分数同格呈现，
-    # 避免旧 baseline「分数可比性完全依赖读者记得看括号里的 n̄」的坑。
+    # 逐样本行：n_contexts 与四个分数同格呈现——分数可比性依赖读者看得到分母。
     for row in result.rows:
         lines.append(
             "| {key} | {n} | {cp} | {cr} | {fa} | {ar} |".format(
@@ -651,12 +554,13 @@ def render_markdown(result: FourMetricResult) -> str:
             rp=result.repeat,
         )
     )
-    # repeat>1 时再附一行极差：均值说「期望多少」，极差说「这个数有多可信」。
-    # cr 极差常为 1.000（二值抖动）→ 此时只能按「支持率比例」读，不能当精确度。
+    # repeat>1 时附极差：均值说「期望多少」，极差说「这个数有多可信」。
+    # ⚠️ 这里是**全体有效分数**的极差（跨样本 × 跨轮），只能粗略看离散程度；
+    #    判定某格有没有真变化要用 run_archive 的逐 cell 跨轮极差（θ）。
     spread = result.repeat_spread or {}
     if result.repeat > 1 and spread:
         lines.append(
-            "跨轮极差(max-min): " + " · ".join(
+            "全量极差(max-min): " + " · ".join(
                 f"{name}={_fmt(spread.get(name))}" for name in _METRIC_NAMES
             )
         )
@@ -673,14 +577,12 @@ async def evaluate_task_four(
 ) -> FourMetricResult:
     """评一个已完成任务的四指标（读 retrieval_snapshot，不落库）。
 
-    ⚠️ 两个 map 都为 None（真实任务默认）时，cp/cr 的 reference 会退化为
-    「维度名」——这是弱 baseline，仅能跑通流程，分数参考价值有限
-    （judge 拿「功能」两个字去判 context 是否支撑，几乎必然失真）。
-    真实任务的强 baseline 需要另外提供该任务的标准答案；
-    只给 `reference_map`（维度级复合句）时 cr 天花板约 0.5，
-    **要拿到干净的 cp/cr 必须给 `reference_cell_map`（cell 级）。**
+    ⚠️ 真实任务默认不传 map → reference 退化为「维度名」，属弱 baseline，
+    仅能跑通流程、分数参考价值有限（judge 拿「功能」两个字判 context 是否支撑）。
+    要拿到干净的 cp/cr 必须给 `reference_cell_map`（cell 级）；只给维度级时
+    cr 天花板约 0.5。
 
-    repeat：每个 (样本,指标) 重复跑几轮取中位（>1 才压得住 judge 方差，成本 ×N）。
+    repeat：每个 (样本,指标) 跑几轮取均值（>1 才压得住 judge 方差，成本 ×N）。
     """
     from src.config import Settings
     from src.db.dao import RetrievalSnapshotDAO
@@ -696,16 +598,18 @@ async def evaluate_task_four(
     return result
 
 
-async def run_golden_proto(
+async def run_golden(
     case_ids: list[str] | None = None, repeat: int = 1
 ) -> list[dict]:
-    """跑 Golden 数据集（Pipeline 后立即四指标评分），只返回分数，不归档。
+    """跑 Golden：每条 case 走真实 Pipeline，再对每个 (竞品@维度) 打四指标分。
 
-    只做一件事：跑 Pipeline → 对每个 (竞品, 维度) 打四指标分 → 打印分数表。
-    不落库、不写 baseline、不建归档目录、不渲染 diff、不判门禁（2026-10-17
-    按「只保留实际使用的代码」删掉了那套外壳）。
+    只算分、不碰磁盘——留痕由调用方（_cmd_golden）跑完后调 finish_run，
+    故本函数仍可被测试完全离线驱动。
 
-    repeat：每个 (样本,指标) 重复跑几轮取**均值**（默认 1；>1 时成本 ×N）。
+    每条 case 新建一个真实 task_id（golden_id 只用于对答案，不落库为任务），
+    用完即关连接池：一条一隔离，跑批场景可接受。
+
+    repeat：每个 (样本,指标) 跑几轮取均值（默认 1；>1 时成本 ×N）。
     """
     from src.db.connection import close_pool, create_pool
     from src.db.dao import RetrievalSnapshotDAO, TaskDAO
@@ -722,12 +626,12 @@ async def run_golden_proto(
         cases = [c for c in cases if c["task_id"] in case_ids]
 
     router = IntentRouter()
+    settings = router.settings  # 循环不变量，提到外面（每条 case 重取一次没有意义）
     results: list[dict] = []
     for case in cases:
         golden_id = case["task_id"]
-        # 每条 Golden 生成一个真实 task_id（golden_id 只用于对答案，不落库为任务）。
+        # 每条 Golden 生成一个真实 task_id：golden_id 只用于对答案，不落库为任务。
         real_task_id = str(uuid.uuid4())
-        settings = router.settings
         pool = await create_pool(settings)
         entry = {
             "golden_id": golden_id,
@@ -739,6 +643,7 @@ async def run_golden_proto(
             "skipped": 0,
             "repeat": repeat,
             "repeat_spread": {},
+            "scores_by_repeat": {},
             "error": None,
         }
         try:
@@ -757,8 +662,8 @@ async def run_golden_proto(
                 "title": case["title"],
                 "user_id": "golden-runner",
             }
-            # 2) 构造 IntentionRouter 期望的解析结果（Golden 自带 competitors/dimensions，
-            #    无需再过一遍意图解析）。intent_is_clear 为假会触发 Supervisor 探索。
+            # 2) 直接构造 router 期望的解析结果：Golden 自带 competitors/dimensions，
+            #    不必再过一遍意图解析。intent_is_clear 为假会触发 Supervisor 探索。
             llm_parsed = {
                 "competitors": case["competitors"],
                 "dimensions": case["dimensions"],
@@ -768,7 +673,7 @@ async def run_golden_proto(
             exec_result = await router.route(task, llm_parsed)
             entry["route"] = exec_result.get("route")
             if "error" in exec_result:
-                # 链路本身失败 → 记录错误、跳过评分（没有快照可评）。
+                # 链路本身失败 → 记错误、跳过评分（没有快照可评）。
                 entry["error"] = exec_result.get("error")
                 results.append(entry)
                 continue
@@ -776,9 +681,8 @@ async def run_golden_proto(
             # 4) 读链路落下的检索快照 → 构样本 → 四指标评分。
             snapshot_dao = RetrievalSnapshotDAO(pool)
             snapshots = await snapshot_dao.get_by_task(real_task_id)
-            # reference 取 **cell 级**（"竞品@维度"，单竞品）——与评估单元同粒度。
-            # 若只传维度级 reference_by_dimension（跨竞品复合句），每个 cell 的
-            # 判据里有一半讲的是对方竞品，cr 天花板会被钉在 0.5。
+            # reference 必须传 **cell 级**（与评估单元同粒度）；只传维度级会让
+            # 每个 cell 的判据有一半讲对方竞品，cr 天花板钉在 0.5。
             samples = build_samples(
                 snapshots,
                 get_reference_by_dimension(golden_id),
@@ -795,8 +699,8 @@ async def run_golden_proto(
             logger.exception("【RAGAS Core】%s 失败: %s", golden_id, exc)
             entry["error"] = str(exc)
         finally:
-            # ⚠️ 每个 case 用完即关池（不做连接复用）。Golden 跑批场景可接受，
-            #    若要优化可提到循环外共用一池；此处为保持「一条一隔离」不动。
+            # 每个 case 用完即关池（一条一隔离）。跑批场景可提到循环外共用一池，
+            # 此处不为性能牺牲隔离。
             await close_pool()
         results.append(entry)
     return results
@@ -817,53 +721,89 @@ def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
 
-async def _cmd_task(task_id: str, as_json: bool, repeat: int = 1) -> None:
-    """CLI 子命令：评估一条已完成的真实任务。"""
+async def _cmd_task(
+    task_id: str,
+    as_json: bool,
+    repeat: int = 1,
+    note: str | None = None,
+    archive: bool = True,
+) -> None:
+    """CLI 子命令：评一条已完成的真实任务（默认留痕）。
+
+    ⚠️ 单评没有 reference，cp/cr 退化为「维度名当 ground truth」= 弱 baseline；
+    归档 kind=task，不进趋势表、不能当 baseline。
+    """
     from src.config import Settings
     from src.db.connection import close_pool, create_pool
     from src.db.dao import TaskDAO
 
     settings = Settings()
     pool = await create_pool(settings)
+    handle = begin_run("task", note=note) if archive else None
     try:
         dao = TaskDAO(pool)
         # 注意：这里不传 reference_map → cp/cr 的 reference 退化为维度名（弱 baseline）。
         result = await evaluate_task_four(task_id, dao, settings, repeat=repeat)
+        if handle:
+            entry = to_dict(result)
+            # 单评没有 golden_id，用 task 前缀当 cases 键（避免与 golden_00x 混淆）。
+            entry["golden_id"] = f"task_{task_id[:8]}"
+            entry["error"] = None
+            run_dir = finish_run(handle, [entry], settings=settings, cases_requested=1)
+        else:
+            run_dir = None
         if as_json:
             _print_json(to_dict(result))
         else:
             print(render_markdown(result))
+        if run_dir:
+            print(f"\n已归档：{run_dir}")
     finally:
         await close_pool()
 
 
 async def _cmd_golden(
-    case_ids: list[str] | None, as_json: bool, repeat: int = 1
+    case_ids: list[str] | None,
+    as_json: bool,
+    repeat: int = 1,
+    note: str | None = None,
+    archive: bool = True,
 ) -> None:
-    """CLI 子命令：跑 Golden 数据集四指标评分。"""
-    results = await run_golden_proto(case_ids, repeat=repeat)
+    """CLI 子命令：跑 Golden 数据集四指标评分（并默认留痕）。"""
+    from src.evaluation.golden_dataset import GOLDEN_DATASET
+
+    requested = len(case_ids) if case_ids else len(GOLDEN_DATASET)
+    # begin_run 放在跑之前：先占住 run_id 并写下 .pending，
+    # 即使跑到一半崩了，目录里也留得下「这次是谁、什么时候、想干什么」。
+    handle = begin_run("golden", note=note) if archive else None
+    results = await run_golden(case_ids, repeat=repeat)
+    run_dir = finish_run(handle, results, cases_requested=requested) if handle else None
     if as_json:
         _print_json(results)
-        return
-    for entry in results:
-        print(f"## {entry['golden_id']} (route={entry.get('route')})")
-        if entry.get("error") and not entry.get("rows"):
-            # 链路失败且无分数行 → 只打印错误。
-            print(f"失败: {entry['error']}")
+    else:
+        for entry in results:
+            print(f"## {entry['golden_id']} (route={entry.get('route')})")
+            if entry.get("error") and not entry.get("rows"):
+                # 链路失败且无分数行 → 只打印错误。
+                print(f"失败: {entry['error']}")
+                print("")
+                continue
+            # 把 dict 还原成 FourMetricResult 以复用统一的 Markdown 渲染。
+            result = FourMetricResult(
+                task_id=entry["task_id"],
+                rows=entry["rows"],
+                aggregates=entry["aggregates"],
+                n_contexts=entry["n_contexts"],
+                skipped=entry["skipped"],
+                repeat=entry.get("repeat", repeat),
+                repeat_spread=entry.get("repeat_spread", {}),
+                scores_by_repeat=entry.get("scores_by_repeat", {}),
+            )
+            print(render_markdown(result))
             print("")
-            continue
-        # 把 dict 还原成 FourMetricResult 以复用统一的 Markdown 渲染。
-        result = FourMetricResult(
-            task_id=entry["task_id"],
-            rows=entry["rows"],
-            aggregates=entry["aggregates"],
-            n_contexts=entry["n_contexts"],
-            skipped=entry["skipped"],
-            repeat=entry.get("repeat", repeat),
-            repeat_spread=entry.get("repeat_spread", {}),
-        )
-        print(render_markdown(result))
-        print("")
+    if run_dir:
+        print(f"已归档：{run_dir}")
+        print("看结果：summary.md（本次明细）/ TREND.md（历史趋势）")
 
 
 def main() -> None:
@@ -875,12 +815,15 @@ def main() -> None:
       python -m src.evaluation.ragas_core --golden --case golden_003  # 只跑一条
       python -m src.evaluation.ragas_core --golden --json         # JSON 输出
       python -m src.evaluation.ragas_core --golden --case golden_001 --repeat 3
-                                                                  # 重复 3 轮取中位压方差
+                                                                  # 重复 3 轮取均值压方差
+      python -m src.evaluation.ragas_core --golden --repeat 3 --note "top_k 15→20"
+                                                                  # 跑并留痕，备注进 manifest
+      python -m src.evaluation.ragas_core --golden --no-archive    # 本次不留痕（调试用）
     """
     _setup_logging()
 
     parser = argparse.ArgumentParser(
-        description="RAGAS 四指标评估（唯一实现：只出分数表，不落库）"
+        description="RAGAS 四指标评估（唯一实现：出分数表 + 默认自动留痕）"
     )
     parser.add_argument("--task", help="评估已完成的真实任务 ID")
     parser.add_argument("--golden", action="store_true", help="跑 Golden 数据集并评分")
@@ -893,18 +836,33 @@ def main() -> None:
         "--repeat",
         type=int,
         default=1,
-        help="每个 (样本,指标) 重复几轮取中位（默认 1；>1 会线性增加 LLM 成本，"
+        help="每个 (样本,指标) 重复几轮取均值（默认 1；>1 会线性增加 LLM 成本，"
         "仅当需要压 judge 方差时使用，建议 3）",
+    )
+    # 留痕默认开：归档必须长在跑分入口上，不能靠人记得调（旧 golden_run.py 就死在这）。
+    # 要关必须显式写 --no-archive，不给「这次不用留」的默认选项。
+    parser.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="本次不落 evaluation_runs/（仅调试用；全量跑不要加）",
+    )
+    parser.add_argument(
+        "--note",
+        default=None,
+        help="一行备注写进 manifest，例如 \"top_k 15→20\"（趋势表的「备注」列）",
     )
     args = parser.parse_args()
     repeat = max(1, int(args.repeat or 1))
+    archive = not args.no_archive
 
     if args.task:
-        asyncio.run(_cmd_task(args.task, args.json, repeat))
+        asyncio.run(_cmd_task(args.task, args.json, repeat, args.note, archive))
         return
     if args.golden:
         # args.case 为空列表时传 None（=跑全部）。
-        asyncio.run(_cmd_golden(args.case or None, args.json, repeat))
+        asyncio.run(
+            _cmd_golden(args.case or None, args.json, repeat, args.note, archive)
+        )
         return
     # 无参数 → 打印帮助（不留空跑）。
     parser.print_help()

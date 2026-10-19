@@ -35,15 +35,15 @@ from uuid import UUID, uuid4
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from prometheus_client import generate_latest
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from src.config import Settings
 from src.db.connection import close_pool, create_pool
-from src.db.dao import AgentLogDAO, ReportDAO, TaskDAO
+from src.db.dao import ReportDAO, TaskDAO
 from src.observability.logging import BoundLogger
 from src.observability.metrics import (
-    generate_latest,
     record_agent_call,
     record_harness_block,
     record_rate_limit_hit,

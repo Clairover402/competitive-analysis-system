@@ -1,37 +1,24 @@
 # -*- coding: utf-8 -*-
-"""评估体系 — 上线前的回归测试，不是生产运行时的一环。
+"""评估体系：上线前的回归尺子，不是生产运行时的一环。
 
-═══════════════════════════════════════════════════════════════════════════════
-                              【模块结构（只有三个）】
-═══════════════════════════════════════════════════════════════════════════════
+【职责】
+  做   发版前显式跑 Golden 回归，回答「这次改动让分数变好还是变坏」。
+  不做 自动跟着生产任务跑、判门禁、上报 Prometheus——评估是离线工具。
 
-  golden_dataset.py  10 条 Golden Case（easy/medium/hard）+ 分维度/分 cell 标准答案
-  llm_factory.py     judge / embeddings / RunConfig 构造 + reference 解析
-  ragas_core.py      四指标唯一实现（context_precision / context_recall /
-                     faithfulness / answer_relevancy）+ CLI
+【模块结构（四个文件）】
+  golden_dataset.py  10 条 Golden Case + 分维度 / 分 cell 标准答案
+  llm_factory.py     judge / embeddings / RunConfig 构造 + reference 三级解析
+  ragas_core.py      四指标唯一实现 + CLI（跑分、出分数表、默认留痕）
+  run_archive.py     run 归档 / compare / trend（纯读 JSON，零 LLM 成本）
 
-  ⚠️ 本模块**刻意不做 re-export**：直接 `from src.evaluation.ragas_core import ...`。
-     旧版 `__init__.py` 把所有符号再导出一次，导致任何一个 import 都会把
-     ragas / langchain 全链路（含 DB、Prometheus）拖进来。评估是离线工具，
-     不配当"包级门面"。
+  ⚠️ 刻意不做 re-export：直接 `from src.evaluation.ragas_core import ...`。
+     旧版 `__init__.py` 把符号全导出一遍，导致任何 import 都会把 ragas /
+     langchain 全链路（含 DB、Prometheus）拖进来。评估是离线工具，
+     不配当「包级门面」。
 
-═══════════════════════════════════════════════════════════════════════════════
-                            【定位：回归测试，不是运行时】
-═══════════════════════════════════════════════════════════════════════════════
-
-  发版前显式跑 `python -m src.evaluation.ragas_core --golden`，生产链路零评估开销。
-
-  为什么不能自动跑：
-    1. 语义错位——RAGAS 核心是拿标准答案对拍；真实用户任务没有标准答案，
-       打出来的是无参照系的分数，只在**版本回归**（和上一版对比）里才有意义。
-    2. 成本错配——评估要额外调 LLM 做裁判，每个生产任务都付一次，
-       换来的是用户根本不看的数字。
-    3. 观测误导——生产自动产生的分数与发版前 Golden 回归分数是两种口径，
-       画在同一条曲线上会误读涨跌。
-
-  【2026-10-17 架构简化】旧链路（ragas_llm 四指标双实现 / golden_run 归档 diff /
-  runner 编排与 Prometheus 上报 / judge_eval 五维报告评分 / cli 旧入口）已整体删除。
-  被删能力的共同点：**从未真正投入使用**（趋势面板无历史数据、门禁未卡过发布、
-  归档目录没有一次真实 baseline）。留着只会让"改一处算法要动六个文件"的老问题复活。
-  详见 竞品分析系统_RAGAS评估重构总纲_2026-10-17.md。
+【为什么不能自动跑（三条，都是口径问题）】
+  1. 语义错位：RAGAS 核心是拿标准答案对拍；真实任务没有标准答案，打出来的分
+     无参照系，只在**版本回归**（和上一版比）里才有意义。
+  2. 成本错配：每个生产任务都要额外调 LLM 做裁判，换来的是没人看的数字。
+  3. 观测误导：生产自动分与发版前 Golden 分是两种口径，画在同一条曲线上会误读。
 """

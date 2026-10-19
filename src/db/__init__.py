@@ -14,13 +14,16 @@ src.db 是系统的"数据底座"——所有 Agent 通过 DAO 读写数据，
   AgentMemoryDAO    → agent_memories (长期记忆+时间衰减)
   AgentLogDAO       → agent_logs (审计)
   RetrievalSnapshotDAO → retrieval_snapshot (检索快照)
-  EvalResultDAO    → eval_results + eval_metric_scores (评估结果)
 
 导出：
     连接池: create_pool / get_pool / close_pool
     DAO:    TaskDAO / ReportDAO / EvidenceDAO / ChunkEmbeddingDAO
             MemorySummaryDAO / AgentMemoryDAO / AgentLogDAO
-            UserDAO / RetrievalSnapshotDAO / EvalResultDAO
+            UserDAO / RetrievalSnapshotDAO
+
+⚠️ 评估结果**不落这张库**：ragas_core 只把 run 落 `evaluation_runs/` 文件归档
+   （见 src/evaluation/run_archive.py）。原 EvalResultDAO + eval_results /
+   eval_metric_scores 两表因「从未真正投入使用」已于 2026-10-19 删除。
 """
 
 from src.db.connection import create_pool, get_pool, close_pool
@@ -34,7 +37,6 @@ from src.db.dao import (
     AgentLogDAO,
     UserDAO,
     RetrievalSnapshotDAO,
-    EvalResultDAO,
 )
 
 __all__ = [
@@ -50,5 +52,4 @@ __all__ = [
     "AgentLogDAO",
     "UserDAO",
     "RetrievalSnapshotDAO",
-    "EvalResultDAO",
 ]

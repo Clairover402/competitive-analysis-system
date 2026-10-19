@@ -88,10 +88,6 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from asyncpg import Pool
 
 logger = logging.getLogger(__name__)
 

@@ -79,11 +79,6 @@ class TokenBucket:
                 return True
             return False
 
-    @property
-    def available(self) -> float:
-        """当前可用 token 数（调试用）。"""
-        return self.tokens
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # §2 AgentSemaphore — Agent 并发控制（Layer 2: 资源保护）
@@ -105,22 +100,14 @@ class AgentSemaphore:
 
     def __init__(self, max_concurrent: int = 3):
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._active_count = 0
 
     async def acquire(self) -> None:
         """获取信号量（阻塞直到有槽位）。"""
         await self._semaphore.acquire()
-        self._active_count += 1
 
     def release(self) -> None:
         """释放信号量。"""
         self._semaphore.release()
-        self._active_count = max(0, self._active_count - 1)
-
-    @property
-    def active_count(self) -> int:
-        """当前活跃的 Agent 调用数。"""
-        return self._active_count
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -187,8 +174,3 @@ class LLMRateLimiter:
 
             # ── 记录本次请求 ──
             self.requests.append(time.monotonic())
-
-    @property
-    def current_count(self) -> int:
-        """当前窗口内的请求数（调试用）。"""
-        return len(self.requests)
