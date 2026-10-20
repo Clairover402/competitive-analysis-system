@@ -14,8 +14,8 @@
     handle = begin_run("golden", note="top_k 15→20")
     finish_run(handle, entries)
 
-【产物：一个 run 恒定两个文件，形状不随内容变】
-  evaluation_runs/
+【产物：一个 run 恒定两个文件，形状不随内容变】（根目录 = 本文件同级 evaluation_runs/）
+  src/evaluation/evaluation_runs/
     TREND.md       全版本趋势（派生视图，trend --write 可整体重建）
     baseline.txt   当前基线 run_id（唯一允许覆盖写的对象）
     <run_id>/
@@ -81,8 +81,14 @@ METRIC_SHORT = {
 # 护栏指标：只呈现，不参与「变好 / 变坏」判定（铁律③）。
 GUARDRAIL = {"faithfulness"}
 
-# 取 project root（src/evaluation/run_archive.py → 上三级）。
+# 取 project root（src/evaluation/run_archive.py → 上三级）。仅给 git 命令当 cwd 用。
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# 归档根目录：跟随**模块所在目录**（src/evaluation/evaluation_runs），不跟项目根、也不跟 cwd。
+# ⚠️ 曾一度改成 PROJECT_ROOT/evaluation_runs —— 结果是 10-17 的历史留在本目录、
+# 10-20 之后写到了项目根，两个根各自只能看到自己的 run，趋势表直接断代。
+# 归档位置必须只由本文件位置决定：模块搬到哪都带着历史走。
+ARCHIVE_ROOT = Path(__file__).resolve().parent / ARCHIVE_DIRNAME
 
 
 # ── 基础工具 ────────────────────────────────────────────────────────────────────
@@ -182,8 +188,8 @@ def _settings_dump(settings=None) -> dict:
 
 
 def archive_root(root: Path | None = None) -> Path:
-    """归档根目录（不存在则创建）。"""
-    path = Path(root) if root else PROJECT_ROOT / ARCHIVE_DIRNAME
+    """归档根目录（不存在则创建）。默认 ARCHIVE_ROOT，即 src/evaluation/evaluation_runs。"""
+    path = Path(root) if root else ARCHIVE_ROOT
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -305,9 +311,12 @@ def build_summary(manifest: dict, cases: dict) -> str:
     lines.append(f"# {m['run_id']}")
     lines.append("")
     dirty = "（工作区有未提交改动，复现打折）" if m.get("git_dirty") else ""
+    # 别把 started_at 单独标成「时间」：那是开始时刻，比产出时刻早整整一个耗时，
+    # 对着文件 mtime 一比就像"记错了"。三个数一起给，读者不用做减法。
     lines.append(
         f"- 类型：`{m.get('kind')}`　备注：{m.get('note') or '—'}　"
-        f"时间：{m.get('started_at')}　耗时：{m.get('duration_sec')}s"
+        f"开始：{m.get('started_at')}　结束：{m.get('finished_at')}　"
+        f"耗时：{m.get('duration_sec')}s（本机时间，无时区偏移）"
     )
     lines.append(
         f"- 代码：`{m.get('git_commit')}` @ `{m.get('git_branch')}`{dirty}　"
