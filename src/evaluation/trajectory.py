@@ -2,15 +2,18 @@
 
 【职责】
   做：把某个 task 的 agent_logs 重建成「第几轮想了什么 → 调了谁 → 用什么工具 →
-      结果如何」的轨迹，算 L1 编排级 + L2 工具级指标，输出 Markdown 报告。
-  不做：不调 LLM、不建表、不落 run 目录、不改任何业务状态（纯读）。
+      结果如何」的轨迹，算 L1 编排级 + L2 工具级指标，输出 Markdown 报告；
+      `--persist` 时把指标 upsert 进 trajectory_metrics（一任务一行，供 Grafana 直读）。
+  不做：不调 LLM、不改任务/报告等业务状态（唯一写操作是幂等 upsert 指标表）。
 
 【输入 → 输出】
   输入：asyncpg 连接池里的 agent_logs（action ∈ think / observe / tool_call / 业务动作）
   输出：stdout 的 Markdown 报告（--json 则输出结构化 dict）
+        + 可选：trajectory_metrics 的指标行（--persist）
   用法：
       python -m src.evaluation.trajectory --task <task_id>
       python -m src.evaluation.trajectory --since 7d --limit 50
+      python -m src.evaluation.trajectory --since 2h --persist   # 定时落库
 
 【关键决策】
   ① 只评 Supervisor，不评 Pipeline：Pipeline 四个节点三条固定边，路径编译期确定，
@@ -20,7 +23,10 @@
      也不做 LLM judge 评轨迹（贵且不稳，规则能抓的问题先抓干净）。
   ③ 缺数据一律标 n/a 并写明「缺什么」，不当 0 —— 日志是 fire-and-forget，
      「没发生」和「没记上」是两件事（同 run_archive 的 compare 纪律）。
+     落库时 n/a → NULL，同样是这个理由。
   ④ 阈值不在本模块写死：先跑分布再用 `--since` 批量定，避免拍脑袋。
+  ⑤ 指标落库由 CLI + crontab 驱动，不用任务结束钩子：不耦合主链路、
+     失败可重跑、历史可回填，幂等由 ON CONFLICT 保证。
 
 【读法】
   L1 看「这任务健不健康」，L2 看「卡在哪一步」。L1 说 collector 被调了 2 次，
@@ -46,13 +52,20 @@ logger = logging.getLogger(__name__)
 # 日志里不落 max_rounds，这里用同一个默认值；改上限时两处要一起改。
 DEFAULT_MAX_ROUNDS = 10
 
+# 批量落库只处理「最后一条日志距今满 10 分钟」的任务。
+# 任务还在写日志时算出来的 termination 可能是假的 incomplete。
+SETTLE_MINUTES = 10
+
 # 各 Agent action 的必填参数（来自 A2A AgentCard input_schema.required）。
 # 只用来判「键有没有丢」——参数值是摘要（如 "list(len=3)"），判不了空。
+#
+# ⚠️ writer / quality 不在此列：ff4e4e29 实测 round 3 只有 {"title": ...}、
+# round 4 是 {}，因为 analysis_results / report_markdown 由 Supervisor state 直接
+# 流转给下游节点，不由 LLM 在 arguments 里传。把它们算作缺键会让**每个健康任务**
+# 的参数完整率恒为 0.5 —— 假警报比没有指标更糟。
 _REQUIRED_ARGS: dict[str, list[str]] = {
     "collector": ["competitors", "dimensions"],
     "analyzer": ["competitors", "dimensions"],
-    "writer": ["analysis_results"],
-    "quality": ["report_markdown"],
 }
 
 # 合法调度顺序：后面的 Agent 必须见过前面的
@@ -89,6 +102,9 @@ class Trace:
     tools: list[dict] = field(default_factory=list)       # 工具调用
     business: list[Event] = field(default_factory=list)   # Agent 业务动作日志
     raw_count: int = 0
+    # L3 检索侧数值（compute_retrieval 的产物）。日志本身不含这些，
+    # 由调用方从 retrieval_snapshot 单独查出来挂上——保持 build_trace 纯函数。
+    retrieval: dict | None = None
 
     @property
     def is_supervisor(self) -> bool:
@@ -110,6 +126,19 @@ def _as_dict(value: Any) -> dict:
         except json.JSONDecodeError:
             return {"_raw": value}
     return {}
+
+
+def _as_list(value: Any) -> list:
+    """同上，用于 jsonb 数组列（retrieved_urls 这类）。"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
 
 
 def _round_of(payload: dict) -> int:
@@ -142,6 +171,8 @@ def build_trace(task_id: str, rows: list[dict]) -> Trace:
                 "thought": response.get("thought") or "",
                 "reason": response.get("reason") or "",
                 "arguments": _as_dict(response.get("arguments")),
+                # degraded 只有非空值（如 "json_error"）才有意义：LLM 决策解析失败后降级退出
+                "degraded": response.get("degraded") or "",
                 "ts": row.get("created_at"),
             })
         elif action == "observe":
@@ -194,13 +225,26 @@ def _metric(value: Any, note: str = "") -> dict:
 def _termination_reason(trace: Trace) -> dict:
     """判断任务怎么结束的 —— 最强的健康度信号。
 
-    forced_finish（act 节点因重写上限强制结束）目前判不出来：
-    act 的返回值不落日志，observe 只能看到 agent='finish' 的空观察。
-    要判需要在 act 里补一条日志，属后续增强，这里如实标 n/a。
+    四类原因按「谁覆盖了谁」排优先级：
+      ① forced_finish —— act 硬拦截重写上限。此时**最后一条 think 写的是 writer**，
+         按 think 判会误报成 incomplete，所以必须优先读 act 的埋点日志。
+      ② json_error —— think 两次解析失败降级为 finish。同样是「看起来正常结束」的故障。
+      ③ finish / max_rounds / incomplete —— 正常路径，按最后一条 think 判。
     """
     if not trace.thinks:
         return _metric("n/a", "无 think 日志（非 Supervisor 任务）")
+
+    forced = next((e for e in trace.business if e.action == "forced_finish"), None)
+    if forced is not None:
+        rewrites = forced.request.get("rewrite_count")
+        return _metric(
+            "forced_finish",
+            f"重写已达上限（rewrite_count={rewrites}），act 强制接受当前报告",
+        )
+
     last = trace.thinks[-1]
+    if last.get("degraded"):
+        return _metric("json_error", f"决策解析降级（{last['degraded']}），安全退出")
     if last["agent"] == "finish" or last["action"] == "finish":
         return _metric("finish", "LLM 主动决策结束")
     rounds = max(t["round"] for t in trace.thinks)
@@ -209,26 +253,31 @@ def _termination_reason(trace: Trace) -> dict:
     return _metric("incomplete", "既没 finish 也没到上限，轨迹中断（可能进程被杀）")
 
 
-def _round_efficiency(trace: Trace) -> dict:
-    """轮次效率 = 有效轮次 / 总轮次。
+def _round_stats(trace: Trace) -> tuple[int, int] | None:
+    """(总轮次, 有效轮次)。无 think 日志返回 None（算不出来，不是 0）。
 
     有效 = 该轮有 observe、状态 completed、且 observation 非空
     （finish 轮和失败轮都不产生新业务状态）。
     """
     if not trace.thinks:
-        return _metric("n/a", "无 think 日志")
-
+        return None
     rounds_used = max(t["round"] for t in trace.thinks)
     effective = {
         o["round"] for o in trace.observes
         if o["status"] == "completed" and o["observation"]
     }
     effective &= {t["round"] for t in trace.thinks}
-    ratio = len(effective) / rounds_used if rounds_used else 0.0
-    return _metric(
-        round(ratio, 3),
-        f"有效轮次 {len(effective)} / 总轮次 {rounds_used}",
-    )
+    return rounds_used, len(effective)
+
+
+def _round_efficiency(trace: Trace) -> dict:
+    """轮次效率 = 有效轮次 / 总轮次。"""
+    stats = _round_stats(trace)
+    if stats is None:
+        return _metric("n/a", "无 think 日志")
+    rounds_used, effective = stats
+    ratio = effective / rounds_used if rounds_used else 0.0
+    return _metric(round(ratio, 3), f"有效轮次 {effective} / 总轮次 {rounds_used}")
 
 
 def _illegal_transitions(trace: Trace) -> dict:
@@ -371,15 +420,15 @@ def _empty_search_rate(trace: Trace) -> dict:
     return _metric(round(empty / len(searches), 3), f"{empty} 次空结果 / {len(searches)} 次搜索")
 
 
-def _fetch_failure_buckets(trace: Trace) -> dict:
-    """抓取失败按错误类型分桶 —— 把「2/7 页」这类人工诊断变成可回归的数字。
+def _fetch_buckets(trace: Trace) -> tuple[int, Counter[str]] | None:
+    """(抓取次数, 失败分桶)。无 web_fetch 调用返回 None。
 
     ⚠️ 只能分「抛异常」的失败；web_fetch 若以正常返回的形式带回错误
     （如 dict 带 error 键），这里会算成成功。当前 tools_web 是抛异常的，口径成立。
     """
     fetches = _tools(trace, "web_fetch")
     if not fetches:
-        return _metric("n/a", "无 web_fetch 调用")
+        return None
 
     buckets: Counter[str] = Counter()
     for item in fetches:
@@ -396,10 +445,18 @@ def _fetch_failure_buckets(trace: Trace) -> dict:
             buckets["连接失败"] += 1
         else:
             buckets["其他"] += 1
+    return len(fetches), buckets
 
-    fail_rate = sum(buckets.values()) / len(fetches)
+
+def _fetch_failure_buckets(trace: Trace) -> dict:
+    """抓取失败按错误类型分桶 —— 把「2/7 页」这类人工诊断变成可回归的数字。"""
+    stats = _fetch_buckets(trace)
+    if stats is None:
+        return _metric("n/a", "无 web_fetch 调用")
+    total, buckets = stats
+    fail_rate = sum(buckets.values()) / total
     detail = ", ".join(f"{k}×{v}" for k, v in buckets.most_common()) or "无失败"
-    return _metric(round(fail_rate, 3), f"{detail}，共 {len(fetches)} 次抓取")
+    return _metric(round(fail_rate, 3), f"{detail}，共 {total} 次抓取")
 
 
 def _duplicate_fetch_rate(trace: Trace) -> dict:
@@ -410,19 +467,27 @@ def _duplicate_fetch_rate(trace: Trace) -> dict:
     return _metric(round(dup / len(urls), 3), f"{dup} 次重复 / {len(urls)} 次抓取")
 
 
-def _embedding_calls(trace: Trace) -> dict:
+def _embed_stats(trace: Trace) -> tuple[int, int, int] | None:
+    """(embed_query 次数, embed_texts 批数, 入库条数)。无调用返回 None。"""
     batch_calls = _tools(trace, "embed_texts")
     query_calls = _tools(trace, "embed_query")
     if not batch_calls and not query_calls:
-        return _metric("n/a", "无 embedding 调用")
+        return None
+    total_chunks = sum(c["n"] for c in batch_calls if isinstance(c["n"], int))
+    return len(query_calls), len(batch_calls), total_chunks
 
-    sizes = [c["n"] for c in batch_calls if isinstance(c["n"], int)]
-    total_chunks = sum(sizes)
+
+def _embedding_calls(trace: Trace) -> dict:
+    stats = _embed_stats(trace)
+    if stats is None:
+        return _metric("n/a", "无 embedding 调用")
+    queries, batches, total_chunks = stats
+    sizes = [c["n"] for c in _tools(trace, "embed_texts") if isinstance(c["n"], int)]
     avg = round(statistics.fmean(sizes), 1) if sizes else None
     return _metric(
-        len(query_calls) + len(batch_calls),
-        f"embed_query {len(query_calls)} 次（应=维度数）、"
-        f"embed_texts {len(batch_calls)} 批 / {total_chunks} 条，平均批大小 {avg}",
+        queries + batches,
+        f"embed_query {queries} 次（应=维度数）、"
+        f"embed_texts {batches} 批 / {total_chunks} 条，平均批大小 {avg}",
     )
 
 
@@ -444,21 +509,47 @@ def _rerank_discrimination(trace: Trace) -> dict:
     )
 
 
-def _funnel(trace: Trace) -> dict:
-    """采集漏斗：搜索结果 → 抓取次数 → 抓到正文 → 最终 chunk。"""
+def _funnel_counts(trace: Trace) -> tuple[int, int, int, int] | None:
+    """(搜索命中条数, 抓取次数, 抓到正文页数, 入库 chunk 数)。无采集日志返回 None。"""
     searches = _tools(trace, "web_search")
     fetches = _tools(trace, "web_fetch")
     embeds = _tools(trace, "embed_texts")
     if not searches and not fetches and not embeds:
-        return _metric("n/a", "无采集链路工具日志")
+        return None
+    return (
+        sum(s["n"] or 0 for s in searches),
+        len(fetches),
+        sum(1 for f in fetches if f["ok"] and (f["chars"] or 0) > 0),
+        sum(e["n"] or 0 for e in embeds),
+    )
 
-    search_hits = sum(s["n"] or 0 for s in searches)
-    fetched = sum(1 for f in fetches if f["ok"] and (f["chars"] or 0) > 0)
-    chunks = sum(e["n"] or 0 for e in embeds)
+
+def _funnel(trace: Trace) -> dict:
+    """采集漏斗：搜索结果 → 抓取次数 → 抓到正文 → 最终 chunk。"""
+    counts = _funnel_counts(trace)
+    if counts is None:
+        return _metric("n/a", "无采集链路工具日志")
     return _metric(
-        f"{search_hits} → {len(fetches)} → {fetched} → {chunks}",
+        " → ".join(str(c) for c in counts),
         "搜索命中条数 → 抓取次数 → 抓到正文页数 → 入库 chunk 数",
     )
+
+
+def _rerank_under_k(trace: Trace) -> int | None:
+    """返回数 < 本次请求 top_k 的次数。
+
+    单次比较而非拿 top_k 均值比：均值会掩盖「一次 50 要 3、一次 3 要 50」这类偏斜。
+    没记 top_k 的调用无法判，跳过。
+    """
+    reranks = _tools(trace, "rerank")
+    if not reranks:
+        return None
+    under = 0
+    for item in reranks:
+        requested = item["args"].get("top_k")
+        if isinstance(requested, int) and isinstance(item["n"], int) and item["n"] < requested:
+            under += 1
+    return under
 
 
 def _rerank_filtering(trace: Trace) -> dict:
@@ -475,7 +566,7 @@ def _rerank_filtering(trace: Trace) -> dict:
     detail = f"平均返回 {round(statistics.fmean(sizes), 1)} 条"
     if requested:
         detail += f"，请求 top_k 平均 {round(statistics.fmean(requested), 1)}"
-        under = sum(1 for s in sizes if requested and s < statistics.fmean(requested))
+        under = _rerank_under_k(trace) or 0
         if under:
             detail += f"；{under} 次返回不足（候选池不够，精排没起筛选作用）"
     return _metric(len(sizes), detail)
@@ -493,6 +584,249 @@ def l2_metrics(trace: Trace) -> dict[str, dict]:
         "精排筛除情况": _rerank_filtering(trace),
         "采集漏斗": _funnel(trace),
     }
+
+
+# ── L3 检索侧指标（数据源：retrieval_snapshot）──────────────────────────
+#
+# L2 度量「采集端有没有把料搬回来」，L3 度量「搬回来的料够不够喂给每个竞品」。
+# 两者不能混：搜索空结果率高是采不到；竞品覆盖偏斜是有料但全堆在某个竞品上。
+
+
+def compute_retrieval(
+    snapshots: list[dict],
+    competitors: list[str] | None = None,
+) -> dict | None:
+    """把 retrieval_snapshot 行压成 4 个检索侧数值；无快照返回 None（不是 0）。
+
+    Args:
+        snapshots: 每行一条 (维度, 竞品) 快照，含 recalled_urls / reranked_urls。
+        competitors: 任务全量竞品名（来自 tasks.competitors）。
+            ⚠️ 必须传：analyzer 对「没找到料」的竞品是 skip，**根本不落快照**，
+            只按快照里的竞品算，最该报警的「某竞品 0 页」会隐身。
+            ⚠️ 已知局限：实测 55 个有快照的任务里 13 个 tasks.competitors 是空数组
+            （竞品由 Supervisor 现场发现），这些任务的空缺识别不出来，
+            skew 只反映「已有快照的竞品之间」的均衡度——偏高，不可当健康证明。
+
+    三个指标的语义：
+      · recall_avg / rerank_avg —— 每格平均召回几条、精排后留几条。
+        两者要一起看：召回 3 条 / 精排 3 条 ≠ 召回 50 / 精排 3，前者是池子空。
+      · coverage_skew —— min / median（按竞品聚合去重页数）。1.0=均衡，0=有竞品彻底没料。
+      · cross_dim_dup —— 同任务不同维度复用同一批 URL 的比例。
+        高说明「几个维度其实在答同一个问题」，维度拆分没起作用。
+    """
+    if not snapshots:
+        return None
+
+    recalled = [len(_as_list(r.get("recalled_urls"))) for r in snapshots]
+    reranked = [len(_as_list(r.get("reranked_urls"))) for r in snapshots]
+    count = len(snapshots)
+
+    # 每竞品去重页数：同一 URL 在多个维度被召回只算一页
+    per_competitor: dict[str, set[str]] = {}
+    for row in snapshots:
+        name = row.get("competitor")
+        if not name:
+            continue
+        per_competitor.setdefault(name, set()).update(_as_list(row.get("recalled_urls")))
+    # 没落快照的竞品按 0 页计入，否则最严重的空缺反而看不见
+    for name in competitors or []:
+        per_competitor.setdefault(name, set())
+
+    skew: float | None = None
+    if len(per_competitor) >= 2:
+        pages = sorted(len(urls) for urls in per_competitor.values())
+        median = statistics.median(pages)
+        skew = round(pages[0] / median, 3) if median else 0.0
+
+    # 每维度一份去重 URL 集合，再看跨维度重复
+    per_dimension: dict[str, set[str]] = {}
+    for row in snapshots:
+        dimension = row.get("dimension") or ""
+        per_dimension.setdefault(dimension, set()).update(_as_list(row.get("reranked_urls")))
+    dup: float | None = None
+    if len(per_dimension) >= 2:
+        reuse_total = sum(len(urls) for urls in per_dimension.values())
+        distinct = len(set().union(*per_dimension.values()))
+        dup = round(1 - distinct / reuse_total, 3) if reuse_total else None
+
+    return {
+        "snapshots": count,
+        "recall_avg": round(statistics.fmean(recalled), 1),
+        "rerank_avg": round(statistics.fmean(reranked), 1),
+        "coverage_skew": skew,
+        "cross_dim_dup": dup,
+    }
+
+
+def l3_metrics(trace: Trace) -> dict[str, dict]:
+    """L3 检索侧四项（展示用）。trace.retrieval 为 None 时全 n/a。"""
+    data = trace.retrieval
+    if not data:
+        return {
+            "检索快照": _metric("n/a", "无 retrieval_snapshot（任务未走到分析阶段）"),
+            "召回 / 精排": _metric("n/a", "无快照"),
+            "竞品覆盖偏斜": _metric("n/a", "无快照"),
+            "跨维度重复率": _metric("n/a", "无快照"),
+        }
+    return {
+        "检索快照": _metric(data["snapshots"], "竞品×维度级快照行数"),
+        "召回 / 精排": _metric(
+            f"{data['recall_avg']} → {data['rerank_avg']}",
+            "每格平均召回条数 → 精排后保留条数（差值过大说明候选池被竞品过滤掉大半）",
+        ),
+        "竞品覆盖偏斜": _metric(
+            data["coverage_skew"] if data["coverage_skew"] is not None else "n/a",
+            "最少竞品页数 / 中位数；1.0=均衡，接近 0=有竞品几乎没料",
+        ),
+        "跨维度重复率": _metric(
+            data["cross_dim_dup"] if data["cross_dim_dup"] is not None else "n/a",
+            "不同维度复用同一批 URL 的比例；高说明维度拆分没起作用",
+        ),
+    }
+
+
+# ── 指标落库（宽表 trajectory_metrics）──────────────────────────────────
+
+# 口径版本。指标定义改了（比如 forced_finish 上线、算法换了）就 +1，
+# 旧行靠它识别、决定要不要全量重算 —— 见计划文档「风险 4」。
+# v1 → v2：参数完整率不再把 writer/quality 计入（state 流转的参数不算「LLM 漏传」）。
+# v2 → v3：termination 新增 forced_finish / json_error 两类（依赖 act/think 新埋点）。
+# v3 → v4：新增 L3 检索侧 5 列（数据源 retrieval_snapshot，日志侧无变化）。
+METRICS_VERSION = 4
+
+# 与 schema.sql 的 trajectory_metrics 列顺序一一对应（不含 task_id / computed_at）。
+_ROW_COLUMNS = (
+    "is_supervisor", "metrics_version", "termination", "rounds", "rounds_effective",
+    "illegal_transitions", "repeat_rate", "failed_round_rate", "arg_completeness",
+    "observation_responsiveness", "tool_calls", "search_empty_rate", "fetch_fail_rate",
+    "fetch_fail_detail", "dup_fetch_rate", "embed_calls", "embed_chunks",
+    "rerank_gap", "rerank_under_k", "funnel_search", "funnel_fetch",
+    "funnel_pages", "funnel_chunks",
+    # L3：检索侧（来源 retrieval_snapshot，不是 agent_logs）
+    "retrieval_cells", "recall_avg", "rerank_avg", "coverage_skew", "cross_dim_dup",
+)
+
+_UPSERT_SQL = (
+    f"INSERT INTO trajectory_metrics (task_id, {', '.join(_ROW_COLUMNS)}) "
+    f"VALUES ($1, {', '.join(f'${i}' for i in range(2, len(_ROW_COLUMNS) + 2))}) "
+    "ON CONFLICT (task_id) DO UPDATE SET "
+    + ", ".join(f"{c} = EXCLUDED.{c}" for c in _ROW_COLUMNS)
+    + ", computed_at = NOW()"
+)
+
+
+def _num(metric: dict) -> float | int | None:
+    """从 {value, note} 里取数值；'n/a' 与非数值一律 None。
+
+    NULL 与 0 必须分清：NULL = 算不出来（没埋点），0 = 确实发生了 0 次。
+    """
+    value = metric.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def to_row(trace: Trace) -> dict:
+    """把 Trace 压成 trajectory_metrics 的一行（纯函数）。
+
+    数值一律复用 l1_metrics / l2_metrics 背后的同一个计算函数，
+    不在这里重算 —— 否则面板和 CLI 迟早出现两个不同的数。
+    """
+    rounds = _round_stats(trace)
+    fetch = _fetch_buckets(trace)
+    embed = _embed_stats(trace)
+    funnel = _funnel_counts(trace)
+    l1 = l1_metrics(trace)
+    l2 = l2_metrics(trace)
+
+    return {
+        "task_id": trace.task_id,
+        "is_supervisor": trace.is_supervisor,
+        "metrics_version": METRICS_VERSION,
+        # 终止原因存字符串（n/a 也要存）：面板靠 WHERE termination <> 'n/a' 过滤
+        "termination": l1["终止原因"]["value"],
+        "rounds": rounds[0] if rounds else None,
+        "rounds_effective": rounds[1] if rounds else None,
+        "illegal_transitions": _num(l1["非法转移"]),
+        "repeat_rate": _num(l1["重复动作率"]),
+        "failed_round_rate": _num(l1["失败轮占比"]),
+        "arg_completeness": _num(l1["参数完整率"]),
+        "observation_responsiveness": _num(l1["观察响应性"]),
+        "tool_calls": _num(l2["工具调用次数"]),
+        "search_empty_rate": _num(l2["搜索空结果率"]),
+        "fetch_fail_rate": _num(l2["抓取失败率"]),
+        "fetch_fail_detail": dict(fetch[1]) if fetch else None,
+        "dup_fetch_rate": _num(l2["重复抓取率"]),
+        "embed_calls": (embed[0] + embed[1]) if embed else None,
+        "embed_chunks": embed[2] if embed else None,
+        "rerank_gap": _num(l2["rerank 区分度"]),
+        "rerank_under_k": _rerank_under_k(trace),
+        "funnel_search": funnel[0] if funnel else None,
+        "funnel_fetch": funnel[1] if funnel else None,
+        "funnel_pages": funnel[2] if funnel else None,
+        "funnel_chunks": funnel[3] if funnel else None,
+        # L3：retrieval 由调用方从 retrieval_snapshot 算好挂在 trace 上；
+        # 没有就是 None——「任务没走到分析阶段」和「有分析但召回 0 条」是两件事。
+        "retrieval_cells": trace.retrieval["snapshots"] if trace.retrieval else None,
+        "recall_avg": trace.retrieval["recall_avg"] if trace.retrieval else None,
+        "rerank_avg": trace.retrieval["rerank_avg"] if trace.retrieval else None,
+        "coverage_skew": trace.retrieval["coverage_skew"] if trace.retrieval else None,
+        "cross_dim_dup": trace.retrieval["cross_dim_dup"] if trace.retrieval else None,
+    }
+
+
+def _row_params(row: dict) -> tuple:
+    """dict → SQL 参数元组。jsonb 列必须 dumps：asyncpg 不让 dict 直传 jsonb。"""
+    values = []
+    for column in _ROW_COLUMNS:
+        value = row.get(column)
+        if column == "fetch_fail_detail" and value is not None:
+            value = json.dumps(value, ensure_ascii=False)
+        values.append(value)
+    return (row["task_id"], *values)
+
+
+async def persist_rows(rows: list[dict]) -> tuple[int, int]:
+    """幂等 upsert 指标行，返回 (写入数, 跳过数)。
+
+    跳过两类：task_id 不是合法 UUID（测试/演示数据）；tasks 表里不存在的
+    task_id（外键会拒绝，先把它们挑出来，不让整批 executemany 一起失败）。
+    """
+    import uuid as _uuid
+
+    from src.config import Settings
+    from src.db.connection import close_pool, create_pool
+
+    if not rows:
+        return 0, 0
+
+    valid: list[dict] = []
+    skipped = 0
+    for row in rows:
+        try:
+            _uuid.UUID(str(row["task_id"]))
+        except (ValueError, AttributeError):
+            skipped += 1
+            continue
+        valid.append(row)
+    if not valid:
+        return 0, skipped
+
+    pool = await create_pool(Settings())
+    try:
+        existing = await pool.fetch(
+            "SELECT id::text FROM tasks WHERE id = ANY($1::uuid[])",
+            [row["task_id"] for row in valid],
+        )
+        known = {r["id"] for r in existing}
+        kept = [row for row in valid if row["task_id"] in known]
+        skipped += len(valid) - len(kept)
+        if not kept:
+            return 0, skipped
+        await pool.executemany(_UPSERT_SQL, [_row_params(row) for row in kept])
+        return len(kept), skipped
+    finally:
+        await close_pool()
 
 
 # ── 报告渲染 ────────────────────────────────────────────────────────────
@@ -535,7 +869,18 @@ def render_case(trace: Trace) -> str:
     for name, item in l2.items():
         lines.append(f"| {name} | {_fmt(item['value'])} | {item['note']} |")
 
-    anomalies = _anomalies(trace, l1, l2)
+    l3 = l3_metrics(trace)
+    lines += [
+        "",
+        "## L3 检索侧（料够不够喂给每个竞品）",
+        "",
+        "| 指标 | 值 | 说明 |",
+        "|---|---|---|",
+    ]
+    for name, item in l3.items():
+        lines.append(f"| {name} | {_fmt(item['value'])} | {item['note']} |")
+
+    anomalies = _anomalies(trace, l1, l2, l3)
     lines += ["", "## 异常明细", ""]
     lines += [f"- {a}" for a in anomalies] if anomalies else ["- 无"]
 
@@ -543,7 +888,7 @@ def render_case(trace: Trace) -> str:
     return "\n".join(lines)
 
 
-def _anomalies(trace: Trace, l1: dict, l2: dict) -> list[str]:
+def _anomalies(trace: Trace, l1: dict, l2: dict, l3: dict | None = None) -> list[str]:
     """把指标翻译成人能直接照着改的话。"""
     out: list[str] = []
     if l1["终止原因"]["value"] not in ("finish", "n/a"):
@@ -560,6 +905,17 @@ def _anomalies(trace: Trace, l1: dict, l2: dict) -> list[str]:
         out.append(f"抓取失败率 {l2['抓取失败率']['value']}（{l2['抓取失败率']['note']}）")
     if isinstance(l2["rerank 区分度"]["value"], float) and l2["rerank 区分度"]["value"] < 0.05:
         out.append(f"rerank 区分度仅 {l2['rerank 区分度']['value']}，精排基本没在区分")
+
+    l3 = l3 or {}
+    skew = l3.get("竞品覆盖偏斜", {}).get("value")
+    if isinstance(skew, (int, float)) and skew < 0.3:
+        out.append(
+            f"竞品覆盖偏斜 {skew}——最少竞品的召回页数不到中位数的三成，"
+            "该竞品的结论多半是模型自己编的"
+        )
+    dup = l3.get("跨维度重复率", {}).get("value")
+    if isinstance(dup, (int, float)) and dup >= 0.5:
+        out.append(f"跨维度重复率 {dup}——多个维度在用同一批证据，维度拆分没起作用")
     return out
 
 
@@ -574,6 +930,13 @@ def _verdict(l1: dict, l2: dict, trace: Trace) -> str:
         return "任务非正常结束，先修编排稳定性；此时任何报告质量指标都不可信。"
     if isinstance(l2["搜索空结果率"]["value"], float) and l2["搜索空结果率"]["value"] >= 0.3:
         return "编排正常但采集端空转明显——问题在「有没有料」，不在「模型好不好」。"
+    if trace.retrieval:
+        skew = trace.retrieval.get("coverage_skew")
+        if isinstance(skew, (int, float)) and skew < 0.3:
+            return (
+                "采集总量正常但竞品间严重偏斜——少数竞品的结论是在「没料」的情况下生成的，"
+                "先补该竞品的采集再谈报告质量。"
+            )
     return "编排与采集均未见明显异常；若报告质量仍差，瓶颈在检索/生成侧，转 RAGAS 那套指标看。"
 
 
@@ -619,6 +982,25 @@ def render_batch(traces: list[Trace]) -> str:
                      f"最大 {round(max(fail_rates), 3)}，样本 {len(fail_rates)}")
     else:
         lines.append("- 抓取失败率：n/a（无 web_fetch 审计）")
+
+    retrieval_rows = [t.retrieval for t in traces if t.retrieval]
+    lines += ["", "## 检索侧分布（有快照的任务）", ""]
+    if retrieval_rows:
+        recalls = [r["recall_avg"] for r in retrieval_rows]
+        reranks = [r["rerank_avg"] for r in retrieval_rows]
+        skews = [r["coverage_skew"] for r in retrieval_rows if r["coverage_skew"] is not None]
+        dups = [r["cross_dim_dup"] for r in retrieval_rows if r["cross_dim_dup"] is not None]
+        lines.append(f"- 每格召回：均值 {round(statistics.fmean(recalls), 1)} 条"
+                     f"（样本 {len(recalls)} 个任务）")
+        lines.append(f"- 精排后保留：均值 {round(statistics.fmean(reranks), 1)} 条"
+                     f"；保留率 {round(100 * sum(reranks) / sum(recalls), 1)}%"
+                     if sum(recalls) else "- 精排后保留：n/a")
+        lines.append(f"- 竞品覆盖偏斜：最低 {min(skews)}，均值 {round(statistics.fmean(skews), 3)}"
+                     if skews else "- 竞品覆盖偏斜：n/a（单竞品任务无法比较）")
+        lines.append(f"- 跨维度重复率：均值 {round(statistics.fmean(dups), 3)}"
+                     if dups else "- 跨维度重复率：n/a（单维度任务无法比较）")
+    else:
+        lines.append("- n/a（这些任务没有 retrieval_snapshot）")
 
     lines += ["", "## 逐任务", "", "| task_id | 终止原因 | 轮次效率 | 搜索空结果率 |", "|---|---|---|---|"]
     for trace in traces:
@@ -670,10 +1052,14 @@ async def fetch_rows(
 
         tasks = await pool.fetch(
             """SELECT task_id, MAX(created_at) AS last_ts
-               FROM agent_logs WHERE created_at >= $1
-               GROUP BY task_id ORDER BY last_ts DESC LIMIT $2""",
+               FROM agent_logs
+               WHERE created_at >= $1
+               GROUP BY task_id
+               HAVING MAX(created_at) < NOW() - ($3::int * INTERVAL '1 minute')
+               ORDER BY last_ts DESC LIMIT $2""",
             _parse_since(since),
             limit,
+            SETTLE_MINUTES,
         )
         if not tasks:
             return {}
@@ -696,15 +1082,54 @@ async def fetch_rows(
         await close_pool()
 
 
+async def fetch_retrieval(task_ids: list[str]) -> dict[str, dict]:
+    """取每个任务的检索快照 + 全量竞品列表，返回 {task_id: {snapshots, competitors}}。
+
+    为什么要连 tasks 表拿 competitors：analyzer 对「没找到料」的竞品是直接 skip、
+    **不落快照**。只看快照等于让最该报警的空缺（某竞品 0 页）隐身。
+    """
+    from src.config import Settings
+    from src.db.connection import close_pool, create_pool
+
+    if not task_ids:
+        return {}
+
+    pool = await create_pool(Settings())
+    try:
+        snaps = await pool.fetch(
+            """SELECT task_id, dimension, competitor, recalled_urls, reranked_urls
+               FROM retrieval_snapshot WHERE task_id = ANY($1::uuid[])""",
+            task_ids,
+        )
+        tasks = await pool.fetch(
+            """SELECT id::text AS id, competitors
+               FROM tasks WHERE id = ANY($1::uuid[])""",
+            task_ids,
+        )
+        names = {r["id"]: _as_list(r["competitors"]) for r in tasks}
+        grouped: dict[str, dict] = {
+            tid: {"snapshots": [], "competitors": names.get(tid, [])} for tid in task_ids
+        }
+        for row in snaps:
+            item = dict(row)
+            grouped[str(item["task_id"])]["snapshots"].append(item)
+        return grouped
+    finally:
+        await close_pool()
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Agent 轨迹评估（只读）")
+    parser = argparse.ArgumentParser(description="Agent 轨迹评估（默认只读，--persist 落库）")
     parser.add_argument("--task", help="单个 task_id")
     parser.add_argument("--since", help="批量时间窗，如 7d / 24h / 30m")
     parser.add_argument("--limit", type=int, default=50, help="批量最多取多少个任务")
     parser.add_argument("--json", action="store_true", help="输出结构化 JSON")
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="把指标 upsert 进 trajectory_metrics（幂等，可重复跑）",
+    )
     args = parser.parse_args(argv)
 
     if not args.task and not args.since:
@@ -719,10 +1144,41 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not grouped:
-        print("没有查到日志。")
+        if args.since:
+            print(
+                f"没有查到日志（--since 只处理最后写入距今超过 {SETTLE_MINUTES} 分钟的任务）。"
+            )
+        else:
+            print("没有查到日志。")
         return 1
 
     traces = [build_trace(tid, rows) for tid, rows in grouped.items()]
+
+    # L3 的数据源是 retrieval_snapshot，不在 agent_logs 里，单独取一次。
+    # --persist 时失败必须中止：否则 L3 五列会被写成 NULL，覆盖掉上一轮的正确值。
+    try:
+        retrieval = asyncio.run(fetch_retrieval(list(grouped)))
+    except Exception as exc:
+        message = f"读取 retrieval_snapshot 失败：{type(exc).__name__}: {exc}"
+        if args.persist:
+            print(message + "（已中止落库，避免把 L3 列写成 NULL）", file=sys.stderr)
+            return 2
+        print(message + "（本次报告 L3 全为 n/a）", file=sys.stderr)
+        retrieval = {}
+    for trace in traces:
+        info = retrieval.get(trace.task_id)
+        if info:
+            trace.retrieval = compute_retrieval(info["snapshots"], info["competitors"])
+
+    if args.persist:
+        rows = [to_row(t) for t in traces]
+        try:
+            written, skipped = asyncio.run(persist_rows(rows))
+        except Exception as exc:
+            print(f"落库失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        # 走 stderr：--json 的 stdout 要保持是纯 JSON
+        print(f"落库 {written} 行" + (f"，跳过 {skipped} 行" if skipped else ""), file=sys.stderr)
 
     if args.json:
         payload = [
@@ -735,6 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "l1": l1_metrics(t),
                 "l2": l2_metrics(t),
+                "l3": l3_metrics(t),
             }
             for t in traces
         ]

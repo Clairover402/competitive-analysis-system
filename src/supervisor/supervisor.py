@@ -50,7 +50,7 @@ Supervisor 是竞品分析系统的"探索模式控制器"。
   淘汰设计:   class Supervisor { self.llm, self.router, ... }
               async def run(self): while(...) ...
   当前设计:   _make_node_think(llm, router, ...) → node_think
-              _make_node_act(router)             → node_act
+              _make_node_act(router, log_dao)    → node_act
               _make_node_observe(summarizer, ...) → node_observe
 
   闭包工厂的优势:
@@ -515,6 +515,24 @@ def _make_node_think(
 
         # 2 次都失败 → 安全退出（防死循环）
         logger.error("Supervisor 2 次 JSON 解析均失败，强制 finish")
+        # 【2026-10-19 轨迹埋点】降级也要留 think 日志，且标 degraded。
+        # ⚠️ 不标的话评估侧会把「技术故障退出」当成「LLM 主动完成」——两者健康度天差地别。
+        if log_dao is not None:
+            await log_dao.log(
+                task_id=state.get("task_id", ""),
+                agent_name="supervisor",
+                action="think",
+                request={"round": state.get("current_round", 1)},
+                response={
+                    "round": state.get("current_round", 1),
+                    "action": "finish",
+                    "agent": "finish",
+                    "thought": "JSON 解析失败，安全退出",
+                    "reason": "两次 JSON 解析失败",
+                    "arguments": {},
+                    "degraded": "json_error",
+                },
+            )
         return {
             "pending_decision": {
                 "thought": "JSON 解析失败，安全退出",
@@ -542,8 +560,8 @@ def _make_node_think(
 # §4 _make_node_act — act 节点闭包工厂
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_node_act(router: A2ARouter):
-    """创建 act 节点函数——注入 A2ARouter（仅此一个依赖）。
+def _make_node_act(router: A2ARouter, log_dao: AgentLogDAO | None = None):
+    """创建 act 节点函数——注入 A2ARouter（+可选 log_dao 只用于强制结束留痕）。
 
     【L3 核心考点】act 为什么不需要 LLM？
     ───────────────────────────────────
@@ -589,6 +607,24 @@ def _make_node_act(router: A2ARouter):
                 "【硬拦截】重写次数已达上限(%d)，强制 finish 而非继续 writer",
                 state.get("rewrite_count", 0),
             )
+            # 【2026-10-19 轨迹埋点】强制结束必须单独留痕。
+            # ⚠️ 否则轨迹评估只看得到最后一条 think 决策是 writer，
+            #    termination 会被误判成 incomplete / max_rounds——症状对、原因错。
+            if log_dao is not None:
+                await log_dao.log(
+                    task_id=state.get("task_id", ""),
+                    agent_name="supervisor",
+                    action="forced_finish",
+                    request={
+                        "round": state.get("current_round", 1),
+                        "agent": "writer",
+                        "rewrite_count": state.get("rewrite_count", 0),
+                    },
+                    response={
+                        "message": "重写已达上限，接受当前报告",
+                        "max_rewrites": _MAX_REWRITES,
+                    },
+                )
             return {
                 "pending_task_agent": "finish",
                 "pending_task_status": "completed",
@@ -1060,7 +1096,7 @@ async def build_supervisor_graph(
     node_think = _make_node_think(
         llm_supervisor, router, retrieval_strategy, memory_engine, log_dao
     )
-    node_act = _make_node_act(router)
+    node_act = _make_node_act(router, log_dao)
     node_observe = _make_node_observe(summarizer, memory_engine, log_dao)
 
     # ─── 步骤①: 创建 StateGraph ───

@@ -286,3 +286,274 @@ def test_parse_since支持d_h_和ISO():
     assert tj._parse_since("7d").year >= 2020
     assert tj._parse_since("24h").year >= 2020
     assert tj._parse_since("2026-10-01").month == 10
+
+
+# ── 落库宽表 ────────────────────────────────────────────────────────────
+
+
+def _full_rows() -> list[dict]:
+    return [
+        _think(1, "collector", {"competitors": "list(len=2)", "dimensions": "list(len=2)"}),
+        _observe(1, "collector", obs="collected 2 competitors"),
+        _tool("web_search", {"query": "a"}, n=0, seq=2),
+        _tool("web_search", {"query": "b"}, n=9, seq=3),
+        _tool("web_fetch", {"url": "https://a"}, ok=False,
+              error="TimeoutError: read timeout", seq=4),
+        _tool("web_fetch", {"url": "https://b"}, chars=100, seq=5),
+        _tool("embed_texts", {"texts": "list(len=5)"}, n=5, seq=6),
+        _think(2, "finish"),
+    ]
+
+
+def test_to_row把指标压成宽表并把漏斗拆成四列():
+    row = tj.to_row(tj.build_trace("t-1", _full_rows()))
+
+    assert row["task_id"] == "t-1"
+    assert row["is_supervisor"] is True
+    assert row["termination"] == "finish"
+    assert row["rounds"] == 2 and row["rounds_effective"] == 1
+    assert row["search_empty_rate"] == 0.5
+    assert row["fetch_fail_rate"] == 0.5
+    assert row["fetch_fail_detail"] == {"timeout": 1}
+    # 9 → 2 → 1 → 5，四个数必须各占一列，面板才能画漏斗
+    assert (row["funnel_search"], row["funnel_fetch"],
+            row["funnel_pages"], row["funnel_chunks"]) == (9, 2, 1, 5)
+    assert row["embed_calls"] == 1 and row["embed_chunks"] == 5
+
+
+def test_to_row的n_a落成None而不是0():
+    # 只有 think 日志、没有任何工具调用：算不出来 ≠ 发生了 0 次
+    trace = tj.build_trace("t-2", [_think(1, "finish")])
+    row = tj.to_row(trace)
+
+    assert row["tool_calls"] is None
+    assert row["search_empty_rate"] is None
+    assert row["fetch_fail_detail"] is None
+    assert row["rerank_gap"] is None
+    assert row["funnel_search"] is None
+    # 编排级的 0 是真 0（没有非法转移），必须保留
+    assert row["illegal_transitions"] == 0
+
+
+def test_pipeline任务的termination记为n_a且无轮次():
+    trace = tj.build_trace("t-3", [_row("collect_pages", agent="collector")])
+    row = tj.to_row(trace)
+
+    assert row["is_supervisor"] is False
+    assert row["termination"] == "n/a"
+    assert row["rounds"] is None and row["rounds_effective"] is None
+
+
+def test_to_row与报告显示值一致():
+    trace = tj.build_trace("t-4", _full_rows())
+    l1, l2 = tj.l1_metrics(trace), tj.l2_metrics(trace)
+    row = tj.to_row(trace)
+
+    assert row["repeat_rate"] == l1["重复动作率"]["value"]
+    assert row["arg_completeness"] == l1["参数完整率"]["value"]
+    assert row["tool_calls"] == l2["工具调用次数"]["value"]
+    assert row["dup_fetch_rate"] == l2["重复抓取率"]["value"]
+    # 没有 rerank 调用：报告显示 n/a，落库是 NULL —— 这是有意的映射，不是不一致
+    assert l2["rerank 区分度"]["value"] == "n/a" and row["rerank_gap"] is None
+
+
+def test_row_params把失败分桶序列化成json():
+    row = tj.to_row(tj.build_trace("t-5", _full_rows()))
+    params = tj._row_params(row)
+
+    assert params[0] == "t-5"
+    index = tj._ROW_COLUMNS.index("fetch_fail_detail") + 1
+    assert isinstance(params[index], str)
+    assert tj.json.loads(params[index]) == {"timeout": 1}
+    assert len(params) == len(tj._ROW_COLUMNS) + 1
+
+
+def test_upsert语句幂等且覆盖全部列():
+    sql = tj._UPSERT_SQL
+    assert "ON CONFLICT (task_id) DO UPDATE" in sql
+    assert "$28" in sql and len(tj._ROW_COLUMNS) == 28
+    for column in tj._ROW_COLUMNS:
+        assert f"{column} = EXCLUDED.{column}" in sql
+
+
+def test_writer和quality不参与参数完整率判定():
+    # 实测：Supervisor 给 writer 只传 title、给 quality 传 {}，
+    # analysis_results / report_markdown 走 state 流转。
+    # 把它们算作缺键会让健康任务恒为 0.5 —— 假警报。
+    rows = [
+        _think(1, "collector", {"competitors": "list(len=2)", "dimensions": "list(len=2)"}),
+        _think(2, "writer", {"title": "x"}),
+        _think(3, "quality", {}),
+        _think(4, "finish"),
+    ]
+    l1 = tj.l1_metrics(tj.build_trace("t", rows))
+    assert l1["参数完整率"]["value"] == 1.0
+    assert l1["参数完整率"]["note"] == "1/1 轮键齐全"
+
+
+def test_指标口径版本随定义变更提升():
+    # v4：新增 L3 检索侧 5 列。改口径必须升版本，否则旧行被误读。
+    assert tj.METRICS_VERSION == 4
+
+
+# ── 阶段 3：强制结束与 JSON 降级的识别 ──────────────────────────────────
+
+
+def test_强制结束优先于最后一条think的决策():
+    # 实测场景：LLM 第 5 轮仍选 writer，act 硬拦截改成 finish。
+    # 只看 think 的话最后一条还是 writer → 会被误判成 incomplete。
+    rows = [
+        _think(1, "collector", {"competitors": "list(len=2)", "dimensions": "list(len=2)"}),
+        _think(2, "analyzer", {"competitors": "list(len=2)", "dimensions": "list(len=2)"}),
+        _think(3, "writer", {"title": "x"}),
+        _row("forced_finish",
+             request={"round": 3, "agent": "writer", "rewrite_count": 2},
+             response={"message": "重写已达上限，接受当前报告", "max_rewrites": 2}),
+    ]
+    l1 = tj.l1_metrics(tj.build_trace("t", rows))
+
+    assert l1["终止原因"]["value"] == "forced_finish"
+    assert "rewrite_count=2" in l1["终止原因"]["note"]
+
+
+def test_json降级不被当成LLM主动完成():
+    # 两次解析失败 → think 落一条 action=finish + degraded=json_error。
+    # 若不加这个标记，这种故障退出会混进 finish，健康度看起来是满分。
+    rows = [
+        _think(1, "collector", {"competitors": "list(len=2)", "dimensions": "list(len=2)"}),
+        _row("think",
+             request={"round": 2},
+             response={"round": 2, "action": "finish", "agent": "finish",
+                       "thought": "JSON 解析失败，安全退出", "reason": "两次 JSON 解析失败",
+                       "arguments": {}, "degraded": "json_error"}),
+    ]
+    l1 = tj.l1_metrics(tj.build_trace("t", rows))
+
+    assert l1["终止原因"]["value"] == "json_error"
+    assert "json_error" in l1["终止原因"]["note"]
+
+
+def test_强制结束同时存在降级时以强制结束为准():
+    # 优先级：act 的硬拦截是事实，think 的 deferred 只是决策层的降级
+    rows = [
+        _think(1, "writer", {"title": "x"}),
+        _row("forced_finish", request={"round": 1, "rewrite_count": 2}, response={}),
+        _row("think", request={"round": 2},
+             response={"round": 2, "action": "finish", "agent": "finish",
+                       "degraded": "json_error"}),
+    ]
+    assert tj.l1_metrics(tj.build_trace("t", rows))["终止原因"]["value"] == "forced_finish"
+
+
+def test_终止原因四类都能进落库行():
+    for reason, rows in {
+        "finish": [_think(1, "finish")],
+        "max_rounds": [_think(10, "collector")],
+        "incomplete": [_think(1, "collector")],
+        "json_error": [_row("think", request={"round": 1},
+                            response={"round": 1, "action": "finish",
+                                      "agent": "finish", "degraded": "json_error"})],
+        "forced_finish": [_think(1, "writer"),
+                          _row("forced_finish", request={"round": 1}, response={})],
+    }.items():
+        assert tj.to_row(tj.build_trace("t", rows))["termination"] == reason
+
+
+# ── 阶段 4：L3 检索侧（数据源 retrieval_snapshot）────────────────────────
+
+
+def _snap(dim, comp, recalled, reranked):
+    return {"dimension": dim, "competitor": comp,
+            "recalled_urls": recalled, "reranked_urls": reranked}
+
+
+def test_检索侧三项指标按快照计算():
+    snaps = [
+        _snap("功能", "A", ["u1", "u2", "u3", "u4"], ["u1", "u2"]),
+        _snap("功能", "B", ["u5", "u6"], ["u5"]),
+        _snap("定价", "A", ["u1", "u2"], ["u1", "u3"]),
+        _snap("定价", "B", ["u5"], ["u5"]),
+    ]
+    data = tj.compute_retrieval(snaps, ["A", "B"])
+
+    assert data["snapshots"] == 4
+    assert data["recall_avg"] == 2.2          # (4+2+2+1)/4
+    assert data["rerank_avg"] == 1.5          # (2+1+2+1)/4
+    # 竞品去重页数 A=4、B=2 → 最小/中位 = 2/3
+    assert data["coverage_skew"] == 0.667
+    # 功能 {u1,u2,u5}=3、定价 {u1,u3,u5}=3，去重后 4 → 1 - 4/6
+    assert data["cross_dim_dup"] == 0.333
+
+
+def test_没落快照的竞品按0页计入偏斜():
+    # analyzer 对「找不到料」的竞品是 skip、不落快照。
+    # 只按快照里的竞品算，最该报警的那个空缺会隐身，skew 还会显示很健康。
+    snaps = [
+        _snap("功能", "A", ["u1", "u2", "u3", "u4"], ["u1"]),
+        _snap("功能", "B", ["u5", "u6"], ["u5"]),
+    ]
+    data = tj.compute_retrieval(snaps, ["A", "B", "C"])
+
+    assert data["coverage_skew"] == 0.0       # C 0 页 / 中位 2 页
+
+
+def test_单竞品单维度时偏斜与重复率不可比():
+    snaps = [_snap("功能", "A", ["u1", "u2"], ["u1"])]
+    data = tj.compute_retrieval(snaps, ["A"])
+
+    assert data["coverage_skew"] is None      # 没有第二个竞品可比较
+    assert data["cross_dim_dup"] is None      # 没有第二个维度可比较
+    assert data["recall_avg"] == 2.0
+
+
+def test_无快照返回None而不是全0():
+    assert tj.compute_retrieval([]) is None
+
+
+def test_jsonb数组回成字符串也能算():
+    # asyncpg 未注册 codec 时 jsonb 回 str；真实库里已经踩过这个坑
+    snaps = [{
+        "dimension": "功能", "competitor": "A",
+        "recalled_urls": '["u1","u2"]', "reranked_urls": '["u1"]',
+    }]
+    data = tj.compute_retrieval(snaps, ["A"])
+    assert data["recall_avg"] == 2.0 and data["rerank_avg"] == 1.0
+
+
+def test_L3落库五列随检索数据走():
+    trace = tj.build_trace("t-l3", [_think(1, "finish")])
+    assert all(
+        tj.to_row(trace)[c] is None
+        for c in ("retrieval_cells", "recall_avg", "rerank_avg",
+                  "coverage_skew", "cross_dim_dup")
+    )
+
+    trace.retrieval = tj.compute_retrieval(
+        [_snap("功能", "A", ["u1", "u2"], ["u1"]),
+         _snap("定价", "A", ["u1"], ["u1"])],
+        ["A"],
+    )
+    row = tj.to_row(trace)
+    assert row["retrieval_cells"] == 2
+    assert row["recall_avg"] == 1.5
+    assert row["coverage_skew"] is None       # 单竞品
+    assert row["cross_dim_dup"] == 0.5        # 功能{u1} + 定价{u1} → 1 - 1/2
+
+
+def test_L3展示与落库同源():
+    trace = tj.build_trace("t-l3b", [_think(1, "finish")])
+    trace.retrieval = tj.compute_retrieval(
+        [_snap("功能", "A", ["u1", "u2", "u3"], ["u1"]),
+         _snap("功能", "B", ["u4"], ["u4"])],
+        ["A", "B"],
+    )
+    l3 = tj.l3_metrics(trace)
+    row = tj.to_row(trace)
+
+    assert l3["检索快照"]["value"] == row["retrieval_cells"]
+    assert l3["竞品覆盖偏斜"]["value"] == row["coverage_skew"]
+
+
+def test_无检索数据的任务L3全为n_a():
+    l3 = tj.l3_metrics(tj.build_trace("t-none", [_think(1, "finish")]))
+    assert all(item["value"] == "n/a" for item in l3.values())

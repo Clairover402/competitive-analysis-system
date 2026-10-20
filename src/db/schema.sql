@@ -277,6 +277,77 @@ CREATE INDEX IF NOT EXISTS idx_agent_logs_created_at ON agent_logs (created_at);
 
 
 -- ============================================================
+-- 5.5 trajectory_metrics — 轨迹指标宽表（一任务一行）
+-- ============================================================
+-- 为什么要有这张表：指标本身不落库，是 agent_logs 的确定性函数
+-- （零 LLM，同样日志必得同样结果）。CLI 随时能重算，所以不需要存档案。
+-- 需要这张表纯粹是为了「跨任务聚合」：Grafana 直连 PG，
+-- 让它每次去解析 JSONB 算 AVG 既慢又会出现第二份口径实现。
+--
+-- 【关键决策】宽表而非 JSONB 一列：面板 SQL 变成纯 SELECT col，
+--   不用每张图写一遍 ->> 转换。
+-- 【关键决策】Python 算、SQL 只读：非法转移/参数完整率这类指标依赖
+--   trajectory.py 里的业务规则（_REQUIRED_ARGS、_ORDER_PREREQ），
+--   SQL 复刻必然漂移——面板数字错了没人立刻发现，但会持续误导。
+-- 【关键决策】NULL 表示「算不出来」，0 表示「发生了 0 次」。
+--   老任务没有 tool_call 日志是常态，把「没记上」当「没发生」
+--   会把健康任务判成有病。面板 SQL 一律带 WHERE col IS NOT NULL。
+--
+-- 写入方：python -m src.evaluation.trajectory --since 2h --persist
+--   幂等 upsert（ON CONFLICT task_id DO UPDATE），可重跑、可回填。
+--   一行一任务 ⇒ AVG(col) 天然是任务等权，与 CLI statistics.fmean 一致。
+CREATE TABLE IF NOT EXISTS trajectory_metrics (
+    task_id         UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    is_supervisor   BOOLEAN NOT NULL DEFAULT FALSE,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metrics_version SMALLINT NOT NULL DEFAULT 1,  -- 口径变更靠它识别旧行
+
+    -- ── L1 编排级（只有 Supervisor 任务有值）──
+    termination                VARCHAR(20),   -- finish / max_rounds / incomplete / forced_finish / json_error / n/a
+    rounds                     INT,           -- 总轮次
+    rounds_effective           INT,           -- 有效轮次（有 observe 且 completed）
+    illegal_transitions        INT,
+    repeat_rate                FLOAT,
+    failed_round_rate          FLOAT,
+    arg_completeness           FLOAT,
+    observation_responsiveness FLOAT,
+
+    -- ── L2 工具级 ──
+    tool_calls        INT,
+    search_empty_rate FLOAT,
+    fetch_fail_rate   FLOAT,
+    fetch_fail_detail JSONB,   -- {"403":1,"timeout":2}，展开后画堆叠图
+    dup_fetch_rate    FLOAT,
+    embed_calls       INT,
+    embed_chunks      INT,
+    rerank_gap        FLOAT,   -- top1 - median，越接近 0 越分不开
+    rerank_under_k    INT,     -- 返回数 < 请求 top_k 的次数（候选池不够）
+    funnel_search     INT,     -- 搜索命中条数
+    funnel_fetch      INT,     -- 抓取次数
+    funnel_pages      INT,     -- 抓到正文页数
+    funnel_chunks     INT,     -- 入库 chunk 数
+
+    -- ── L3 检索侧（来源 retrieval_snapshot，不是 agent_logs）──
+    retrieval_cells   INT,     -- 竞品×维度快照行数（样本量，也是加权分母）
+    recall_avg        FLOAT,   -- 每格平均召回条数
+    rerank_avg        FLOAT,   -- 每格精排后平均保留条数（与 recall_avg 一起看才有意义）
+    coverage_skew     FLOAT,   -- 最少竞品页数 / 中位数；1.0=均衡，0=有竞品彻底没料
+    cross_dim_dup     FLOAT    -- 不同维度复用同一批 URL 的比例
+);
+
+-- v4 起新增 L3 五列：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
+-- 旧库必须走 ALTER（与 retrieval_snapshot 补 response_text 同一套路）。
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS retrieval_cells INT;
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS recall_avg FLOAT;
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS rerank_avg FLOAT;
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS coverage_skew FLOAT;
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS cross_dim_dup FLOAT;
+
+CREATE INDEX IF NOT EXISTS idx_traj_metrics_computed ON trajectory_metrics (computed_at);
+CREATE INDEX IF NOT EXISTS idx_traj_metrics_term ON trajectory_metrics (termination);
+
+
+-- ============================================================
 -- 6. memory_summaries — 摘要记忆（短期/工作记忆）
 -- ============================================================
 -- 【L3 核心考点】memory_summaries 和 agent_memories 的区别

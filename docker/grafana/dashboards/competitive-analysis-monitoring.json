@@ -432,6 +432,656 @@
           "unit": "short"
         }
       }
+    },
+    {
+      "type": "row",
+      "title": "轨迹评估（Agent 执行路径）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "panels": []
+    },
+    {
+      "type": "piechart",
+      "title": "终止原因分布",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 57
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT\n  count(*) FILTER (WHERE termination = 'finish')      AS \"finish\",\n  count(*) FILTER (WHERE termination = 'max_rounds')  AS \"max_rounds\",\n  count(*) FILTER (WHERE termination = 'incomplete')  AS \"incomplete\",\n  count(*) FILTER (WHERE termination = 'forced_finish') AS \"forced_finish\",\n  count(*) FILTER (WHERE termination = 'json_error')    AS \"json_error\"\nFROM trajectory_metrics\nWHERE termination <> 'n/a' AND $__timeFilter(computed_at)",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "pieType": "donut",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "采集漏斗（时间窗内合计）",
+      "description": "搜索命中 → 发起抓取 → 抓到正文 → 入库 chunk。哪一段塌了一眼可见。",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 57
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT stage, n FROM (\n  SELECT 1 AS ord, '① 搜索命中' AS stage, COALESCE(SUM(funnel_search), 0)::int AS n\n    FROM trajectory_metrics WHERE funnel_search IS NOT NULL AND $__timeFilter(computed_at)\n  UNION ALL\n  SELECT 2, '② 发起抓取', COALESCE(SUM(funnel_fetch), 0)::int\n    FROM trajectory_metrics WHERE funnel_fetch IS NOT NULL AND $__timeFilter(computed_at)\n  UNION ALL\n  SELECT 3, '③ 抓到正文', COALESCE(SUM(funnel_pages), 0)::int\n    FROM trajectory_metrics WHERE funnel_pages IS NOT NULL AND $__timeFilter(computed_at)\n  UNION ALL\n  SELECT 4, '④ 入库 chunk', COALESCE(SUM(funnel_chunks), 0)::int\n    FROM trajectory_metrics WHERE funnel_chunks IS NOT NULL AND $__timeFilter(computed_at)\n) t ORDER BY ord",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "xField": "stage",
+        "orientation": "vertical",
+        "showValue": "always",
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "搜索空结果率趋势",
+      "description": "按天任务等权平均（一行一任务），与 CLI 的 statistics.fmean 口径一致。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 65
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND((AVG(search_empty_rate) * 100)::numeric, 1) AS \"空结果率%\"\nFROM trajectory_metrics\nWHERE search_empty_rate IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "抓取失败次数（按错误类型堆叠）",
+      "description": "只看「抛异常」的失败；timeout / 403 / SSL / 连接失败 / 其他。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 65
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       COALESCE(SUM((fetch_fail_detail->>'403')::int), 0)  AS \"403\",\n       COALESCE(SUM((fetch_fail_detail->>'timeout')::int), 0) AS \"超时\",\n       COALESCE(SUM((fetch_fail_detail->>'ssl')::int), 0)  AS \"SSL\",\n       COALESCE(SUM((fetch_fail_detail->>'连接失败')::int), 0) AS \"连接失败\",\n       COALESCE(SUM((fetch_fail_detail->>'其他')::int), 0) AS \"其他\"\nFROM trajectory_metrics\nWHERE fetch_fail_detail IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "rerank 区分度趋势",
+      "description": "top1 - median，越接近 0 越说明精排分不开。灰色虚线是 0.05 参考线，不触发告警。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 65
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND(AVG(rerank_gap)::numeric, 4) AS \"区分度\",\n       0.05 AS \"参考线 0.05\"\nFROM trajectory_metrics\nWHERE rerank_gap IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "参考线 0.05"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8a8a8a"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    6,
+                    6
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "轮次数分布",
+      "description": "Supervisor 每任务实际用了多少轮。右移说明决策效率下降（max_rounds=10 是硬上限）。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 73
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT rounds AS \"轮次数\", count(*) AS \"任务数\"\nFROM trajectory_metrics\nWHERE rounds IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "xField": "轮次数",
+        "orientation": "vertical",
+        "showValue": "always",
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "失败轮占比趋势",
+      "description": "该轮 Agent 执行失败的比例（任务等权平均）。持续走高说明不是偶发错误，是能力或数据问题。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 73
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND((AVG(failed_round_rate) * 100)::numeric, 1) AS \"失败轮占比%\"\nFROM trajectory_metrics\nWHERE failed_round_rate IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "工具调用次数",
+      "description": "平均每任务调用工具次数（成本代理指标）+ 时间窗内合计。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 73
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND(AVG(tool_calls)::numeric, 1) AS \"平均每任务工具调用数\",\n       SUM(tool_calls) AS \"合计调用次数\"\nFROM trajectory_metrics\nWHERE tool_calls IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "重复抓取率趋势",
+      "description": "同一 URL 被抓多次的比例。理想为 0——不为 0 说明 seen_urls 去重没生效，在烧带宽。",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 81
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND((AVG(dup_fetch_rate) * 100)::numeric, 1) AS \"重复抓取率%\"\nFROM trajectory_metrics\nWHERE dup_fetch_rate IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "检索侧（料够不够喂给每个竞品）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 89
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "召回 vs 精排保留",
+      "description": "两条线贴在一起 = 候选池本来就不够（不是精排太狠）；召回高但保留低 = 竞品过滤或 top_k 掐得太紧。",
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 0,
+        "y": 90
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND(AVG(recall_avg)::numeric, 1) AS \"每格召回条数\",\n       ROUND(AVG(rerank_avg)::numeric, 1) AS \"精排后保留条数\"\nFROM trajectory_metrics\nWHERE recall_avg IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "竞品覆盖偏斜",
+      "description": "最少竞品页数 / 中位数。1.0=各竞品料量均衡，接近 0=有竞品几乎没料，它的结论基本是模型自己编的。灰色虚线 0.3 只做视觉参考，不告警。",
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 90
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "cas-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "cas-postgres"
+          },
+          "format": "table",
+          "rawSql": "SELECT $__timeGroup(computed_at, '1d') AS \"time\",\n       ROUND(AVG(coverage_skew)::numeric, 3) AS \"竞品覆盖偏斜\",\n       0.3 AS \"参考线 0.3\"\nFROM trajectory_metrics\nWHERE coverage_skew IS NOT NULL AND $__timeFilter(computed_at)\nGROUP BY 1 ORDER BY 1",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "参考线 0.3"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8a8a8a"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    6,
+                    6
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
     }
   ],
   "templating": {
