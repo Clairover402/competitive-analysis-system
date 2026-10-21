@@ -61,12 +61,12 @@ export function render() {
           '<label class="pixel-input-label" for="adv-title">[ \u6807\u9898 ]</label>' +
           '<input id="adv-title" class="pixel-input pixel-mb-md" ' +
                  ' placeholder="> 例如：MOBA 头部游戏竞品分析" maxlength="200">' +
-          '<label class="pixel-input-label" for="adv-competitors">[ \u7ADE\u54C1 ]</label>' +
+          '<label class="pixel-input-label" for="adv-competitors">[ 竞品 · 最多 4 个 ]</label>' +
           '<input id="adv-competitors" class="pixel-input pixel-mb-md" ' +
-                 ' placeholder="> 例如：王者荣耀, 英雄联盟, 英雄联盟手游, 决战平安京" maxlength="2000">' +
-          '<label class="pixel-input-label" for="adv-dimensions">[ \u7EF4\u5EA6 ]</label>' +
+                 ' placeholder="> 例如：王者荣耀, 英雄联盟, 英雄联盟手游, 决战平安京（最多 4 个）" maxlength="2000">' +
+          '<label class="pixel-input-label" for="adv-dimensions">[ 维度 · 最多 4 个 ]</label>' +
           '<input id="adv-dimensions" class="pixel-input pixel-mb-md" ' +
-                 ' placeholder="> 例如：玩法设计, 美术风格, 电竞生态, 商业化, 社交系统" maxlength="2000">' +
+                 ' placeholder="> 例如：玩法设计, 美术风格, 电竞生态, 商业化（最多 4 个）" maxlength="2000">' +
           '<button id="btn-submit-adv" class="pixel-btn">' +
             '&blacktriangleright; \u5F00\u59CB\u5206\u6790' +
           '</button>' +
@@ -126,6 +126,26 @@ export function mount() {
     }
   }
 
+  // 单次任务规模上限——与后端 src/config.py 的 max_competitors / max_dimensions 保持一致。
+  // 后端也会 400，这里只是让用户不必等一次网络往返才看到错误。
+  // 【为什么要上限】竞品一多，检索池（按 task 混池取 60 条）被摊薄，
+  // 容易出现某竞品在某维度整块「数据不足」，而报告看起来仍是完整的。
+  var MAX_COMPETITORS = 4;
+  var MAX_DIMENSIONS = 4;
+
+  function splitList(s) {
+    return s.split(/[,，]/).map(function(x) { return x.trim(); }).filter(Boolean);
+  }
+
+  function checkLimit(list, label, max) {
+    if (list.length > max) {
+      showMsg('> ' + label + ' ' + list.length + ' 个，最多 ' + max + ' 个，请精简后重试', 'error');
+      SFX.error();
+      return false;
+    }
+    return true;
+  }
+
   if (tabQuick && tabAdvanced && panelQuick && panelAdvanced) {
     tabQuick.addEventListener('click', function() {
       mode = 'quick';
@@ -182,13 +202,18 @@ export function mount() {
       return;
     }
 
+    var compList = competitors ? splitList(competitors) : [];
+    var dimList = dimensions ? splitList(dimensions) : [];
+    if (!checkLimit(compList, '竞品', MAX_COMPETITORS)) return;
+    if (!checkLimit(dimList, '维度', MAX_DIMENSIONS)) return;
+
     btnSubmitAdv.disabled = true;
     btnSubmitAdv.textContent = '\u5904\u7406\u4E2D...';
 
     try {
       var body = { title: title || '\u672A\u547D\u540D' };
-      if (competitors) body.competitors = competitors.split(/[,，]/).map(function(s) { return s.trim(); }).filter(Boolean);
-      if (dimensions) body.dimensions = dimensions.split(/[,，]/).map(function(s) { return s.trim(); }).filter(Boolean);
+      if (compList.length) body.competitors = compList;
+      if (dimList.length) body.dimensions = dimList;
       var data = await API.post('/api/tasks', body);
       showMsg('> \u4EFB\u52A1\u5DF2\u521B\u5EFA :: ' + data.task_id, 'success');
       SFX.confirm();

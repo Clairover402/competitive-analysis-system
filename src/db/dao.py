@@ -330,7 +330,7 @@ class RetrievalSnapshotDAO:
     对象必须是检索阶段原始产出的 retrieved_contexts（精排后的原文），
     不能是「LLM 结论」或「事后按 URL 反查的 chunk」。故 analyzer 在
     精排完成、喂 LLM 前，把召回全集 + 精排 TopK 原样落 retrieval_snapshot。
-    召回全集 recalled_urls 另用于 source_coverage（域名对拍）度量关键来源是否覆盖。
+    recalled_urls 是该竞品分到的候选（按 competitor 分组后那一份），用于召回是否漏。
     """
 
     def __init__(self, pool: asyncpg.Pool) -> None:

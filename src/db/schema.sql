@@ -204,11 +204,14 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embedding_hnsw
 --   后者经过 _smart_slice 丢弃与结论改写，检索质量信号已被稀释/污染。
 --
 --   因此本表在 analyzer 精排完成、喂 LLM 之前，把检索的中间结果原样落盘：
---     - recalled_urls  = 向量(TopK=60) ∪ 关键词(TopK=30) 去重后的召回全集
---       （2026-10-12 校正：与 analyzer.py 实际传参一致；此前注释写 30/20 是过期值）
+--     - recalled_urls  = **该竞品分到的候选 URL**（向量∪关键词混池按 competitor 分组后，
+--       这个竞品那一份，已过样板清洗）。粒度与同行的 competitor 一致。
+--       ⚠️ 2026-10-20 之前落的是「该维度的混池全集」——同一维度下所有竞品的
+--       recalled_urls 完全相同，导致 coverage_skew 恒偏健康（只看得见整块没料的格）。
+--       历史行未回填，**跨版本对比 recall_avg / coverage_skew 必须分段**。
 --     - reranked_urls/texts = Cross-encoder 精排后 TopK=15 的 url/text
 --   reranked_texts 才是 RAGAS context_precision 该吃的 retrieved_contexts。
---   recalled_urls 则用于 source_coverage（关键来源覆盖率）的域名对拍。
+--   recalled_urls 则用于「关键来源是否进了候选池」的域名对拍（按竞品各自那一份算）。
 --     （该指标 2026-10-14 由 recall_hit_rate 改名：原名易被误读为 ragas
 --      context_recall，实际度量的是「标准答案的域名锚点有多少进了候选池」。
 --      改名前的历史行 metric_name 仍是 recall_hit_rate。）
@@ -222,7 +225,7 @@ CREATE TABLE IF NOT EXISTS retrieval_snapshot (
     dimension       VARCHAR(50) NOT NULL,     -- 所属维度（功能/定价/市场…）
     competitor      TEXT,                     -- 所属竞品名（竞品×维度粒度快照；NULL=旧维度级数据）
     query           TEXT NOT NULL,            -- 检索 query（精排 query = "竞品 维度"）
-    recalled_urls   JSONB NOT NULL DEFAULT '[]',  -- 召回全集 URL（向量∪关键词去重后）
+    recalled_urls   JSONB NOT NULL DEFAULT '[]',  -- 该竞品分到的候选 URL（2026-10-20 前为维度混池全集）
     reranked_urls   JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 URL（保持排序）
     reranked_texts  JSONB NOT NULL DEFAULT '[]',  -- 精排后 TopK 的 chunk 原文（与 url 对齐）
     response_text   TEXT,                         -- 该 (竞品@维度) 的 LLM 分析结论（RAGAS response 输入）

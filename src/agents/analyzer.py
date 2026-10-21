@@ -300,6 +300,8 @@ async def _retrieve_and_analyze_dimension(
         #  ⟺ **池子本身小于 top_k**。此时该层检索等于「把池子全取回来」，
         #  维度名对召回结果**零影响**（实测 golden_001：池子 32 < 60，
         #  4 个快照的 recalled_urls 是同一个 12 URL 集合，只有顺序不同）。
+        #  ⚠️ 那句观测本身也是 Step 5.5 那个口径 bug 的证据：当时 recalled_urls
+        #  落的是维度级混池，所以各竞品快照天然相同。已改落 group，仅历史快照仍如此。
         #  这个退化此前完全静默，外部只表现为「评估分数全 0」，极易被误判为
         #  「判据形态问题」或「模型不听话」。所以在最上游主动 WARN，暴露根因。
         if len(vec_results) < vec_top_k:
@@ -478,6 +480,14 @@ async def _retrieve_and_analyze_dimension(
             # 一个问法去考检索，而是考「线上真正拿去排序的那个串」。
             # 【名词边界】DB 列名仍是 query / reranked_texts（历史名，未做迁移）；
             # 「query → user_input」的转换只在评估侧边界做（ragas_core.build_samples）。
+            # 【2026-10-20 修 recalled_urls 口径】原先落的是 `merged`——**该维度的混池全集**，
+            #   同一维度下每个竞品拿到的是同一份 URL 集合，于是：
+            #   ⚠️ coverage_skew 只看得见「整块没料、连快照都没落」（上面 continue 掉的那种格），
+            #      「被大竞品挤到只剩 1 条」完全看不见 → 指标恒偏健康，检索粒度改造无法验证。
+            #   改落 `group`（该竞品实际进精排的候选），三项指标才成立：
+            #     recall_avg    = 每格真召回几条（不再是混池大小）
+            #     coverage_skew = 竞品间召回均衡度（不再是同维度内的固定值）
+            #   ★ 代价：2026-10-20 之前的历史快照仍是混池口径，**新旧对比必须分段**。
             snapshot_id: str | None = None
             try:
                 snapshot_id = await snapshot_dao.insert_snapshot(
@@ -485,7 +495,7 @@ async def _retrieve_and_analyze_dimension(
                     dimension=dimension,
                     competitor=competitor,
                     query=rerank_query,
-                    recalled_urls=[r.get("source_url", "") for r in merged],
+                    recalled_urls=[r.get("source_url", "") for r in group],
                     reranked_urls=reranked_urls,
                     reranked_texts=reranked_texts,
                 )

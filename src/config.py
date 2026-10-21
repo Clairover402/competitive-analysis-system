@@ -59,6 +59,20 @@ class Settings(BaseSettings):
     vector_search_top_k: int = 60
     rerank_top_k: int = 15
 
+    # ---- 任务规模上限（入口校验，2026-10-21 产品约束）----
+    # 【为什么要有硬上限】任务内是 N×M 格，每格一次精排 + 一次 LLM 分析，
+    #   成本线性涨只是次要问题，主要问题是**质量会静默劣化**：
+    #   单任务实测均值 27.5 页 / 112.8 chunk（约 4 chunk/页），
+    #   while vector_search_top_k 是 **绝对值 60 条 chunk**（≈14 页），
+    #   所以竞品数一多，每个竞品分到的配额就被摊薄——
+    #   实测 8 竞品 / 612 chunk 的任务里，某竞品在单一维度 **0/60 条**（整块归零），
+    #   那格下游只能写 [数据不足]，而报告**看起来是完整的**。
+    #   N=4 时池子仍能被 60 条覆盖到一半以上，是当前 top_k 能撑住的规模。
+    # 【为什么现在是配置而不是写死在路由】上限会随 top_k / 采集量一起变，
+    #   写死会让「调了 top_k 却忘了调上限」再现同一类静默缺格。
+    max_competitors: int = 4
+    max_dimensions: int = 4
+
     # ---- RAGAS 评估运行参数（ragas_core 唯一口径，构造见 llm_factory）----
     # 【2026-10-16 新增】主因是一次实测事故：`钉钉@功能` 的 context_precision
     #   恒为 NaN，日志只有一行 `Job[12]: TimeoutError()`。

@@ -137,6 +137,47 @@ def _reject_duplicates(
         raise HTTPException(400, "；".join(problems) + "。请去掉重复项后重试。")
 
 
+def _reject_over_limit(
+    competitors: list[str] | None,
+    dimensions: list[str] | None,
+    settings: Settings,
+) -> None:
+    """规模上限校验：竞品或维度超过上限 → HTTP 400（2026-10-21 产品约束）。
+
+    【为什么要有上限——不是成本，是质量会静默劣化】
+      检索是**单任务混池**取 `vector_search_top_k`(=60) 条 chunk，这是个绝对值：
+      竞品数一多，每个竞品分到的配额就被摊薄。实测 8 竞品 / 612 chunk 的任务里，
+      某竞品在单一维度 **0/60** → 那格只能写 `[数据不足]`，
+      而最终报告**看起来是完整的一份**。这种缺格比 400 难发现得多。
+
+    【为什么是拒绝而不是截断】
+      与 `_reject_duplicates` 同一口径：截断会静默改写用户要分析的范围，
+      用户拿到少几格的报告却以为按自己说的跑了。显式 400 让用户自己决定砍哪个。
+
+    【为什么显式提示数量】
+      「最多 4 个」不告诉用户「你现在传了几个」，用户还得自己数一遍。
+    """
+    problems: list[str] = []
+    if competitors and len(competitors) > settings.max_competitors:
+        problems.append(
+            f"竞品 {len(competitors)} 个，超过上限 {settings.max_competitors} 个"
+            f"（{'、'.join(competitors)}）"
+        )
+    if dimensions and len(dimensions) > settings.max_dimensions:
+        problems.append(
+            f"维度 {len(dimensions)} 个，超过上限 {settings.max_dimensions} 个"
+            f"（{'、'.join(dimensions)}）"
+        )
+    if problems:
+        raise HTTPException(
+            400,
+            "；".join(problems)
+            + f"。单次任务最多 {settings.max_competitors} 个竞品 × "
+            f"{settings.max_dimensions} 个维度，请精简后重试"
+            "（竞品过多会让每个竞品分到的资料变少，容易出现整块「数据不足」）。",
+        )
+
+
 class TaskRequest(BaseModel):
     """创建任务请求体。
 
@@ -699,8 +740,11 @@ async def create_task(
 
     # ── Layer 2: 参数校验 ──
     # Pydantic model_post_init 已保证 competitors+dimensions 或 query 至少传一组；
-    # 这里追加**业务级**校验：同任务内重复的竞品/维度直接 400（避免重复跑 + 静默覆盖）。
+    # 这里追加**业务级**校验：
+    #   ① 同任务内重复的竞品/维度直接 400（避免重复跑 + 静默覆盖）；
+    #   ② 规模上限（2026-10-21）：超过 4×4 直接 400，不做静默截断。
     _reject_duplicates(body.competitors, body.dimensions)
+    _reject_over_limit(body.competitors, body.dimensions, request.app.state.settings)
 
     # ── 构造 llm_parsed ──
     # 如果传了 competitors + dimensions → intent 明确
@@ -727,6 +771,13 @@ async def create_task(
         # 重新评估 intent_is_clear（提取后有值时可能改变）
         llm_parsed["intent_is_clear"] = bool(
             llm_parsed["competitors"] and llm_parsed["dimensions"]
+        )
+        # 规模上限：LLM 从一句话里可能抽出远超上限的实体（"对比 A B C D E F G"）。
+        # 这里同样走 400 而不是截断——用户并不知道自己"说了 7 个"，
+        # 静默只取前 4 个会让他以为 7 家都分析了。提示里带上限和实际数量，他才好改口径。
+        _reject_over_limit(
+            llm_parsed["competitors"], llm_parsed["dimensions"],
+            request.app.state.settings,
         )
 
     # ── 写入 DB ──

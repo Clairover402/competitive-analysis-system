@@ -125,12 +125,17 @@ curl -X POST http://localhost:8000/api/analyze \
   -H "Content-Type: application/json" \
   -d '{
     "competitors": ["飞书", "钉钉", "企业微信"],
-    "dimensions": ["定价", "功能", "用户体验", "生态", "市场份额"]
+    "dimensions": ["定价", "功能", "用户体验", "生态"]
   }'
 
 # SSE 实时查看进度
 curl -N http://localhost:8000/api/analyze/{task_id}/stream
 ```
+
+> **规模上限：单次任务最多 4 个竞品 × 4 个维度**（`MAX_COMPETITORS` / `MAX_DIMENSIONS`，
+> 见 `src/config.py`）。超出时入口直接返回 400，并在提示里写明「实际几个 / 上限几个」。
+> 不是成本考虑——检索是单任务混池取 60 条 chunk，竞品一多配额被摊薄，
+> 会出现某竞品在某维度整块「数据不足」，而最终报告看起来仍是完整的。
 
 ---
 
