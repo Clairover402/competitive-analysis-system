@@ -51,6 +51,11 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-tab { border: none; border-radius: 0; background: transparent; color: var(--pixel-light); font-family: var(--pixel-font); font-size: 14px; padding: 12px 24px; cursor: pointer; text-transform: uppercase; letter-spacing: 2px; border-bottom: 3px solid var(--pixel-mid); transition: color 0.1s ease, border-color 0.1s ease; }
 .pixel-tab:hover { color: var(--pixel-white); }
 .pixel-tab.active { color: var(--pixel-green); border-bottom-color: var(--pixel-green); }
+/* 模式说明：标准=结构化入参走 Pipeline，高级=一句话走 Supervisor。
+   一行小字把「哪条更慢更不可控」写在用户点之前，免得名字把人骗去探索模式。 */
+.pixel-mode-hint { color: var(--pixel-light); font-family: var(--pixel-mono); font-size: 13px; line-height: 1.6; margin: 0 0 16px; }
+.pixel-mode-hint::before { content: '\25B8 '; color: var(--pixel-green); }
+.pixel-mode-hint.pixel-text-amber::before { color: var(--pixel-amber); }
 .pixel-divider { border: none; height: 2px; background: var(--pixel-mid); margin: 14px 0; }
 .pixel-sidebar { width: 220px; min-width: 220px; min-height: 100vh; background: var(--pixel-dark); display: flex; flex-direction: column; box-shadow: 4px 0 0 0 var(--pixel-mid), inset 0 0 0 2px rgba(255,255,255,0.02); }
 .pixel-sidebar-brand { display: flex; flex-direction: column; align-items: center; padding: 28px 18px 18px; gap: 10px; }

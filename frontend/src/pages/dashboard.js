@@ -4,7 +4,12 @@ import { Auth } from '../js/auth.js';
 import { API } from '../js/api.js';
 import { SFX } from '../js/sounds.js';
 
-var mode = 'quick';
+// 两种模式 = 后端两条执行路径，命名必须跟着架构走，别让 UI 词比代码更"先进"：
+//   标准模式（默认）：用户自己给竞品与维度 → 参数齐全 → Pipeline 确定性分析
+//   高级模式        ：一句话交给 LLM 抽实体 → 常缺参数 → Supervisor 探索补齐
+// 不要把"一句话"叫快速模式：它更省事，但要跑 ReAct 探索，更慢、更贵、更依赖模型推断。
+// 把更慢更不确定的那条叫"高级"，也比叫"快速"诚实。
+var mode = 'standard';
 
 export function render() {
   var username = Auth.getUsername();
@@ -45,28 +50,33 @@ export function render() {
       '<div class="pixel-box pixel-mb-lg">' +
 
         '<div class="pixel-tabs">' +
-          '<button id="tab-quick" class="pixel-tab active">\u5FEB\u901F\u6A21\u5F0F</button>' +
+          '<button id="tab-standard" class="pixel-tab active">\u6807\u51C6\u6A21\u5F0F</button>' +
           '<button id="tab-advanced" class="pixel-tab">\u9AD8\u7EA7\u6A21\u5F0F</button>' +
         '</div>' +
 
-        '<div id="panel-quick">' +
-          '<textarea id="quick-query" class="pixel-textarea pixel-mb-md" rows="4"' +
-                    ' placeholder="> 例如：对比王者荣耀和英雄联盟在玩法设计、美术风格、电竞生态、商业化方面的表现"></textarea>' +
-          '<button id="btn-submit-quick" class="pixel-btn">' +
+        // 默认入口：结构化入参。参数齐全直接进 Pipeline，快、稳、可复现。
+        '<div id="panel-standard">' +
+          '<p class="pixel-mode-hint">\u81EA\u5DF1\u6307\u5B9A\u7ADE\u54C1\u4E0E\u7EF4\u5EA6 \u00B7 \u4E24\u9879\u9F50\u5168\u5373\u8D70\u786E\u5B9A\u6027\u5206\u6790\uFF08Pipeline\uFF09\uFF0C\u7ED3\u679C\u53EF\u590D\u73B0\u3001\u8017\u65F6\u53EF\u9884\u671F</p>' +
+          '<label class="pixel-input-label" for="std-title">[ \u6807\u9898 ]</label>' +
+          '<input id="std-title" class="pixel-input pixel-mb-md" ' +
+                 ' placeholder="> \u4F8B\u5982\uFF1AMOBA \u5934\u90E8\u6E38\u620F\u7ADE\u54C1\u5206\u6790" maxlength="200">' +
+          '<label class="pixel-input-label" for="std-competitors">[ \u7ADE\u54C1 \u00B7 \u6700\u591A 4 \u4E2A ]</label>' +
+          '<input id="std-competitors" class="pixel-input pixel-mb-md" ' +
+                 ' placeholder="> \u4F8B\u5982\uFF1A\u738B\u8005\u8363\u8000, \u82F1\u96C4\u8054\u76DF, \u82F1\u96C4\u8054\u76DF\u624B\u6E38, \u51B3\u6218\u5E73\u5B89\u4EAC\uFF08\u6700\u591A 4 \u4E2A\uFF09" maxlength="2000">' +
+          '<label class="pixel-input-label" for="std-dimensions">[ \u7EF4\u5EA6 \u00B7 \u6700\u591A 4 \u4E2A ]</label>' +
+          '<input id="std-dimensions" class="pixel-input pixel-mb-md" ' +
+                 ' placeholder="> \u4F8B\u5982\uFF1A\u73A9\u6CD5\u8BBE\u8BA1, \u7F8E\u672F\u98CE\u683C, \u7535\u7ADE\u751F\u6001, \u5546\u4E1A\u5316\uFF08\u6700\u591A 4 \u4E2A\uFF09" maxlength="2000">' +
+          '<button id="btn-submit-std" class="pixel-btn">' +
             '&blacktriangleright; \u5F00\u59CB\u5206\u6790' +
           '</button>' +
         '</div>' +
 
+        // 高级入口：一句话。省掉填表，代价是竞品/维度要靠模型抽，缺了参数就转探索。
         '<div id="panel-advanced" class="pixel-hidden">' +
-          '<label class="pixel-input-label" for="adv-title">[ \u6807\u9898 ]</label>' +
-          '<input id="adv-title" class="pixel-input pixel-mb-md" ' +
-                 ' placeholder="> 例如：MOBA 头部游戏竞品分析" maxlength="200">' +
-          '<label class="pixel-input-label" for="adv-competitors">[ 竞品 · 最多 4 个 ]</label>' +
-          '<input id="adv-competitors" class="pixel-input pixel-mb-md" ' +
-                 ' placeholder="> 例如：王者荣耀, 英雄联盟, 英雄联盟手游, 决战平安京（最多 4 个）" maxlength="2000">' +
-          '<label class="pixel-input-label" for="adv-dimensions">[ 维度 · 最多 4 个 ]</label>' +
-          '<input id="adv-dimensions" class="pixel-input pixel-mb-md" ' +
-                 ' placeholder="> 例如：玩法设计, 美术风格, 电竞生态, 商业化（最多 4 个）" maxlength="2000">' +
+          '<p class="pixel-mode-hint">\u4E00\u53E5\u8BDD\u4EA4\u7ED9 Agent \u81EA\u5DF1\u8BC6\u522B \u00B7 \u5148\u62BD\u7ADE\u54C1\u4E0E\u7EF4\u5EA6\uFF0C\u7F3A\u53C2\u6570\u65F6\u8D70 Supervisor \u63A2\u7D22\u8865\u9F50\uFF0C\u7701\u4E8B\u4F46\u66F4\u6162\u3001\u66F4\u4F9D\u8D56\u6A21\u578B\u63A8\u65AD</p>' +
+          '<textarea id="adv-query" class="pixel-textarea pixel-mb-sm" rows="4"' +
+                    ' placeholder="> \u4F8B\u5982\uFF1A\u5BF9\u6BD4\u738B\u8005\u8363\u8000\u548C\u82F1\u96C4\u8054\u76DF\u5728\u73A9\u6CD5\u8BBE\u8BA1\u3001\u7F8E\u672F\u98CE\u683C\u3001\u7535\u7ADE\u751F\u6001\u3001\u5546\u4E1A\u5316\u65B9\u9762\u7684\u8868\u73B0"></textarea>' +
+          '<p class="pixel-mode-hint pixel-text-amber">\u26A0 \u81F3\u5C11\u9700\u80FD\u8BC6\u522B\u51FA\u7ADE\u54C1\u6216\u7EF4\u5EA6\u4E4B\u4E00\uFF1B\u4E24\u8005\u90FD\u8BC6\u522B\u4E0D\u5230\u4F1A\u88AB\u76F4\u63A5\u62D2\u7EDD</p>' +
           '<button id="btn-submit-adv" class="pixel-btn">' +
             '&blacktriangleright; \u5F00\u59CB\u5206\u6790' +
           '</button>' +
@@ -94,16 +104,16 @@ export function render() {
 }
 
 export function mount() {
-  var tabQuick = document.getElementById('tab-quick');
+  var tabStandard = document.getElementById('tab-standard');
   var tabAdvanced = document.getElementById('tab-advanced');
-  var panelQuick = document.getElementById('panel-quick');
+  var panelStandard = document.getElementById('panel-standard');
   var panelAdvanced = document.getElementById('panel-advanced');
   var msgEl = document.getElementById('submit-msg');
-  var quickQuery = document.getElementById('quick-query');
-  var advTitle = document.getElementById('adv-title');
-  var advCompetitors = document.getElementById('adv-competitors');
-  var advDimensions = document.getElementById('adv-dimensions');
-  var btnSubmitQuick = document.getElementById('btn-submit-quick');
+  var stdTitle = document.getElementById('std-title');
+  var stdCompetitors = document.getElementById('std-competitors');
+  var stdDimensions = document.getElementById('std-dimensions');
+  var advQuery = document.getElementById('adv-query');
+  var btnSubmitStd = document.getElementById('btn-submit-std');
   var btnSubmitAdv = document.getElementById('btn-submit-adv');
   var btnRefresh = document.getElementById('btn-refresh-tasks');
   var btnLogout = document.getElementById('btn-logout');
@@ -146,69 +156,48 @@ export function mount() {
     return true;
   }
 
-  if (tabQuick && tabAdvanced && panelQuick && panelAdvanced) {
-    tabQuick.addEventListener('click', function() {
-      mode = 'quick';
-      tabQuick.classList.add('active');
+  if (tabStandard && tabAdvanced && panelStandard && panelAdvanced) {
+    tabStandard.addEventListener('click', function() {
+      mode = 'standard';
+      tabStandard.classList.add('active');
       tabAdvanced.classList.remove('active');
-      panelQuick.classList.remove('pixel-hidden');
+      panelStandard.classList.remove('pixel-hidden');
       panelAdvanced.classList.add('pixel-hidden');
       SFX.blip();
-      quickQuery.focus();
+      if (stdCompetitors) stdCompetitors.focus();
     });
 
     tabAdvanced.addEventListener('click', function() {
       mode = 'advanced';
       tabAdvanced.classList.add('active');
-      tabQuick.classList.remove('active');
+      tabStandard.classList.remove('active');
       panelAdvanced.classList.remove('pixel-hidden');
-      panelQuick.classList.add('pixel-hidden');
+      panelStandard.classList.add('pixel-hidden');
       SFX.blip();
+      if (advQuery) advQuery.focus();
     });
   }
 
-  async function submitQuick() {
-    var query = quickQuery.value.trim();
-    if (!query) {
-      showMsg('> \u8BF7\u8F93\u5165\u5206\u6790\u5185\u5BB9', 'error');
-      SFX.error();
-      return;
-    }
-
-    btnSubmitQuick.disabled = true;
-    btnSubmitQuick.textContent = '\u5904\u7406\u4E2D...';
-
-    try {
-      var data = await API.post('/api/tasks', { title: query.substring(0, 80), query: query });
-      showMsg('> \u4EFB\u52A1\u5DF2\u521B\u5EFA :: ' + data.task_id, 'success');
-      SFX.confirm();
-      setTimeout(function() { window.location.hash = '#/task/' + data.task_id; }, 600);
-    } catch (e) {
-      showMsg('> \u9519\u8BEF: ' + e.message, 'error');
-      SFX.error();
-      btnSubmitQuick.disabled = false;
-      btnSubmitQuick.textContent = '\u25B6 \u5F00\u59CB\u5206\u6790';
-    }
-  }
-
-  async function submitAdvanced() {
-    var title = advTitle.value.trim();
-    var competitors = advCompetitors.value.trim();
-    var dimensions = advDimensions.value.trim();
-
-    if (!title && !competitors) {
-      showMsg('> \u6807\u9898\u6216\u7ADE\u54C1\u81F3\u5C11\u586B\u5199\u4E00\u9879', 'error');
-      SFX.error();
-      return;
-    }
+  async function submitStandard() {
+    var title = stdTitle.value.trim();
+    var competitors = stdCompetitors.value.trim();
+    var dimensions = stdDimensions.value.trim();
 
     var compList = competitors ? splitList(competitors) : [];
     var dimList = dimensions ? splitList(dimensions) : [];
-    if (!checkLimit(compList, '竞品', MAX_COMPETITORS)) return;
-    if (!checkLimit(dimList, '维度', MAX_DIMENSIONS)) return;
 
-    btnSubmitAdv.disabled = true;
-    btnSubmitAdv.textContent = '\u5904\u7406\u4E2D...';
+    // 竞品/维度至少一项：标题只负责命名，不构成分析锚点。
+    // 后端 _reject_no_anchor 对两个都空的请求返回 400，这里先本地拦一次，省一趟往返。
+    if (!compList.length && !dimList.length) {
+      showMsg('> \u7ADE\u54C1\u6216\u7EF4\u5EA6\u81F3\u5C11\u586B\u5199\u4E00\u9879\uFF08\u6807\u9898\u4EC5\u7528\u4E8E\u547D\u540D\uFF09', 'error');
+      SFX.error();
+      return;
+    }
+    if (!checkLimit(compList, '\u7ADE\u54C1', MAX_COMPETITORS)) return;
+    if (!checkLimit(dimList, '\u7EF4\u5EA6', MAX_DIMENSIONS)) return;
+
+    btnSubmitStd.disabled = true;
+    btnSubmitStd.textContent = '\u5904\u7406\u4E2D...';
 
     try {
       var body = { title: title || '\u672A\u547D\u540D' };
@@ -221,31 +210,57 @@ export function mount() {
     } catch (e) {
       showMsg('> \u9519\u8BEF: ' + e.message, 'error');
       SFX.error();
+      btnSubmitStd.disabled = false;
+      btnSubmitStd.textContent = '\u25B6 \u5F00\u59CB\u5206\u6790';
+    }
+  }
+
+  async function submitAdvanced() {
+    var query = advQuery.value.trim();
+    if (!query) {
+      showMsg('> \u8BF7\u8F93\u5165\u5206\u6790\u5185\u5BB9', 'error');
+      SFX.error();
+      return;
+    }
+
+    btnSubmitAdv.disabled = true;
+    btnSubmitAdv.textContent = '\u5904\u7406\u4E2D...';
+
+    try {
+      var data = await API.post('/api/tasks', { title: query.substring(0, 80), query: query });
+      showMsg('> \u4EFB\u52A1\u5DF2\u521B\u5EFA :: ' + data.task_id, 'success');
+      SFX.confirm();
+      setTimeout(function() { window.location.hash = '#/task/' + data.task_id; }, 600);
+    } catch (e) {
+      // 抽不出竞品/维度时后端给 400，detail 已经是给用户看的话，直接透出
+      showMsg('> \u9519\u8BEF: ' + e.message, 'error');
+      SFX.error();
       btnSubmitAdv.disabled = false;
       btnSubmitAdv.textContent = '\u25B6 \u5F00\u59CB\u5206\u6790';
     }
   }
 
-  if (quickQuery) {
-    quickQuery.addEventListener('keydown', function(e) {
+  if (advQuery) {
+    advQuery.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && e.ctrlKey) {
         e.preventDefault();
-        submitQuick();
+        submitAdvanced();
       }
     });
   }
-  if (advDimensions) {
-    advDimensions.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') submitAdvanced();
+  if (stdDimensions) {
+    stdDimensions.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') submitStandard();
     });
   }
 
-  if (btnSubmitQuick) btnSubmitQuick.addEventListener('click', submitQuick);
+  if (btnSubmitStd) btnSubmitStd.addEventListener('click', submitStandard);
   if (btnSubmitAdv) btnSubmitAdv.addEventListener('click', submitAdvanced);
   if (btnRefresh) btnRefresh.addEventListener('click', function() { SFX.click(); loadTasks(); });
   if (btnLogout) btnLogout.addEventListener('click', function() { SFX.click(); Auth.logout(); });
 
-  if (quickQuery) quickQuery.focus();
+  // 默认落在标准模式：第一个该填的是竞品，不是标题
+  if (stdCompetitors) stdCompetitors.focus();
 
   loadTasks();
 }

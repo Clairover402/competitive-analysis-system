@@ -88,9 +88,14 @@ export function unmount()        // 清理定时器/SSE 连接
 ### 4.2 仪表盘 `#/dashboard`
 
 - 左侧 220px 侧边栏：🔍 Logo + 导航项（▶ 仪表盘 / 监控面板）+ 用户信息 + 退出按钮
-- 右侧上半区：`pixel-tabs` 切换快速/高级模式
-  - **快速模式**：textarea + Ctrl+Enter 提交，POST `/api/tasks` body `{title, query}`
-  - **高级模式**：标题 + 竞品 + 维度三个输入框，POST `/api/tasks` body `{title, competitors, dimensions}`
+- 右侧上半区：`pixel-tabs` 切换标准/高级模式（**命名对齐后端两条执行路径，不是按"填几个框"命名**）
+  - **标准模式（默认）**：标题 + 竞品 + 维度三个输入框，POST `/api/tasks` body `{title, competitors, dimensions}`
+    —— 结构化入参，参数齐全直接进 **Pipeline**（确定性分析：快、稳、可复现）
+  - **高级模式**：textarea + Ctrl+Enter 提交，POST `/api/tasks` body `{title, query}`
+    —— 一句话交给 LLM 抽实体，常缺参数 → **Supervisor** 探索补齐（更省事，但更慢、更贵、更依赖模型推断）
+  - ⚠️ 两条都不能省：前者是原始设计（先有结构化入参），后者是"用户一句话、竞品维度不明确"场景的补充。
+    所以"一句话"不能叫快速模式——它的延迟和不确定性都更高，叫快速会误导用户。
+  - 标准模式要求竞品/维度**至少填一项**（标题只用于命名），与后端 `_reject_no_anchor` 的 400 对齐
   - 提交成功 → 600ms 后跳 `#/task/{id}`
 - 右侧下半区：任务卡片 3 列网格
   - 每张卡片：状态 badge + 标题 + 时间 + 竞品数
