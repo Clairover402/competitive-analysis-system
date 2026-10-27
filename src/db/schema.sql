@@ -412,9 +412,53 @@ CREATE TABLE IF NOT EXISTS agent_memories (
                         -- 半衰期（天）：decision=90 preference=60 fact=30 chat=7
     is_active       BOOLEAN NOT NULL DEFAULT true,
                         -- 软删除标记：false = 已删除/已归档
+    -- ── M3 semantic 事实的时效字段（2026-10-27）────────────────────────
+    -- observed_at: 这条结论**什么时候被观测到**（= 证据抓取时间），不是入库时间。
+    --   两者会差几分钟到几天（任务跑完才写记忆、或从历史报告回填），
+    --   而 verify 问的是"多久没核对过"→ 必须用观测时间，用 created_at 会少算。
+    observed_at     TIMESTAMPTZ,
+    ttl_days        INT,
+                        -- 保鲜期档位（定价30/功能60/融资90/组织180），NULL = 不判过期
+    status          VARCHAR(16) NOT NULL DEFAULT 'active',
+                        -- active / superseded（被新观测取代）/ expired（超保鲜期）
+    superseded_by   UUID REFERENCES agent_memories(id) ON DELETE SET NULL,
+                        -- 指向取代它的那条记忆 → 取代链可回溯"这个结论什么时候变的"
+    evidence_url    TEXT,
+                        -- 结论的来源 URL。★ 与 evidence_map.source_url 同源不同命：
+                        --   evidence_map 是"某份报告引用过它"，可随报告删除；
+                        --   这里是"这条事实的出处"，报告删了也要能点回去。
+    subject         VARCHAR(160),
+                        -- "这件事是什么"的稳定锚点，形如 `飞书|定价`。
+                        -- ⚠️ 取代判据必须**先同 subject 再比相似度**：两条不同事实
+                        --   （"支持多维表格" vs "支持自动化流程"）句式相近，纯相似度会误取代。
+    model_version   VARCHAR(32) DEFAULT 'bge-m3',
+                        -- 生成 embedding 的模型版本。换模型后旧向量与新 query 不在
+                        -- 同一空间，检索时按此列过滤（退化为关键词），不让它们静默参与排序。
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_accessed   TIMESTAMPTZ              -- 最后被检索时间
 );
+
+-- 已有库补列（CREATE TABLE IF NOT EXISTS 不会给老表加列）——幂等
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS observed_at    TIMESTAMPTZ;
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS ttl_days       INT;
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS status         VARCHAR(16) NOT NULL DEFAULT 'active';
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS superseded_by  UUID REFERENCES agent_memories(id) ON DELETE SET NULL;
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS evidence_url   TEXT;
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS subject        VARCHAR(160);
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS model_version  VARCHAR(32) DEFAULT 'bge-m3';
+
+-- 【两个"是否有效"必须分清，面试会被追问】2026-10-27 M3
+--   is_active      = 人的动作（用户删除 / 归档），语义是"别再用了"
+--   status         = 事实的生命周期（active / superseded / expired），语义是"它还是不是当前真相"
+-- 两者不正交但也不能合并：
+--   被取代的 fact 仍 is_active=true —— 它是历史观测，要留给审计与"结论怎么变的"追问；
+--   用户手动删掉的 fact 则两者都要改，否则检索还会命中它。
+-- 检索条件因此是 `is_active AND status='active'`。
+CREATE INDEX IF NOT EXISTS idx_agent_memories_active_fact
+    ON agent_memories (user_id, subject) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_agent_memories_observed
+    ON agent_memories (user_id, observed_at DESC);
+
 
 -- 复合查询路径：按用户 + 类型 + 活跃状态过滤
 CREATE INDEX IF NOT EXISTS idx_agent_memories_user_id ON agent_memories (user_id);
@@ -493,6 +537,43 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
 CREATE INDEX IF NOT EXISTS idx_conversation_turns_conv_seq
     ON conversation_turns (conversation_id, seq DESC);
 
+
+-- ============================================================
+-- 7.6 user_preferences — 程序性记忆（"怎么做"的默认值）2026-10-27 M4
+-- ============================================================
+-- 【术语先界定】程序性记忆（procedural memory）= 怎么做事的规则（Prompt / SOP / 默认参数）。
+-- 这里只落其中**可 KV 化**的一小块：默认参数与展示偏好。
+-- SOP 版本管理、Prompt 模板热更新不做 —— 那属于 Prompt 工程，塞进记忆表只会
+-- 得到一张没人读的表（M2 之前 agent_memories 恒 0 行就是这么来的）。
+--
+-- 【为什么不用 agent_memories 存偏好】
+-- ------------------------------------------------------------
+-- 1) 取法不同：偏好按 `(user_id, key)` **精确取**，记忆按相似度取。
+--    把偏好放进向量表意味着"偏好 Markdown"和"不喜欢 Markdown"会被排到一起，
+--    这是向量索引**主动制造错误**的少数场景。
+-- 2) 生命周期不同：偏好是覆盖式（改了就没了），记忆是追加式（旧观测要留审计）。
+-- 3) 键空间要可枚举：前端要能列出"你设置过哪些偏好"，向量表给不了这个。
+--
+-- 【source 三态是硬约束，不是建议】
+--   user_set  → UI 显式勾选，直接生效
+--   confirmed → LLM 从对话里提取，用户点过"以后都这样"
+--   proposed  → 只进确认卡，**永不进 prompt**
+-- 允许 LLM 直接写 confirmed 等于让它静默改变系统行为，且用户无从察觉。
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id     VARCHAR(100) NOT NULL,
+    key         VARCHAR(64)  NOT NULL,
+                -- 首批：default_dimensions / frequent_competitors / report_style
+    value       JSONB        NOT NULL,
+    source      VARCHAR(16)  NOT NULL DEFAULT 'proposed',
+                -- user_set / confirmed / proposed
+    confidence  FLOAT        NOT NULL DEFAULT 0.0,
+                -- LLM 提取时的置信度；user_set 恒 1.0
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_preferences_source
+    ON user_preferences (user_id, source);
 
 -- ============================================================
 -- 8-9. LangGraph Checkpoint 表（超标交付）

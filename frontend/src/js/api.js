@@ -35,6 +35,14 @@ export const API = {
     return _handle(res);
   },
 
+  /* DELETE：目前只有"删偏好/忽略提案"用到（M4）。
+   * 单独开一个方法而不是用 post + 动词路径，是为了让接口语义与 HTTP 方法一致——
+   * 忽略一条提案就是删掉它，不需要服务端再记一个"已忽略"状态。 */
+  async del(path) {
+    var res = await fetch(BASE_URL + path, { method: 'DELETE', headers: _headers() });
+    return _handle(res);
+  },
+
   /* SSE with named event support
    * handlers: { onProgress, onComplete, onError, onMessage, onDone } */
   sse(path, handlers) {

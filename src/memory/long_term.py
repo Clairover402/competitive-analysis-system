@@ -154,6 +154,7 @@ SQL 层排序的优势:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from src.db.dao import AgentMemoryDAO
@@ -198,6 +199,19 @@ _IMPORTANCE_MAP = {
     # 所以半衰期取 90 天（与 decision 同级），让它慢衰减、但不永久占位。
     "episode":    (0.6, 90),
 }
+
+
+def importance_for(
+    memory_type: str, default: tuple[float, int] = (0.5, 30)
+) -> tuple[float, int]:
+    """取某类记忆的 (重要性, 半衰期) 默认值 —— 表外唯一读口。
+
+    【为什么要有这个函数】semantic 写入（`memory/semantic.py`）不能走
+    `add_memory()`：它需要在"算完向量"与"插入"之间插一步"找出被取代的旧观测"，
+    而 add_memory 是把这两步焊死的一次性封装。直接读 `_IMPORTANCE_MAP` 又等于
+    让两个模块共享私有符号——加这个函数是为了让"改默认值只改一处"这条成立。
+    """
+    return _IMPORTANCE_MAP.get(memory_type, default)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -296,6 +310,7 @@ class LongTermMemoryEngine:
         llm: ChatDeepSeek,
         dao: AgentMemoryDAO,
         conflict_resolver: MemoryConflictResolver | None = None,
+        model_version: str | None = None,
     ) -> None:
         """初始化检索引擎。
 
@@ -314,6 +329,20 @@ class LongTermMemoryEngine:
         self._llm = llm
         self._dao = dao
         self._conflict = conflict_resolver
+        # 生成 embedding 的模型版本，检索时按此值过滤（见 AgentMemoryDAO.similarity_search）。
+        # None = 不做版本过滤，仅用于离线分析/单测；生产由 lifespan 传 settings.embed_model_version。
+        self.model_version = model_version
+
+    @property
+    def dao(self) -> AgentMemoryDAO:
+        """暴露 DAO —— 只给"取代链"这种需要两步写入的路径用。
+
+        正常写入走 `add_memory()`；但 semantic 事实必须先查旧观测、再插新观测、
+        最后回写 `superseded_by`，这个序列 add_memory 封不出来。
+        与其在 semantic.py 里 `engine._dao`（跨模块用私有属性），不如显式开这个口子，
+        让"我知道这是内部依赖"这件事写在代码里而不是藏在调用点。
+        """
+        return self._dao
 
     # ══════════════════════════════════════════════════════════════════════
     # 检索 — 五步流水线
@@ -357,7 +386,9 @@ class LongTermMemoryEngine:
         query_vec = await embed_query(rewritten)
         vec_results: list[dict] = []
         if query_vec:
-            vec_results = await self._dao.similarity_search(user_id, query_vec, top_k=60)
+            vec_results = await self._dao.similarity_search(
+                user_id, query_vec, top_k=60, model_version=self.model_version
+            )
         else:
             # ⚠️ 不 return：降级成单路检索，总比整块读不出来强
             logger.warning("embed_query 失败，本次只走关键词路: %r", rewritten)
@@ -446,6 +477,11 @@ class LongTermMemoryEngine:
         half_life_days: int | None = None,
         source_task_id: str | None = None,
         dedupe: bool = False,
+        *,
+        observed_at: datetime | None = None,
+        ttl_days: int | None = None,
+        evidence_url: str | None = None,
+        subject: str | None = None,
     ) -> str | None:
         """写入长期记忆——含冲突检测。
 
@@ -518,6 +554,14 @@ class LongTermMemoryEngine:
             source_task_id=source_task_id,
             half_life_days=half,
             dedupe=dedupe,
+            observed_at=observed_at,
+            ttl_days=ttl_days,
+            evidence_url=evidence_url,
+            subject=subject,
+            # ⚠️ 没配 model_version 时写 DDL 默认值（'bge-m3'），不要写 NULL：
+            #    NULL 会让该行在 similarity_search 的 `model_version = $4` 下永远命中不了，
+            #    等于"写入即失联"。宁可标签写成一个"大概是它"的值。
+            model_version=self.model_version or "bge-m3",
         )
 
         if memory_id is None:

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 
 import asyncpg
 
@@ -700,6 +701,12 @@ class AgentMemoryDAO:
         source_task_id: str | None = None,
         half_life_days: int = 30,
         dedupe: bool = False,
+        *,
+        observed_at: datetime | None = None,
+        ttl_days: int | None = None,
+        evidence_url: str | None = None,
+        subject: str | None = None,
+        model_version: str = "bge-m3",
     ) -> str | None:
         """插入长期记忆；`dedupe=True` 时撞唯一约束不报错，返回 None。
 
@@ -719,11 +726,28 @@ class AgentMemoryDAO:
         ON CONFLICT 让数据库自己判定，语义也更直白：写不进去就是已经有了。
         ⚠️ 只有 episode 有部分唯一索引，所以这个分支只对 memory_type='episode' 有意义，
            dedupe=True 配其他类型等于没开（会照常插入）。
+
+        【M3 新增字段各自的用途，别混用】
+        ------------------------------------------------------------
+        observed_at —— 结论**什么时候被观测到**（= 证据抓取时间）。不是入库时间：
+                       任务跑完到写记忆之间可能有几分钟，历史回填可能差几个月，
+                       而 verify 问的是"多久没核对过"，只能用观测时间。
+        ttl_days    —— 保鲜期档位。和 half_life_days 是两回事：
+                       half_life 管检索排序衰减（不影响正确性判断），
+                       ttl 管正确性判定（超过就报 stale）。并存，不二选一。
+        subject     —— "这件事是什么"的稳定锚点（`飞书|定价`），
+                       取代判据必须**先同 subject 再比相似度**，否则两条不同
+                       事实（"支持多维表格" / "支持自动化流程"）会被误判成同一条。
+        model_version —— 生成 embedding 的模型版本，换模型后按此列过滤。
+                       与 DDL 默认值保持一致（'bge-m3'）。
         """
         sql = """INSERT INTO agent_memories (user_id, memory_type, content,
                                             importance, embedding,
-                                            source_task_id, half_life_days)
-                 VALUES ($1, $2, $3, $4, $5::vector, $6, $7)"""
+                                            source_task_id, half_life_days,
+                                            observed_at, ttl_days, evidence_url,
+                                            subject, model_version)
+                 VALUES ($1, $2, $3, $4, $5::vector, $6, $7,
+                         COALESCE($8::timestamptz, NOW()), $9, $10, $11, $12)"""
         if dedupe:
             # 谓词必须与部分唯一索引完全一致，否则 PG 推断不出该索引
             sql += " ON CONFLICT (source_task_id) WHERE memory_type = 'episode' DO NOTHING"
@@ -733,6 +757,7 @@ class AgentMemoryDAO:
                 sql,
                 user_id, memory_type, content, importance,
                 _vector_str(embedding) if embedding else None, source_task_id, half_life_days,
+                observed_at, ttl_days, evidence_url, subject, model_version,
             )
             return str(row["id"]) if row else None
 
@@ -743,11 +768,14 @@ class AgentMemoryDAO:
         Step 2 是一次 embedding——表里一条记忆都没有时，这两笔开销纯属白烧，
         而"记忆表空"在 M2 之前是**常态**（agent_memories 恒 0 行）。
         一次 count 走 (user_id) 索引，比一次 LLM 便宜三个数量级。
+
+        ⚠️ 必须带 `status='active'`：被取代的 fact 仍 is_active=true（要留审计），
+           只数 is_active 会在"全部事实都被取代"时短路失效——白白跑完整条检索。
         """
         async with self._pool.acquire() as conn:
             return int(await conn.fetchval(
                 """SELECT count(*) FROM agent_memories
-                   WHERE user_id = $1 AND is_active = true""",
+                   WHERE user_id = $1 AND is_active = true AND status = 'active'""",
                 user_id,
             ) or 0)
 
@@ -756,6 +784,7 @@ class AgentMemoryDAO:
         user_id: str,
         query_embedding: list[float],
         top_k: int = 60,
+        model_version: str | None = None,
     ) -> list[dict]:
         """向量相似度检索，含时间衰减加权。
 
@@ -768,12 +797,24 @@ class AgentMemoryDAO:
         如果设 20，可能漏掉相关内容。
 
         返回结果含 weighted_score 字段，便于调试记忆排序效果。
+
+        【M3：为什么要按 model_version 过滤】
+        ------------------------------------------------------------
+        换 embedding 模型后，旧向量与新 query 向量不在同一空间：余弦值照样算得出来、
+        照样落在 0~1，只是**含义没了**——它会静默把不相关的记忆排到前面。
+        这种错误不报错、不告警，只能靠版本列提前挡掉。
+        挡在 SQL 而不是 Python 的另一个理由：过滤后再进 HNSW 只出 60 条，
+        Python 层过滤等于先取 60 条再丢一半，召回池白白缩水。
+
+        ⚠️ model_version=None 表示"不做版本过滤"（离线分析/单测用），
+           生产路径必须传 —— 见 `LongTermMemoryEngine.__init__`。
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT id, user_id, memory_type, content, importance,
                           access_count, half_life_days, created_at,
-                          last_accessed,
+                          last_accessed, observed_at, ttl_days, status,
+                          subject, evidence_url,
                           (1.0 - (embedding <=> $2::vector)) * 0.6
                           + importance * 0.3
                           + POWER(0.5,
@@ -781,10 +822,14 @@ class AgentMemoryDAO:
                                   / half_life_days
                             ) * 0.1 AS weighted_score
                    FROM agent_memories
-                   WHERE user_id = $1 AND is_active = true
+                   WHERE user_id = $1
+                     AND is_active = true
+                     AND status = 'active'
+                     AND embedding IS NOT NULL
+                     AND ($4::text IS NULL OR model_version = $4)
                    ORDER BY weighted_score DESC
                    LIMIT $3""",
-                user_id, _vector_str(query_embedding), top_k,
+                user_id, _vector_str(query_embedding), top_k, model_version,
             )
             return [dict(r) for r in rows]
 
@@ -799,15 +844,21 @@ class AgentMemoryDAO:
         用于精确匹配场景："我记得之前分析过飞书的定价策略"
         → keyword_search(user_id, "飞书 定价")。
         不需要向量——关键词足够定位。
+
+        ★ 这条路径**不按 model_version 过滤**：它压根不用向量，换模型对它没有影响。
+          这正是"写入允许无向量、读取不接受全瞎"的另一半：
+          向量路因版本不符被挡掉时，记忆还能靠关键词被找回来。
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT id, user_id, memory_type, content, importance,
                           access_count, half_life_days, created_at,
-                          last_accessed
+                          last_accessed, observed_at, ttl_days, status,
+                          subject, evidence_url
                    FROM agent_memories
                    WHERE user_id = $1
                      AND is_active = true
+                     AND status = 'active'
                      AND to_tsvector('zhparse', content)
                          @@ plainto_tsquery('zhparse', $2)
                    ORDER BY created_at DESC
@@ -815,6 +866,85 @@ class AgentMemoryDAO:
                 user_id, keywords, top_k,
             )
             return [dict(r) for r in rows]
+
+    # ── M3 semantic 事实专用：取代链 / 幂等 / verify 取数 ──────────────────
+
+    async def find_active_similar(
+        self,
+        user_id: str,
+        content_embedding: list[float],
+        subject: str,
+        threshold: float = 0.90,
+    ) -> list[dict]:
+        """在同 subject 的活跃 fact 里找"说的是同一件事"的旧观测。
+
+        【为什么必须先同 subject 再比相似度】
+        ------------------------------------------------------------
+        取代的判据是"同一件事的新观测"，不是"长得像的两句话"。
+        同竞品同维度的两条不同事实（"支持多维表格" / "支持自动化流程"）
+        句式高度相似，全库比会把它们判成同一条，然后**删掉一条真的信息**。
+        subject（`飞书|定价`）先把候选压到"同一个竞品的同一个维度"，再比语义。
+
+        只比 fact —— episode 是追加式历史，不该被取代（见 M2 的取舍）。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, content, observed_at, created_at,
+                          1.0 - (embedding <=> $2::vector) AS similarity
+                   FROM agent_memories
+                   WHERE user_id = $1
+                     AND memory_type = 'fact'
+                     AND status = 'active'
+                     AND is_active = true
+                     AND subject IS NOT DISTINCT FROM $3
+                     AND embedding IS NOT NULL
+                     AND (1.0 - (embedding <=> $2::vector)) >= $4
+                   ORDER BY similarity DESC""",
+                user_id, _vector_str(content_embedding), subject, threshold,
+            )
+            return [dict(r) for r in rows]
+
+    async def supersede(self, old_id: str, new_id: str) -> None:
+        """把旧观测标成 superseded，并指向取代它的那条。
+
+        ⚠️ 条件带 `status='active'`：并发下两条新观测可能同时想取代同一条旧记录，
+           后到的那条不该把 superseded_by 改写成自己——先到先得，
+           谁先写谁才是"直接后代"，取代链才可回溯。
+        ⚠️ 不删行、不置 is_active=false：被取代的观测是**历史证据**，
+           "这条结论什么时候变的"这种追问只能靠它答。
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE agent_memories
+                   SET status = 'superseded', superseded_by = $2
+                   WHERE id = $1 AND status = 'active'""",
+                old_id, new_id,
+            )
+
+    async def fact_exists(
+        self, user_id: str, source_task_id: str, subject: str, content: str
+    ) -> bool:
+        """同一任务是否已经写过这条事实（任务重跑幂等）。
+
+        【为什么不用唯一索引】事实行允许多条并存（同一 subject 可能有多个侧面），
+        能锁的只有"同一任务 + 同一 subject + 同一正文"这个组合，而 content 是 TEXT，
+        B-tree 索引键长有限。一次按 (user_id, source_task_id) 的等值查询走
+        idx_agent_memories_user_id 就够——单个任务的证据行只有十几条。
+        """
+        async with self._pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """SELECT 1 FROM agent_memories
+                   WHERE user_id = $1 AND source_task_id = $2
+                     AND subject IS NOT DISTINCT FROM $3 AND content = $4
+                   LIMIT 1""",
+                user_id, source_task_id, subject, content,
+            ))
+
+    # ⚠️ 这里没有 `list_facts()`：verify 的取数 SQL 放在
+    #    `supervisor/query_handlers.py`，因为那三个执行器只用 `pool.fetch()`
+    #    一个方法（见该文件头部的"零 DB 测试"约定）。两边各留一份同名查询，
+    #    迟早会因为"只改了一处"而让 verify 和写入侧对不上。想复用时把 SQL
+    #    搬到一个公共模块，别在 DAO 里再抄一遍。
 
     async def soft_delete(self, memory_id: str) -> None:
         """软删除记忆——标记 is_active=false，不物理删除数据。
@@ -891,6 +1021,7 @@ class AgentMemoryDAO:
                    FROM agent_memories
                    WHERE user_id = $1
                      AND is_active = true
+                     AND status = 'active'
                      AND embedding IS NOT NULL
                      AND (1.0 - (embedding <=> $2::vector)) >= $3
                    ORDER BY similarity DESC""",
@@ -1158,3 +1289,101 @@ class ConversationDAO:
                    WHERE id = $1""",
                 conversation_id, summary,
             )
+
+
+class PreferenceDAO:
+    """程序性记忆（默认值/偏好）数据访问 —— 一张 (user_id, key) 的 KV 表。
+
+    【与 AgentMemoryDAO 的分工，面试会被问到】
+    ------------------------------------------------------------
+      agent_memories = 学到了什么（按相似度取，追加式，旧观测要留审计）
+      user_preferences = 以后怎么做（按主键精确取，覆盖式，改了就没了）
+
+    偏好在**任何情况下都不向量化**：一旦进向量表，"偏好 Markdown 输出"和
+    "不喜欢 Markdown"会被排到一起，这是向量索引主动制造错误的少数场景。
+
+    ⚠️ 本类不判断"这个偏好合不合规"——语义校验需要 system 硬规则上下文，
+       放在 `src/memory/preferences.py` 的注入侧做，见那里的说明。
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def list(self, user_id: str) -> list[dict]:
+        """取该用户的全部偏好（三种 source 一起给，前端要区分渲染）。"""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT key, value, source, confidence, updated_at
+                   FROM user_preferences WHERE user_id = $1
+                   ORDER BY key""",
+                user_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def get_effective(self, user_id: str) -> dict[str, object]:
+        """取**可生效**的偏好：只有 user_set / confirmed。
+
+        ★ proposed 永不生效 —— 这是三级写入纪律里最硬的一条。
+          把它过滤在这一层而不是拼 prompt 那层：调用方拿到 dict 就该是
+          "可以直接用的"，漏过滤一次就是 LLM 静默改用户行为。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT key, value FROM user_preferences
+                   WHERE user_id = $1 AND source IN ('user_set', 'confirmed')""",
+                user_id,
+            )
+            out: dict[str, object] = {}
+            for r in rows:
+                raw = r["value"]
+                # asyncpg 未注册 jsonb codec 时返回字符串
+                out[r["key"]] = json.loads(raw) if isinstance(raw, str) else raw
+            return out
+
+    async def upsert(
+        self,
+        user_id: str,
+        key: str,
+        value: object,
+        source: str = "proposed",
+        confidence: float = 0.0,
+    ) -> None:
+        """写一条偏好。同 key 覆盖（偏好是覆盖式，不留历史版本）。
+
+        ⚠️ `source='proposed'` 覆盖已有 confirmed 值是一条**降级**路径：
+           它的实际来源是"LLM 又提了个新值"，不该把用户已确认的东西顶掉。
+           故 proposed 只在"该 key 还不存在"时才插入（见 ON CONFLICT 的 WHERE）。
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO user_preferences (user_id, key, value, source, confidence)
+                   VALUES ($1, $2, $3::jsonb, $4, $5)
+                   ON CONFLICT (user_id, key) DO UPDATE
+                     SET value = EXCLUDED.value,
+                         source = EXCLUDED.source,
+                         confidence = EXCLUDED.confidence,
+                         updated_at = NOW()
+                     WHERE EXCLUDED.source <> 'proposed'
+                        OR user_preferences.source = 'proposed'""",
+                user_id, key, json.dumps(value, ensure_ascii=False), source, confidence,
+            )
+
+    async def confirm(self, user_id: str, key: str) -> bool:
+        """把一条 proposed 转正；没有这条或已转正 → False。"""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """UPDATE user_preferences
+                   SET source = 'confirmed', confidence = 1.0, updated_at = NOW()
+                   WHERE user_id = $1 AND key = $2 AND source = 'proposed'""",
+                user_id, key,
+            )
+            return result.endswith(" 1")
+
+    async def delete(self, user_id: str, key: str) -> bool:
+        """删掉一条偏好（用户反悔；偏好是覆盖式的，没有保留价值）。"""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM user_preferences WHERE user_id = $1 AND key = $2",
+                user_id, key,
+            )
+            return not result.endswith(" 0")

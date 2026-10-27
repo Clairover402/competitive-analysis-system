@@ -370,6 +370,29 @@ export function mount() {
         '</div></div>';
     }
 
+    if (m.kind === 'pref') {
+      // 偏好确认卡（M4）：LLM 从对话里提取的规则**只能提议**，
+      // 点"以后都这样"才转正（POST .../confirm），点"忽略"就是删掉这条提案。
+      // ⚠️ 不点就一直是 proposed —— 它永远不进 prompt，这是硬约束不是提示。
+      var cards = (m.cards || []).map(function(c) {
+        return '<div class="pixel-chat-pref">' +
+          '<div class="pixel-chat-pref-q">' + esc(c.question) + '</div>' +
+          '<div class="pixel-chat-opts">' +
+            '<button class="pixel-chat-opt" data-pref-key="' + esc(c.key) + '" data-pref-act="confirm">以后都这样</button>' +
+            '<button class="pixel-chat-opt ghost" data-pref-key="' + esc(c.key) + '" data-pref-act="dismiss">忽略</button>' +
+          '</div></div>';
+      }).join('');
+      return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+        '<div class="pixel-chat-meta">记住这个偏好？</div>' + cards + '</div></div>';
+    }
+
+    if (m.kind === 'note') {
+      // 系统回执（目前只有偏好操作）：一句话、无条目、不可点
+      return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+        '<div class="pixel-chat-meta">' + esc(m.meta || '已处理') + '</div>' +
+        '<div>' + esc(m.text) + '</div></div></div>';
+    }
+
     if (m.kind === 'task') {
       var e = m.entities || {};
       var comps = (e.competitors && e.competitors.length) ? e.competitors.join(' / ') : '—';
@@ -431,6 +454,46 @@ export function mount() {
     };
   }
 
+  async function resolvePreference(key, act) {
+    /* 确认/忽略一条偏好提案（M4）。
+     *
+     * ⚠️ 确认之后必须**如实回执"会不会生效"**：后端返回 will_apply=false 意味着
+     *    这条偏好与 system 硬规则冲突（比如"不要表格"），存下了但注入时被压制。
+     *    这里若统一回"已记住"，用户下次发现没变化只会觉得系统坏了。
+     */
+    var path = '/api/preferences/' + encodeURIComponent(key);
+    try {
+      var res = null;
+      if (act === 'confirm') {
+        res = await API.post(path + '/confirm', {});
+        SFX.confirm();
+      } else {
+        await API.del(path);
+        SFX.blip();
+      }
+      chatMessages.forEach(function(m) {
+        if (m.kind === 'pref') {
+          m.cards = (m.cards || []).filter(function(c) { return c.key !== key; });
+        }
+      });
+      // 卡片清空后整条消息也撤掉，避免留一个空壳气泡
+      chatMessages = chatMessages.filter(function(m) {
+        return m.kind !== 'pref' || (m.cards && m.cards.length);
+      });
+      chatMessages.push({
+        role: 'bot', kind: 'note', meta: act === 'confirm' ? '偏好已更新' : '已忽略',
+        text: act !== 'confirm' ? '好的，不改。'
+          : (res && res.will_apply === false
+              ? '已记住，但它与报告结构规则冲突，本次不会生效。'
+              : '已记住，以后我按这个来。'),
+      });
+    } catch (e) {
+      chatMessages.push({ role: 'bot', kind: 'error', text: '偏好没保存成功: ' + (e.message || '请求失败') });
+      SFX.error();
+    }
+    renderChatLog();
+  }
+
   async function sendChat(text) {
     if (chatBusy) return;
     var q = String(text || '').trim();
@@ -452,6 +515,10 @@ export function mount() {
       }
       chatMessages.pop();  // 撤掉"判定中"
       chatMessages.push(botMessageFrom(data));
+      // 提案单独成一张卡：混在回答气泡里，用户会以为那是回答的一部分
+      if (data && data.pending_preferences && data.pending_preferences.length) {
+        chatMessages.push({ role: 'bot', kind: 'pref', cards: data.pending_preferences });
+      }
       if (data.type === 'task') {
         SFX.confirm();
         loadTasks();   // 任务卡进列表，用户不跳页也能看到它
@@ -494,6 +561,13 @@ export function mount() {
       var opt = t.closest('.pixel-chat-opt');
       if (opt) {
         SFX.click();
+        // 偏好确认卡（M4）：转正 / 忽略，都不发回对话——它们改的是设置，不是提问。
+        // ⚠️ 走完要重绘一次：卡片消失才算"处理过了"，否则用户会反复点同一条。
+        var prefKey = opt.getAttribute('data-pref-key');
+        if (prefKey) {
+          resolvePreference(prefKey, opt.getAttribute('data-pref-act'));
+          return;
+        }
         // ★ 发的是选项自带的 message（完整句子），不是 label、更不是序号。
         //   发"②"这种序号 → 下一轮漏斗再判一次"②" → 四层全判不出 → 再反问 → 死循环。
         sendChat(opt.getAttribute('data-msg'));

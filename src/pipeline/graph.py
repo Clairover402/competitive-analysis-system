@@ -229,7 +229,7 @@ def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek, engine: LongTer
     return node_analyze
 
 
-def _make_node_write(mcp_server: MCPServer, llm: ChatDeepSeek):
+def _make_node_write(mcp_server: MCPServer, llm: ChatDeepSeek, pool: Pool | None = None):
     """创建 write 节点函数（闭包注入 LLM t=0.3）。
 
     【L5 决策】这是 Pipeline 中唯一的循环节点——可能被执行多次。
@@ -286,7 +286,27 @@ def _make_node_write(mcp_server: MCPServer, llm: ChatDeepSeek):
             "🔄改写" if is_rewrite else "📝初稿",
             steps_left, prev_score,
         )
-        result = await writer_agent(task, mcp_server, llm)
+        # ── 偏好（程序性记忆，2026-10-27 M4）──
+        # 【为什么在节点里查、不在 build 时查】图是 lifespan 预编译一次的，
+        #   所有用户共用同一张图；偏好是 per-user 的，只能在拿得到 user_id 的
+        #   执行期查。一次主键查询（几十微秒）比"每次建图"便宜得多。
+        # 【为什么失败不阻断】偏好只是默认值，读不到就当没设过；
+        #   写报告这件事不该因为一张偏好表抖动而失败。
+        preference_block = ""
+        if pool is not None:
+            try:
+                from src.db.dao import PreferenceDAO
+                from src.memory.preferences import for_injection, format_block
+
+                effective = await PreferenceDAO(pool).get_effective(
+                    state.get("user_id") or "default"
+                )
+                usable, _suppressed = for_injection(effective)
+                preference_block = format_block(usable)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("【Pipeline】偏好读取失败（忽略）: %s", exc)
+
+        result = await writer_agent(task, mcp_server, llm, preference_block=preference_block)
         return {
             "report_content": result["report_markdown"],
             "report_version": state.get("report_version", 0) + 1,
@@ -513,7 +533,7 @@ async def build_pipeline_graph(
     # 节点名和节点函数分离：同一个函数可以用不同名字注册（虽然这里没用到）
     graph.add_node("collect", _make_node_collect(mcp_server, llm_collector))
     graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer, ltm_engine))
-    graph.add_node("write", _make_node_write(mcp_server, llm_writer))
+    graph.add_node("write", _make_node_write(mcp_server, llm_writer, pool))
     graph.add_node("quality", _make_node_quality(mcp_server, llm_quality))
     graph.add_node("finalize", _make_node_finalize(pool))
 

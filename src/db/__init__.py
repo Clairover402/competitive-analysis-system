@@ -12,6 +12,8 @@ src.db 是系统的"数据底座"——所有 Agent 通过 DAO 读写数据，
   ChunkEmbeddingDAO → chunk_embeddings (向量检索)
   MemorySummaryDAO  → memory_summaries (短期摘要记忆)
   AgentMemoryDAO    → agent_memories (长期记忆+时间衰减)
+  ConversationDAO   → conversations / conversation_turns (会话记忆)
+  PreferenceDAO     → user_preferences (程序性记忆：默认值)
   AgentLogDAO       → agent_logs (审计)
   RetrievalSnapshotDAO → retrieval_snapshot (检索快照)
 
@@ -37,6 +39,8 @@ from src.db.dao import (
     AgentLogDAO,
     UserDAO,
     RetrievalSnapshotDAO,
+    ConversationDAO,
+    PreferenceDAO,
 )
 
 __all__ = [
@@ -52,4 +56,6 @@ __all__ = [
     "AgentLogDAO",
     "UserDAO",
     "RetrievalSnapshotDAO",
+    "ConversationDAO",
+    "PreferenceDAO",
 ]

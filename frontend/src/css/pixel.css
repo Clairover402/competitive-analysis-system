@@ -167,3 +167,11 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-chat-conv { font-family: var(--pixel-mono); font-size: 12px; letter-spacing: 1px; color: var(--pixel-light); }
 .pixel-chat-new { border: none; border-radius: 0; background: transparent; color: var(--pixel-cyan); font-family: var(--pixel-mono); font-size: 12px; letter-spacing: 1px; padding: 4px 10px; cursor: pointer; box-shadow: 0 0 0 2px var(--pixel-mid); }
 .pixel-chat-new:hover { color: var(--pixel-black); background: var(--pixel-cyan); box-shadow: 0 0 0 2px var(--pixel-cyan); }
+
+/* 偏好确认卡（M4）：一张卡一条规则，两个动作。
+ * 用虚线边框与普通气泡区分——它不是一个"回答"，是等用户拍板的东西。 */
+.pixel-chat-pref { border-top: 2px dashed var(--pixel-mid); padding-top: 8px; margin-top: 8px; }
+.pixel-chat-pref:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+.pixel-chat-pref-q { font-size: 13px; line-height: 1.5; margin-bottom: 8px; }
+.pixel-chat-opt.ghost { color: var(--pixel-light); }
+.pixel-chat-opt.ghost:hover { color: var(--pixel-black); background: var(--pixel-mid); }

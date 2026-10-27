@@ -29,7 +29,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -41,7 +41,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from src.config import Settings
 from src.db.connection import close_pool, create_pool
-from src.db.dao import ReportDAO, TaskDAO
+from src.db.dao import PreferenceDAO, ReportDAO, TaskDAO
 from src.observability.logging import BoundLogger
 from src.observability.metrics import (
     record_agent_call,
@@ -224,12 +224,19 @@ class TaskRequest(BaseModel):
     query: str | None = Field(None, description="自然语言查询（Supervisor 模式入口）")
 
     def model_post_init(self, _context) -> None:
-        """校验：competitors+dimensions 和 query 至少传一组。
+        """校验：至少要给一个锚点（query / competitors / dimensions 之一）。
 
         【L4 工程】关键区分：
           — competitors=[] + dimensions=["功能"] → Supervisor 探索（传了但空）
           — competitors=None → 字段未传（跟空列表语义不同）
           — 用 `is not None` 而非 falsy 判断，避免空列表被误判为"未传"
+
+        【2026-10-27 M4 放宽：不再要求 competitors 与 dimensions 同时给】
+        原来要求"两个都传"才放行，理由是"缺一个就跑不起来"。加了偏好之后
+        这条前提不成立了：用户设过 `default_dimensions` 时，"只给竞品"是
+        一种正常请求——缺的那半边由 `_create_task_impl` 的补缺逻辑填。
+        真正该守的底线是"得有个锚点"：一个都没有就 400（_reject_no_anchor 也会再挡一次，
+        但那是在 LLM 抽取与偏好补缺都试过之后，报错文案更准确）。
 
         【L4 工程】中英文逗号兼容：
           — 前端 split(/[,，]/) 已做，但后端加防御层
@@ -241,10 +248,17 @@ class TaskRequest(BaseModel):
         if self.dimensions:
             self.dimensions = _split_i18n_commas(self.dimensions)
 
-        has_structured = (self.competitors is not None and self.dimensions is not None)
+        # 【2026-10-27 M4 放宽：不再要求 competitors 与 dimensions 同时给】
+        #   原来判"两个都非 None"才放行，理由是缺一个就跑不起来。有了偏好之后
+        #   这条前提不成立了：用户设过 default_dimensions 时，"只给竞品"
+        #   是正常请求——缺的那半边由 _create_task_impl 的补缺逻辑填。
+        #   判据因此改成"**至少给了一个字段**（哪怕是空列表）或给了 query"：
+        #   空列表仍然放行，交给 _reject_no_anchor 报"竞品或维度"——
+        #   那里的文案比 Pydantic 的 422 更能告诉用户该改什么。
+        has_any_field = (self.competitors is not None) or (self.dimensions is not None)
         has_query = bool(self.query and self.query.strip())
-        if not has_structured and not has_query:
-            raise ValueError("请提供 competitors+dimensions 或 query")
+        if not has_any_field and not has_query:
+            raise ValueError("请提供 competitors / dimensions / query 至少一项")
 
 
 class ChatRequest(BaseModel):
@@ -434,7 +448,11 @@ async def lifespan(app: FastAPI):
     from src.db.dao import AgentMemoryDAO as _AgentMemoryDAO
     from src.memory.long_term import LongTermMemoryEngine
 
-    app.state.memory_engine = LongTermMemoryEngine(llm_analyzer, _AgentMemoryDAO(pool))
+    # model_version 传进去，是为了让**写入**打的标签与**检索**的过滤用同一个值：
+    # 写的时候标 bge-m3、查的时候不按版本过滤，换模型后旧记忆会静默参与排序。
+    app.state.memory_engine = LongTermMemoryEngine(
+        llm_analyzer, _AgentMemoryDAO(pool), model_version=settings.embed_model_version
+    )
     app.state.memory_llm = llm_analyzer
 
     logger.info(
@@ -729,6 +747,25 @@ async def _execute_task(
                 logger.warning("episode 写入异常（已忽略） task=%s", task_id_str[:8],
                                exc_info=True)
 
+            # ── 4.6 从证据链提事实（M3，2026-10-27）──
+            # 【为什么紧跟在 episode 之后、同一个 try 之外】两者独立失败：
+            #   episode 挂了不该连累 fact（fact 才是 verify 的数据源），
+            #   反之亦然。各自兜自己的异常，一个写了另一个没写仍算正常。
+            # 【为什么事实来自 evidence_map 而不是报告正文】正文里的句子没有来源 URL；
+            #   把"模型说过的话"升格成"观测到的事实"，之后就再也查不回来了。
+            try:
+                from src.memory.semantic import write_task_facts
+
+                await write_task_facts(
+                    engine=memory_engine,
+                    pool=pool,
+                    task=enriched_task,
+                    settings=request.app.state.settings,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("fact 写入异常（已忽略） task=%s", task_id_str[:8],
+                               exc_info=True)
+
         # ── 5. 评估不再在此触发 ──
         # 【2026-10-15 设计修正】此前任务 completed 后会 fire-and-forget 自动跑
         # RAGAS/Judge 评估。该设计已移除：评估是**上线前的回归测试**，不是生产
@@ -851,6 +888,35 @@ async def _create_task_impl(
             llm_parsed["competitors"], llm_parsed["dimensions"],
             request.app.state.settings,
         )
+
+    # ── 偏好补缺（2026-10-27 M4：默认值不用每次说）──
+    # 【位置很关键】必须在实体定稿之后、无锚点校验之前：
+    #   定稿之后才知道用户真正缺什么（补的是空缺，不是覆盖用户明说的值）；
+    #   校验之前补，才能让"只传了竞品、维度用默认值"的请求真的跑起来，
+    #   而不是被 _reject_no_anchor 挡成 400。
+    # ⚠️ 只吃 user_set / confirmed（DAO 在 SQL 层已过滤 proposed）——
+    #    LLM 提取的提案在用户点确认前不许生效。
+    if request.app.state.settings.memory_preferences_enabled and not (
+        llm_parsed["competitors"] and llm_parsed["dimensions"]
+    ):
+        from src.memory.preferences import for_injection, prefill_for_task
+
+        try:
+            effective = await PreferenceDAO(_get_pool(request)).get_effective(
+                current_user.user_id
+            )
+            usable, _suppressed = for_injection(effective)
+            fill = prefill_for_task(usable)
+            if not llm_parsed["competitors"] and fill.get("competitors"):
+                llm_parsed["competitors"] = _dedupe(fill["competitors"])
+            if not llm_parsed["dimensions"] and fill.get("dimensions"):
+                llm_parsed["dimensions"] = _dedupe(fill["dimensions"])
+            llm_parsed["intent_is_clear"] = bool(
+                llm_parsed["competitors"] and llm_parsed["dimensions"]
+            )
+        except Exception:  # noqa: BLE001 — 偏好读失败最多是"回到没有默认值"，不该 500
+            logger.warning("偏好补缺失败（忽略） user=%s", current_user.user_id,
+                           exc_info=True)
 
     # ── 无锚点校验（2026-10-26）──
     # 此时 competitors/dimensions = 显式参数 ∪ LLM 抽取结果，是两条路径的定稿值。
@@ -976,6 +1042,35 @@ async def chat(
     )
     base = {"intent": funnel.intent, "layer": funnel.layer, "confidence": funnel.confidence}
 
+    # ── 偏好提案识别（M4，2026-10-27）──
+    # 【为什么放在漏斗之后而不是之前】一句话可能同时是命令与规则
+    #   （"以后默认用功能和定价，先帮我分析飞书"）：判成 analysis 也不该丢掉提案。
+    # 【为什么先过关键词门】判"这句话有没有在说偏好"本身就是分类任务，
+    #   字符串命中能挡掉绝大多数轮次，剩下的才花一次 LLM（见 preferences.has_cue）。
+    # 【为什么写进去的只是 proposed】LLM 可以提取，但不能替用户拍板；
+    #   转正要等前端确认卡被点（POST /api/preferences/{key}/confirm）。
+    pending_prefs: list[dict] = []
+    if settings.memory_preferences_enabled:
+        from src.memory.preferences import detect_proposals, pending_cards
+
+        pref_dao = PreferenceDAO(pool)
+        try:
+            proposals = await detect_proposals(
+                body.message, getattr(request.app.state, "memory_llm", None), settings
+            )
+            for p in proposals:
+                await pref_dao.upsert(
+                    current_user.user_id, p["key"], p["value"],
+                    source="proposed", confidence=p["confidence"],
+                )
+            if proposals:
+                # 提案落库后重新取一遍：确认卡要包含**之前没确认的**那些，
+                # 不能只显示本轮新提的（否则上次的提案永远等不到确认）
+                pending_prefs = pending_cards(await pref_dao.list(current_user.user_id))
+        except Exception:  # noqa: BLE001 — 提案识别失败不影响这句对话
+            logger.warning("偏好提案处理失败（忽略） user=%s", current_user.user_id,
+                           exc_info=True)
+
     async def finish(
         status_code: int,
         content: dict,
@@ -997,7 +1092,13 @@ async def chat(
         )
         return JSONResponse(
             status_code=status_code,
-            content={**content, "conversation_id": conversation["id"]},
+            content={
+                **content,
+                "conversation_id": conversation["id"],
+                # 三个分支统一带：前端不必为每种 type 各写一遍确认卡逻辑。
+                # 空列表也要带上（区分"没有提案"与"字段缺失"）。
+                "pending_preferences": pending_prefs,
+            },
         )
 
     # ── L4 澄清：不入库、不建任务，只回一句反问 ──
@@ -1070,6 +1171,126 @@ async def chat(
         "items": data["items"],
         "echo": body.message,
     }, data["summary"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §5.6 路由 — /api/preferences（程序性记忆，2026-10-27 M4）
+# ═════════════════════════════════════════════════════════════════════════════
+
+class PreferenceBody(BaseModel):
+    """设置一条偏好。
+
+    `source` 只开放 user_set / confirmed 两个值：proposed 是**内部状态**，
+    由 LLM 提案那条链路写，客户端不该能直接把一条偏好标成"提案"——
+    否则它会被当成"用户没确认过的东西"永久搁置。
+    """
+    value: Any = Field(..., description="偏好值，形状由 key 决定")
+    source: str = Field("user_set", description="user_set | confirmed")
+
+
+@app.get("/api/preferences")
+async def list_preferences(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """列出该用户的全部偏好，并标出哪些**此刻真的会生效**。
+
+    【为什么返回两个列表而不是一个】
+    存的 ≠ 生效的。一条 `report_style=只要一行` 存得进去，但与 system 的
+    "必须有总览表格 + 逐维度分析"冲突，注入时会被压制。
+    前端要能显示"已保存，但不会生效（原因）"——静默忽略等于骗用户设置成功了。
+    """
+    from src.memory.preferences import for_injection
+
+    dao = PreferenceDAO(_get_pool(request))
+    rows = await dao.list(current_user.user_id)
+    effective = await dao.get_effective(current_user.user_id)
+    usable, suppressed = for_injection(effective)
+    reasons = dict(suppressed)
+    items = []
+    for row in rows:
+        value = row["value"]
+        if isinstance(value, (str, bytes)):
+            try:
+                value = _parse_jsonb(value)
+            except Exception:  # noqa: BLE001
+                pass
+        items.append({
+            "key": row["key"],
+            "value": value,
+            "source": row["source"],
+            "confidence": row["confidence"],
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "will_apply": row["key"] in usable,
+            "suppressed_reason": reasons.get(row["key"]),
+        })
+    return {"items": items, "effective": usable}
+
+
+@app.put("/api/preferences/{key}")
+async def put_preference(
+    key: str,
+    body: PreferenceBody,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """写入一条偏好（UI 显式设置 → 直接生效）。
+
+    【两层校验，各管一件事】
+      这里做**结构校验**（类型/形状/条数）→ 不合法 400，当场告诉用户哪写错了；
+      **语义压制**放在注入侧（`preferences.for_injection`）→ 因为"与 system 硬规则
+      冲突"要看硬规则，而硬规则在 writer prompt 里，写入侧拿不到。
+    返回值里的 `will_apply=false` 就是"存下了，但这次不会生效"的诚实回执。
+    """
+    from src.memory.preferences import for_injection, validate
+
+    if body.source not in ("user_set", "confirmed"):
+        raise HTTPException(400, "source 只能是 user_set 或 confirmed")
+    reason = validate(key, body.value)
+    if reason:
+        raise HTTPException(400, reason)
+
+    dao = PreferenceDAO(_get_pool(request))
+    await dao.upsert(
+        current_user.user_id, key, body.value,
+        source=body.source, confidence=1.0 if body.source == "user_set" else 0.9,
+    )
+    usable, suppressed = for_injection({key: body.value})
+    suppressed_reason = dict(suppressed).get(key)
+    return {
+        "key": key,
+        "source": body.source,
+        "will_apply": key in usable,
+        "reason": suppressed_reason,
+    }
+
+
+@app.post("/api/preferences/{key}/confirm")
+async def confirm_preference(
+    key: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """把一条 proposed 转正 —— 确认卡的"以后都这样"按钮。"""
+    dao = PreferenceDAO(_get_pool(request))
+    if not await dao.confirm(current_user.user_id, key):
+        raise HTTPException(404, "没有待确认的偏好")
+    effective = await dao.get_effective(current_user.user_id)
+    from src.memory.preferences import for_injection
+
+    usable, _ = for_injection(effective)
+    return {"key": key, "source": "confirmed", "will_apply": key in usable}
+
+
+@app.delete("/api/preferences/{key}")
+async def delete_preference(
+    key: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """删掉一条偏好（含"忽略"提案）。"""
+    dao = PreferenceDAO(_get_pool(request))
+    return {"key": key, "deleted": await dao.delete(current_user.user_id, key)}
 
 
 # ═════════════════════════════════════════════════════════════════════════════

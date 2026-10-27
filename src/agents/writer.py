@@ -79,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 _WRITER_PROMPT = """你是一个技术报告撰写专家。根据给定的竞品分析结果，生成一份专业的 Markdown 竞品分析报告。
 
+%s
 任务: %s
 竞品: %s
 分析维度: %s
@@ -115,6 +116,7 @@ async def writer_agent(
     task: dict,
     mcp_server: MCPServer,
     llm: ChatDeepSeek,
+    preference_block: str = "",
 ) -> dict:
     """Writer Agent — 生成 Markdown 竞品分析报告。
 
@@ -134,6 +136,8 @@ async def writer_agent(
         }
         mcp_server: MCP 工具服务器（仅获取 settings）
         llm: ChatDeepSeek 客户端（temperature=0.3）
+        preference_block: 程序性记忆拼成的"用户偏好：…"段（已过冲突压制；
+            空串表示该用户没设偏好，或设了但全被压制）
 
     Returns:
         {report_markdown: str}
@@ -204,6 +208,11 @@ async def writer_agent(
         suggestions_str = "\n".join(lines)
 
     prompt = _WRITER_PROMPT % (
+        # 偏好拼在**角色设定之后、任务数据之前**（2026-10-27 M4）。
+        # 位置本身不产生优先级——真正的优先级由 `preferences.for_injection()`
+        # 提前压制实现（与硬规则冲突的偏好根本到不了这里）；
+        # 放前面只是因为"写法偏好"应当影响后面所有段落，而不是只影响结论段。
+        preference_block or "",
         title,
         "、".join(competitors),
         "、".join(dimensions),

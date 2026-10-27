@@ -100,6 +100,26 @@ class Settings(BaseSettings):
     #   那类才需要带 TTL 去管过期。
     memory_episodic_max_chars: int = 200
 
+    # ---- 长期记忆写入（2026-10-27 M3：semantic 事实 + 时效）----
+    # 与 episode 分开开关：episode 出错只是"少一条历史"，fact 出错会污染
+    # verify 的答案（拿一条已失效的价格当当前事实念给用户），必须能单独停。
+    memory_semantic_enabled: bool = True
+    # 一个任务最多提炼多少条事实。报告证据行常见 8~20 条，全写会把
+    # 一个任务的结论淹没在同一次爬取的复述里；20 条已覆盖结论骨架。
+    memory_semantic_max_per_task: int = 20
+    # 取代判据：新事实与旧事实余弦 ≥ 此值且 subject 相同 → 旧事实转 superseded。
+    # 0.90 而非 M2 冲突检测用的 0.85 —— 0.85 会把"飞书支持多维表格"和
+    # "飞书支持自动化流程"（同竞品同维度、句式相近）判成同一条而误取代。
+    memory_semantic_supersede_threshold: float = 0.90
+
+    # ---- 程序性记忆（2026-10-27 M4：user_preferences）----
+    memory_preferences_enabled: bool = True
+    # 对话里识别偏好提案的**前置门**：命中这些词才花一次 LLM。
+    # 不加门的代价是每轮对话多一次 LLM，而 90% 的轮次根本没在说偏好。
+    preference_cue_keywords: str = (
+        "以后,今后,默认,每次,都要,不要再,别再,习惯,偏好,总是,统一"
+    )
+
     # ---- RAGAS 评估运行参数（ragas_core 唯一口径，构造见 llm_factory）----
     # 【2026-10-16 新增】主因是一次实测事故：`钉钉@功能` 的 context_precision
     #   恒为 NaN，日志只有一行 `Job[12]: TimeoutError()`。
@@ -158,6 +178,21 @@ class Settings(BaseSettings):
     max_rounds_supervisor: int = 10
     token_bucket_capacity: int = 100
     llm_rpm_limit: int = 60
+
+    @computed_field
+    @property
+    def embed_model_version(self) -> str:
+        """向量版本标签（`memory_model_version` 列的值）—— 由模型名派生，不单独配。
+
+        ★ 为什么不给它一个独立配置项：两处可配就一定会漂。`embedding_model`
+          换成 bge-large 而版本标签还写着 bge-m3 时，检索会拿新模型的 query 向量
+          去比旧模型的记忆向量——余弦值毫无意义，但**不报错**，只是排序变乱。
+          派生就没有漂的余地。
+
+        取模型名末段（"BAAI/bge-m3" → "bge-m3"）：组织前缀换了但模型没换时，
+        向量空间其实没变，不该因此让全量历史记忆退出候选。
+        """
+        return self.embedding_model.split("/")[-1]
 
     @computed_field
     @property
