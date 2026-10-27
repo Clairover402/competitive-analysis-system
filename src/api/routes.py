@@ -424,6 +424,19 @@ async def lifespan(app: FastAPI):
     from src.supervisor.router import IntentRouter
     app.state.router = IntentRouter(settings)
 
+    # ── 长期记忆写入口（M2，2026-10-27）──
+    # 只建一个实例供**写**用，和 pipeline 图内部那个读实例是两个对象，区别是：
+    #   · 这里刻意**不传 conflict_resolver** —— 冲突检测（相似度≥0.85 → LLM 仲裁 → 软删旧记忆）
+    #     的语义是"新观测取代旧观测"，只对 fact/decision 成立；
+    #     episode 是追加式历史，同批竞品同批维度的两条 episode 模板高度相似，
+    #     会被判成冲突而互相删除，于是"上个月那次分析"永久消失。
+    #   · 读路径继续用 pipeline 图里那个带 resolver 的实例（它只读，resolver 不会触发）。
+    from src.db.dao import AgentMemoryDAO as _AgentMemoryDAO
+    from src.memory.long_term import LongTermMemoryEngine
+
+    app.state.memory_engine = LongTermMemoryEngine(llm_analyzer, _AgentMemoryDAO(pool))
+    app.state.memory_llm = llm_analyzer
+
     logger.info(
         "竞品分析系统启动完成 | DB pool: min=2 max=10 | "
         "Pipeline ✅ | Supervisor ✅ | A2A 4Agent ✅"
@@ -687,6 +700,34 @@ async def _execute_task(
             "route": route_type,
             "elapsed_ms": int(elapsed * 1000),
         })
+
+        # ── 4.5 写一条 episode（长期记忆，2026-10-27 M2）──
+        # 【为什么在这里而不是 finalize 节点】pipeline 与 supervisor 两条路径
+        #   都会走到这行；分别写进两个图的 finalize 节点必然漏一处。
+        # 【为什么放在 completed 之后】记忆是任务完成后的附加动作：
+        #   写失败只影响"下次分析少一条参考"，绝不能把已完成的任务改成 failed。
+        #   write_task_episode 内部已 try/except 兜底，这里再包一层防 getattr 之类意外。
+        memory_engine = getattr(request.app.state, "memory_engine", None)
+        if memory_engine is not None:
+            from src.memory.episode import write_task_episode
+
+            try:
+                await write_task_episode(
+                    engine=memory_engine,
+                    llm=getattr(request.app.state, "memory_llm", None),
+                    task=enriched_task,
+                    route_type=route_type,
+                    report_text=(
+                        final_state.get("final_report", "")
+                        if route_type == "pipeline"
+                        else final_state.get("final_output", "")
+                    ),
+                    quality_score=final_state.get("quality_score", 0.0),
+                    settings=request.app.state.settings,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("episode 写入异常（已忽略） task=%s", task_id_str[:8],
+                               exc_info=True)
 
         # ── 5. 评估不再在此触发 ──
         # 【2026-10-15 设计修正】此前任务 completed 后会 fire-and-forget 自动跑

@@ -191,6 +191,12 @@ _IMPORTANCE_MAP = {
     "preference": (0.7, 60),    # 用户偏好 — 中保留 + 中高权重
     "fact":       (0.5, 30),    # 事实信息 — 中保留 + 中权重
     "chat":       (0.1, 7),     # 闲聊 — 短保留 + 低权重
+    # 【2026-10-27 M2 新增】episode = 一次任务的经过与结论（情景记忆）
+    # 与 fact 的差别不在"重不重要"，而在**失效方式**：
+    #   fact 会被新观测取代（涨价了旧价就该退场），episode 不会——
+    #   "上个月那次分析得出了什么"是一个历史事实，永远有效。
+    # 所以半衰期取 90 天（与 decision 同级），让它慢衰减、但不永久占位。
+    "episode":    (0.6, 90),
 }
 
 
@@ -318,12 +324,18 @@ class LongTermMemoryEngine:
     ) -> list[dict]:
         """五步检索流水线入口。
 
-        【L4 工程】两条 early return 路径
+        【L4 工程】三条 early return 路径
         ─────────────────────────────
-        1. embed_query() 失败 → 返回空列表（无法做向量检索，关键词也不够精确）
-        2. RRF 融合后为空 → 返回空列表（两种检索器都没命中）
+        0. 该用户一条活跃记忆都没有 → 直接返回（M2 新增，见 Step 0）
+        1. RRF 融合后为空 → 返回空列表（两种检索器都没命中）
+        2. RRF 候选数 ≤ top_k → 跳过精排直接返回
 
-        early return 不是 bug——它防止空数据流入 Cross-encoder 精排层。
+        【2026-10-27 M2 修正】原来"embed_query 失败 → return []"这条已删除。
+        真实代价不是"退化成关键词查"，而是**索引层一挂、读取整体归零**——
+        连那些本来就不需要向量的行（embedding IS NULL）也一起瞎了。
+        写入侧允许 embed 失败（存 NULL 照常插入），读取侧却不容忍，
+        这个不对称会让"embed 服务抖 30 秒"变成"记忆功能全停 30 秒"。
+        现在改成只跳过向量路，关键词路照常进 RRF 与精排。
 
         【L3 核心考点】top_k 的三层含义
         ───────────────────────────
@@ -331,19 +343,27 @@ class LongTermMemoryEngine:
         Step 2 关键词检索: top_k=30（固定——关键词命中比向量少，设少点合理）
         Step 5 精排: top_k 由调用方指定（默认 10）——这是最终返回数量
         """
+        # ── Step 0: 空表短路（2026-10-27 M2）──
+        # 表里没记忆时 Step 1 的 LLM 改写 + Step 2 的 embedding 全是白烧；
+        # 而"没记忆"在新用户、新环境、刚清库时是常态，不是异常。
+        if await self._dao.count(user_id) == 0:
+            logger.debug("记忆表为空，跳过检索 user=%s", user_id)
+            return []
+
         # ── Step 1: Query 重写 ──
         rewritten = await self._rewrite_query(query)
 
-        # ── Step 2: 混合检索 ──
+        # ── Step 2: 混合检索（向量路可降级，关键词路必跑）──
         query_vec = await embed_query(rewritten)
-        if not query_vec:
-            logger.warning("embed_query 失败: %r", rewritten)
-            return []  # early return 1: 向量检索不可用
-
+        vec_results: list[dict] = []
+        if query_vec:
+            vec_results = await self._dao.similarity_search(user_id, query_vec, top_k=60)
+        else:
+            # ⚠️ 不 return：降级成单路检索，总比整块读不出来强
+            logger.warning("embed_query 失败，本次只走关键词路: %r", rewritten)
         # 【L5 决策】向量和关键词的 top_k 不对称的原因
         # 向量检索（top_k=60）: 语义层面匹配更广，需要更大的候选池
         # 关键词检索（top_k=30）: 精确匹配，通常命中少于向量
-        vec_results = await self._dao.similarity_search(user_id, query_vec, top_k=60)
         kw_results = await self._dao.keyword_search(user_id, rewritten, top_k=30)
 
         # ── Step 3: RRF 融合 ──
@@ -351,7 +371,7 @@ class LongTermMemoryEngine:
 
         # ── Step 4: 元数据过滤（SQL 层已做，Python 层无需额外操作） ──
         if not merged:
-            return []  # early return 2: 两路都没命中
+            return []  # early return: 两路都没命中
 
         # ── Step 5: Cross-encoder 精排 ──
         documents = [d.get("content", "") for d in merged]
@@ -425,26 +445,28 @@ class LongTermMemoryEngine:
         importance: float | None = None,
         half_life_days: int | None = None,
         source_task_id: str | None = None,
-    ) -> str:
+        dedupe: bool = False,
+    ) -> str | None:
         """写入长期记忆——含冲突检测。
 
         全流程:
           1. 查 _IMPORTANCE_MAP 获取类型默认值
           2. 调用方传了自定义 importance/half_life → 覆盖默认值
-          3. 调用 embed_query(content) 生成 1024 维向量
+          3. 调用 embed_query(content) 生成 1024 维向量（失败不阻塞写入）
           4. 如果有 conflict_resolver → detect → resolve → soft_delete
           5. DAO.insert() 写入 agent_memories 表
 
         Args:
             user_id: 用户 ID（多用户隔离）
             content: 记忆内容文本
-            memory_type: 记忆类型（decision/preference/fact/chat）
+            memory_type: 记忆类型（decision/preference/fact/chat/episode）
             importance: 重要性评分（0~1，None 则从 _IMPORTANCE_MAP 取）
             half_life_days: 半衰期天数（None 则从 _IMPORTANCE_MAP 取）
             source_task_id: 来源任务 ID（追溯记忆由哪个分析任务产生）
+            dedupe: 同一个 source_task_id 已有同类型记忆时静默跳过（见 AgentMemoryDAO.insert）
 
         Returns:
-            新记忆的 UUID
+            新记忆的 UUID；`dedupe=True` 且已存在时返回 **None**（不是异常）。
 
         【L5 决策】importance 和 half_life 的参数设计
         ──────────────────────────────────────────
@@ -459,6 +481,12 @@ class LongTermMemoryEngine:
         从分析报告中提取的记忆携带 source_task_id——知道"这句话来自哪次分析"。
         出问题时可以溯源: 这次分析的结论提取出了什么记忆？
         这是一个可观测性字段——不必需但你不想没有。
+
+        【⚠️ 2026-10-27 M2】写 episode 时**不要给它 conflict_resolver**。
+        冲突检测（相似度 ≥0.85 → LLM 仲裁 → 软删除旧记忆）的语义是
+        "新观测取代旧观测"，只对 fact/decision 成立；episode 是追加式历史，
+        两条模板相似的 episode（同一批竞品、同一批维度）会被判成冲突而互相删，
+        于是"上个月那次分析"永久消失。写入口用 conflict_resolver=None 的 engine 实例。
         """
         # ── 1. 取默认值 + 调用方覆盖 ──
         imp, half = _IMPORTANCE_MAP.get(
@@ -489,8 +517,15 @@ class LongTermMemoryEngine:
             embedding=embedding if embedding else None,
             source_task_id=source_task_id,
             half_life_days=half,
+            dedupe=dedupe,
         )
 
-        logger.info("长期记忆写入成功: id=%s, 类型=%s, 重要性=%.1f",
-                     memory_id[:8], memory_type, imp)
+        if memory_id is None:
+            # dedupe 命中：这条记忆早就写过了（任务重跑的正常路径，不是错误）
+            logger.info("长期记忆已存在，跳过: 类型=%s task=%s",
+                         memory_type, str(source_task_id)[:8])
+            return None
+
+        logger.info("长期记忆写入成功: id=%s, 类型=%s, 重要性=%.1f, 有向量=%s",
+                     memory_id[:8], memory_type, imp, bool(embedding))
         return memory_id

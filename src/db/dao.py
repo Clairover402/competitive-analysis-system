@@ -699,8 +699,9 @@ class AgentMemoryDAO:
         embedding: list[float] | None = None,
         source_task_id: str | None = None,
         half_life_days: int = 30,
-    ) -> str:
-        """插入长期记忆。
+        dedupe: bool = False,
+    ) -> str | None:
+        """插入长期记忆；`dedupe=True` 时撞唯一约束不报错，返回 None。
 
         【L4 工程】embedding 为什么是可选的（None）？
         ------------------------------------------------------------
@@ -709,18 +710,46 @@ class AgentMemoryDAO:
           存 embedding=None 省 2KB 存储。
         但无 embedding 的记忆只能用 keyword_search（zhparser），
         不能用 similarity_search。这是"按需求选择检索方式"的体现。
+
+        【为什么 dedupe 用 ON CONFLICT DO NOTHING 而不是捕异常】
+        ------------------------------------------------------------
+        任务重跑时"这条 episode 已存在"是**正常路径**，不是错误。
+        捕 UniqueViolationError 会让上层必须认识 asyncpg 的异常类型，
+        而且异常会把连接的事务状态弄脏（需要在 savepoint 里做）；
+        ON CONFLICT 让数据库自己判定，语义也更直白：写不进去就是已经有了。
+        ⚠️ 只有 episode 有部分唯一索引，所以这个分支只对 memory_type='episode' 有意义，
+           dedupe=True 配其他类型等于没开（会照常插入）。
         """
+        sql = """INSERT INTO agent_memories (user_id, memory_type, content,
+                                            importance, embedding,
+                                            source_task_id, half_life_days)
+                 VALUES ($1, $2, $3, $4, $5::vector, $6, $7)"""
+        if dedupe:
+            # 谓词必须与部分唯一索引完全一致，否则 PG 推断不出该索引
+            sql += " ON CONFLICT (source_task_id) WHERE memory_type = 'episode' DO NOTHING"
+        sql += " RETURNING id"
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                """INSERT INTO agent_memories (user_id, memory_type, content,
-                                               importance, embedding,
-                                               source_task_id, half_life_days)
-                   VALUES ($1, $2, $3, $4, $5::vector, $6, $7)
-                   RETURNING id""",
+                sql,
                 user_id, memory_type, content, importance,
                 _vector_str(embedding) if embedding else None, source_task_id, half_life_days,
             )
-            return str(row["id"])
+            return str(row["id"]) if row else None
+
+    async def count(self, user_id: str) -> int:
+        """该用户当前有几条活跃记忆。
+
+        【为什么需要它】`retrieve()` 的五步流水线里，Step 1 是一次 LLM 改写、
+        Step 2 是一次 embedding——表里一条记忆都没有时，这两笔开销纯属白烧，
+        而"记忆表空"在 M2 之前是**常态**（agent_memories 恒 0 行）。
+        一次 count 走 (user_id) 索引，比一次 LLM 便宜三个数量级。
+        """
+        async with self._pool.acquire() as conn:
+            return int(await conn.fetchval(
+                """SELECT count(*) FROM agent_memories
+                   WHERE user_id = $1 AND is_active = true""",
+                user_id,
+            ) or 0)
 
     async def similarity_search(
         self,

@@ -88,6 +88,18 @@ class Settings(BaseSettings):
     intent_funnel_floor: float = 0.55
     intent_funnel_margin: float = 0.10
 
+    # ---- 长期记忆写入（2026-10-27 M2：episodic）----
+    # 【为什么加开关】写记忆是"任务完成后的附加动作"，一旦它出问题
+    #   （embed 服务抖动 / 表被锁），最坏结果是"记忆没写进去"，
+    #   但绝不能变成"任务被判失败"。开关是留给线上紧急止损用的：
+    #   关掉即回到"每份报告都从零开始"，任务链路本身不受影响。
+    memory_episodic_enabled: bool = True
+    # 【为什么 episode 只留 200 字】它的消费端是 analyze 的 [历史记忆] 段，
+    #   注入 5 条就要占掉 1000 字预算；而 episode 要表达的只是
+    #   "分析过谁、用了哪些维度、结论朝哪边走"——具体的数字属于 M3 的 semantic，
+    #   那类才需要带 TTL 去管过期。
+    memory_episodic_max_chars: int = 200
+
     # ---- RAGAS 评估运行参数（ragas_core 唯一口径，构造见 llm_factory）----
     # 【2026-10-16 新增】主因是一次实测事故：`钉钉@功能` 的 context_precision
     #   恒为 NaN，日志只有一行 `Job[12]: TimeoutError()`。
