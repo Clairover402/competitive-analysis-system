@@ -178,6 +178,38 @@ def _reject_over_limit(
         )
 
 
+def _reject_no_anchor(
+    competitors: list[str] | None,
+    dimensions: list[str] | None,
+) -> None:
+    """无锚点校验：竞品和维度**都为**空 → HTTP 400（2026-10-26）。
+
+    【为什么"两个都空"要拒，"只缺一个"不拒】
+      classify() 把"缺任一个"一律路由给 supervisor 探索，但两者性质不同：
+      — 缺竞品、给了维度（"从定价角度看看这个市场"）→ 有分析角度，能反推该找谁 → 值得探索；
+      — 缺维度、给了竞品（"分析下飞书"）→ 有对象，能推断该看什么 → 值得探索；
+      — 两个都空（"帮我做个竞品分析"）→ **没有锚点**，ReAct 只能从零猜，
+        跑出来往往是一堆不相关竞品，报告**看着完整、内容没用**。
+      与 `_reject_over_limit` 同一判据：静默给出一份"能看但不对"的东西，比 400 难发现得多。
+
+    【为什么必须在"抽取之后"调用】
+      model_post_init 用 `is not None` 判结构化参数，所以 `competitors=[] + dimensions=[]`
+      能通过 Pydantic（被当成"传了"）。若在入口就判，正常 query 模式（两个字段都没传）
+      会被直接挡掉，连 LLM 抽取的机会都没有。所以判据要落在"参数定稿之后"——
+      此时 competitors/dimensions = 显式参数 ∪ 抽取结果，两个都空才是真的没有锚点。
+
+    【为什么是拒绝而不是交给探索】
+      与 `_reject_duplicates` / `_reject_over_limit` 同口径：不静默替用户决定范围。
+      提示里给两个正例，让用户知道"至少得给一个"。
+    """
+    if not competitors and not dimensions:
+        raise HTTPException(
+            400,
+            "未能从描述中识别出竞品或维度，请至少指定其中一个再提交"
+            "（例如「对比飞书和钉钉的定价」，或指定维度「从定价角度分析市场」）。",
+        )
+
+
 class TaskRequest(BaseModel):
     """创建任务请求体。
 
@@ -779,6 +811,11 @@ async def create_task(
             llm_parsed["competitors"], llm_parsed["dimensions"],
             request.app.state.settings,
         )
+
+    # ── 无锚点校验（2026-10-26）──
+    # 此时 competitors/dimensions = 显式参数 ∪ LLM 抽取结果，是两条路径的定稿值。
+    # 放在这里而不是入口：入口处 query 模式的两个字段还是空的，会被误挡。
+    _reject_no_anchor(llm_parsed["competitors"], llm_parsed["dimensions"])
 
     # ── 写入 DB ──
     pool = _get_pool(request)
