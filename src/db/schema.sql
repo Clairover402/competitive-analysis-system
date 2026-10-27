@@ -426,6 +426,61 @@ CREATE INDEX IF NOT EXISTS idx_agent_memories_embedding_hnsw
 
 
 -- ============================================================
+-- 7.5 conversations / conversation_turns — 会话记忆（2026-10-27 M1）
+-- ============================================================
+-- 【L4 工程】为什么不复用 checkpointer 的 thread_id 当会话？
+-- ------------------------------------------------------------
+-- checkpointer 一行存的是 60 多字段的 graph state（节点执行快照），
+-- 用途是"中断恢复"，粒度是**一次任务**。把它当对话记忆用会同时坏两件事：
+--   1) 任务恢复找不到锚点（thread_id 被会话改绑后，同一个 task 的恢复状态丢了）
+--   2) 对话上下文被 state 挤爆（60 字段的快照里 95% 与"用户说了什么"无关）
+-- ⇒ 会话记忆走独立的表，任务执行继续用 task 级 thread_id。
+--
+-- 【L4 工程】为什么拆两张表，不是一张自引用表？
+-- ------------------------------------------------------------
+-- conversations 是**聚合根**（携带 summary / turn_count，一行一会儿话），
+-- conversation_turns 是**流水**（只追加，不改）。拆开后：
+--   · 存摘要只 UPDATE 一行，不必扫全表
+--   · 取最近 N 轮只走 (conversation_id, seq) 索引，seq 单调保证顺序
+--   · 清理会话时两条 DELETE，不涉及外键自引用级联
+--
+-- 【L4 决策】turns 不存 embedding（与 §7.5 的会话层取舍一致）：
+-- 取法是 WHERE conversation_id ORDER BY seq，天然有序，没有"找相似"的场景；
+-- 建 HNSW 只是给一个顺序读的表加维护成本。
+CREATE TABLE IF NOT EXISTS conversations (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    VARCHAR(100) NOT NULL,
+    title      VARCHAR(200),                    -- 首句话裁出来的标题，仅给会话列表看
+    summary    TEXT,                            -- 超过 6 轮后的会话摘要（滚动覆盖）
+    turn_count INT NOT NULL DEFAULT 0,          -- 用户轮数（不含 assistant 行）
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 会话列表：按用户取最近活跃
+CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
+    ON conversations (user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    seq             INT  NOT NULL,              -- 会话内单调递增，1 起
+    role            VARCHAR(16) NOT NULL,       -- user / assistant
+    content         TEXT NOT NULL,
+    intent          VARCHAR(20),                -- 该轮判出的意图（assistant 行也记，便于回溯）
+    ref_task_id     UUID REFERENCES tasks(id)   ON DELETE SET NULL,
+    ref_report_id   UUID REFERENCES reports(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- ★ 并发下防重号：seq 由 INSERT 时取 MAX+1 生成（见 ConversationDAO.add_turn），
+    --   这条唯一约束是兜底——两个请求同时算出同一个 seq 时，后到的会失败而不是写重。
+    UNIQUE (conversation_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_turns_conv_seq
+    ON conversation_turns (conversation_id, seq DESC);
+
+
+-- ============================================================
 -- 8-9. LangGraph Checkpoint 表（超标交付）
 -- ============================================================
 -- 【L3 知识点】LangGraph 的 Checkpoint 存储 ——

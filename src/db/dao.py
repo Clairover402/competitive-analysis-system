@@ -1018,3 +1018,114 @@ class UserDAO:
                 email,
             )
             return dict(row) if row else None
+
+
+class ConversationDAO:
+    """会话记忆数据访问——一张聚合根（conversations）+ 一条流水（conversation_turns）。
+
+    【L3 面试必问】会话记忆和长期记忆差在哪？
+    ------------------------------------------------------------
+      conversations/turns = **原话**，按 seq 顺序取，问的是"刚才说了什么"；
+      agent_memories      = **结论**，按相似度取，问的是"以前得出过什么"。
+      前者是对话的载体，后者是知识的载体；前者可归档，后者要跨会话留存。
+
+    本类刻意不做 embedding：取法天然有序，向量索引是纯维护成本。
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def create(self, user_id: str, title: str | None = None) -> str:
+        """新建一个会话，返回 id。"""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO conversations (user_id, title)
+                   VALUES ($1, $2) RETURNING id""",
+                user_id, title,
+            )
+            return str(row["id"])
+
+    async def get(self, conversation_id: str, user_id: str) -> dict | None:
+        """按 id 取会话，**同时校验归属**。
+
+        ⚠️ user_id 必须进 WHERE，不能取回来再比：
+           写成 `if row["user_id"] != user_id: return None` 看起来一样，
+           但一旦有人把返回值塞进日志/异常信息，别人的会话 id 就泄露了。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, user_id, title, summary, turn_count, created_at, updated_at
+                   FROM conversations
+                   WHERE id = $1 AND user_id = $2""",
+                conversation_id, user_id,
+            )
+            if row is None:
+                return None
+            data = dict(row)
+            # ⚠️ asyncpg 读出来是 uuid.UUID 对象，而 create() 返回的是 str ——
+            #   两边不一致会让同一个字段在 JSON 响应里时而可序列化、时而 500。
+            #   统一在 DAO 边界转 str，上层不必关心。
+            data["id"] = str(data["id"])
+            return data
+
+    async def add_turn(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        intent: str | None = None,
+        ref_task_id: str | None = None,
+        ref_report_id: str | None = None,
+    ) -> int:
+        """追加一行流水，返回分配到的 seq。
+
+        seq 用 `MAX(seq)+1` 在同一条语句里算，避免"先读后写"的两步竞态；
+        UNIQUE(conversation_id, seq) 兜底，并发下后到的那条会抛唯一冲突
+        （宁可让调用方重试一次，也不要写出两个 seq=3）。
+
+        turn_count 只数 user 行 —— 它是"对话了几轮"，不是"存了几行"。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO conversation_turns
+                       (conversation_id, seq, role, content, intent, ref_task_id, ref_report_id)
+                   SELECT $1, COALESCE(MAX(seq), 0) + 1, $2, $3, $4, $5, $6
+                   FROM conversation_turns WHERE conversation_id = $1
+                   RETURNING seq""",
+                conversation_id, role, content, intent, ref_task_id, ref_report_id,
+            )
+            await conn.execute(
+                """UPDATE conversations SET
+                       turn_count = (SELECT count(*) FROM conversation_turns
+                                     WHERE conversation_id = $1 AND role = 'user'),
+                       updated_at = NOW()
+                   WHERE id = $1""",
+                conversation_id,
+            )
+            return int(row["seq"])
+
+    async def recent_turns(self, conversation_id: str, limit: int = 6) -> list[dict]:
+        """取最近 N 行流水，**按时间正序返回**。
+
+        两步取法的原因：DESC + LIMIT 才能走 (conversation_id, seq DESC) 索引，
+        但拼 prompt 时必须正序（倒序会让模型以为最后一句是最早说的）。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT seq, role, content, intent
+                   FROM conversation_turns
+                   WHERE conversation_id = $1
+                   ORDER BY seq DESC
+                   LIMIT $2""",
+                conversation_id, limit,
+            )
+            return [dict(r) for r in reversed(rows)]
+
+    async def update_summary(self, conversation_id: str, summary: str) -> None:
+        """覆盖写会话摘要（滚动式，不保留历史版本）。"""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE conversations SET summary = $2, updated_at = NOW()
+                   WHERE id = $1""",
+                conversation_id, summary,
+            )
