@@ -4,12 +4,19 @@ import { Auth } from '../js/auth.js';
 import { API } from '../js/api.js';
 import { SFX } from '../js/sounds.js';
 
-// 两种模式 = 后端两条执行路径，命名必须跟着架构走，别让 UI 词比代码更"先进"：
-//   标准模式（默认）：用户自己给竞品与维度 → 参数齐全 → Pipeline 确定性分析
-//   高级模式        ：一句话交给 LLM 抽实体 → 常缺参数 → Supervisor 探索补齐
-// 不要把"一句话"叫快速模式：它更省事，但要跑 ReAct 探索，更慢、更贵、更依赖模型推断。
-// 把更慢更不确定的那条叫"高级"，也比叫"快速"诚实。
-var mode = 'standard';
+// 两个入口 = 两种交互形态，命名跟着"用户要做什么"走：
+//   标准模式（默认）：自己给竞品与维度 → 参数齐全 → Pipeline 确定性分析，**一定出报告**
+//   对话模式        ：一句话交给漏斗判意图 → 四种之一，**只有 analysis 会出报告**
+//
+// ⚠️ 旧名叫"高级模式"，立论是"更慢更不确定的那条才配叫高级"。接上意图漏斗后
+//    lookup / trace / verify 三个意图都比分析更快更确定，这个词的立论已经失效，
+//    2026-10-27 改名（见 notes/实施计划_意图漏斗与对话入口_2026-10-27.md D4）。
+//
+// ⚠️ 对话模式**不跳页**：一次任务分析要跑几分钟，跳走就看不了对话了。
+//    只有 type=task 会在气泡里给一个"查看进度"入口，由用户自己决定跳不跳。
+//
+// 这里原先有个 var mode = 'standard'，两个 tab 切换时改写它，但没人读过 ——
+// 提交走哪个接口是由"哪个按钮被点"决定的，不是由 mode 决定的。D4 顺手删掉。
 
 export function render() {
   var username = Auth.getUsername();
@@ -51,7 +58,7 @@ export function render() {
 
         '<div class="pixel-tabs">' +
           '<button id="tab-standard" class="pixel-tab active">\u6807\u51C6\u6A21\u5F0F</button>' +
-          '<button id="tab-advanced" class="pixel-tab">\u9AD8\u7EA7\u6A21\u5F0F</button>' +
+          '<button id="tab-chat" class="pixel-tab">\u5BF9\u8BDD\u6A21\u5F0F</button>' +
         '</div>' +
 
         // 默认入口：结构化入参。参数齐全直接进 Pipeline，快、稳、可复现。
@@ -71,14 +78,19 @@ export function render() {
           '</button>' +
         '</div>' +
 
-        // 高级入口：一句话。省掉填表，代价是竞品/维度要靠模型抽，缺了参数就转探索。
-        '<div id="panel-advanced" class="pixel-hidden">' +
-          '<p class="pixel-mode-hint">\u4E00\u53E5\u8BDD\u4EA4\u7ED9 Agent \u81EA\u5DF1\u8BC6\u522B \u00B7 \u5148\u62BD\u7ADE\u54C1\u4E0E\u7EF4\u5EA6\uFF0C\u7F3A\u53C2\u6570\u65F6\u8D70 Supervisor \u63A2\u7D22\u8865\u9F50\uFF0C\u7701\u4E8B\u4F46\u66F4\u6162\u3001\u66F4\u4F9D\u8D56\u6A21\u578B\u63A8\u65AD</p>' +
-          '<textarea id="adv-query" class="pixel-textarea pixel-mb-sm" rows="4"' +
-                    ' placeholder="> \u4F8B\u5982\uFF1A\u5BF9\u6BD4\u738B\u8005\u8363\u8000\u548C\u82F1\u96C4\u8054\u76DF\u5728\u73A9\u6CD5\u8BBE\u8BA1\u3001\u7F8E\u672F\u98CE\u683C\u3001\u7535\u7ADE\u751F\u6001\u3001\u5546\u4E1A\u5316\u65B9\u9762\u7684\u8868\u73B0"></textarea>' +
-          '<p class="pixel-mode-hint pixel-text-amber">\u26A0 \u81F3\u5C11\u9700\u80FD\u8BC6\u522B\u51FA\u7ADE\u54C1\u6216\u7EF4\u5EA6\u4E4B\u4E00\uFF1B\u4E24\u8005\u90FD\u8BC6\u522B\u4E0D\u5230\u4F1A\u88AB\u76F4\u63A5\u62D2\u7EDD</p>' +
-          '<button id="btn-submit-adv" class="pixel-btn">' +
-            '&blacktriangleright; \u5F00\u59CB\u5206\u6790' +
+        // 对话入口：一句话进去，后端按漏斗判意图。四种结果：出报告 / 查报告 / 查证据 / 反问。
+        // 提示语必须写明"不是每句话都出报告"，否则用户会等着一个永远不会来的报告。
+        '<div id="panel-chat" class="pixel-hidden">' +
+          '<p class="pixel-mode-hint">\u4E00\u53E5\u8BDD\u8BF4\u6E05\u8981\u505A\u4EC0\u4E48 \u00B7 \u81EA\u52A8\u5224\u65AD\u610F\u56FE\uFF1A\u5206\u6790\u7ADE\u54C1 / \u627E\u5386\u53F2\u62A5\u544A / \u67E5\u8BC1\u636E\u51FA\u5904 / \u6838\u5BF9\u6570\u636E\u65B0\u65E7\uFF1B\u53EA\u6709\u300C\u5206\u6790\u300D\u4F1A\u4EA7\u51FA\u62A5\u544A</p>' +
+          '<div class="pixel-chat-bar">' +
+            '<span class="pixel-chat-conv">\u591A\u8F6E\u5BF9\u8BDD\uFF1A\u540E\u9762\u7684\u8BDD\u4F1A\u5E26\u4E0A\u524D\u6587</span>' +
+            '<button id="btn-new-chat" class="pixel-chat-new" type="button">+ \u65B0\u5BF9\u8BDD</button>' +
+          '</div>' +
+          '<div id="chat-log" class="pixel-chat-log"></div>' +
+          '<textarea id="chat-input" class="pixel-textarea pixel-mb-sm" rows="3"' +
+                    ' placeholder="> \u4F8B\u5982\uFF1A\u4EE5\u524D\u8DD1\u8FC7\u7684\u7ADE\u54C1\u5206\u6790\u62A5\u544A\u5728\u54EA\uFF08Enter \u53D1\u9001\uFF0CShift+Enter \u6362\u884C\uFF09"></textarea>' +
+          '<button id="btn-submit-chat" class="pixel-btn">' +
+            '&blacktriangleright; \u53D1\u9001' +
           '</button>' +
         '</div>' +
 
@@ -105,16 +117,18 @@ export function render() {
 
 export function mount() {
   var tabStandard = document.getElementById('tab-standard');
-  var tabAdvanced = document.getElementById('tab-advanced');
+  var tabChat = document.getElementById('tab-chat');
   var panelStandard = document.getElementById('panel-standard');
-  var panelAdvanced = document.getElementById('panel-advanced');
+  var panelChat = document.getElementById('panel-chat');
   var msgEl = document.getElementById('submit-msg');
   var stdTitle = document.getElementById('std-title');
   var stdCompetitors = document.getElementById('std-competitors');
   var stdDimensions = document.getElementById('std-dimensions');
-  var advQuery = document.getElementById('adv-query');
+  var chatLog = document.getElementById('chat-log');
+  var chatInput = document.getElementById('chat-input');
+  var btnNewChat = document.getElementById('btn-new-chat');
   var btnSubmitStd = document.getElementById('btn-submit-std');
-  var btnSubmitAdv = document.getElementById('btn-submit-adv');
+  var btnSubmitChat = document.getElementById('btn-submit-chat');
   var btnRefresh = document.getElementById('btn-refresh-tasks');
   var btnLogout = document.getElementById('btn-logout');
 
@@ -156,25 +170,24 @@ export function mount() {
     return true;
   }
 
-  if (tabStandard && tabAdvanced && panelStandard && panelAdvanced) {
+  if (tabStandard && tabChat && panelStandard && panelChat) {
     tabStandard.addEventListener('click', function() {
-      mode = 'standard';
       tabStandard.classList.add('active');
-      tabAdvanced.classList.remove('active');
+      tabChat.classList.remove('active');
       panelStandard.classList.remove('pixel-hidden');
-      panelAdvanced.classList.add('pixel-hidden');
+      panelChat.classList.add('pixel-hidden');
       SFX.blip();
       if (stdCompetitors) stdCompetitors.focus();
     });
 
-    tabAdvanced.addEventListener('click', function() {
-      mode = 'advanced';
-      tabAdvanced.classList.add('active');
+    tabChat.addEventListener('click', function() {
+      tabChat.classList.add('active');
       tabStandard.classList.remove('active');
-      panelAdvanced.classList.remove('pixel-hidden');
+      panelChat.classList.remove('pixel-hidden');
       panelStandard.classList.add('pixel-hidden');
       SFX.blip();
-      if (advQuery) advQuery.focus();
+      renderChatLog();
+      if (chatInput) chatInput.focus();
     });
   }
 
@@ -215,36 +228,293 @@ export function mount() {
     }
   }
 
-  async function submitAdvanced() {
-    var query = advQuery.value.trim();
-    if (!query) {
-      showMsg('> \u8BF7\u8F93\u5165\u5206\u6790\u5185\u5BB9', 'error');
-      SFX.error();
-      return;
+  // ── 对话模式 ─────────────────────────────────────────────────────────────
+  // 一句话 → POST /api/chat → 按返回的 type 渲染三种气泡。这里**不复制任何判定逻辑**：
+  // 意图、澄清文案、选项句子全由后端给，前端只负责画。多写一份判据 = 两处不一致。
+  //
+  // conversation_id 由后端新建并回传，前端只负责存下来、下一轮带上。
+  // ⚠️ 不要自己造 id（D4 时用过 'local-xxx' 占位）—— 后端会当成非法会话直接 404。
+  // 存 localStorage：刷新页面后还能接着上一轮，而不是被迫从零开始。
+  var CHAT_CONV_KEY = 'chat_conv_id';
+  var chatConvId = null;
+  try { chatConvId = localStorage.getItem(CHAT_CONV_KEY) || null; } catch (e) { chatConvId = null; }
+  var chatMessages = [];
+  var chatBusy = false;
+
+  var INTENT_LABEL = {
+    analysis: '竞品分析',
+    lookup: '历史报告',
+    trace: '证据溯源',
+    verify: '数据新旧',
+  };
+
+  // ★ 必须转义：summary / claim / source_text 全是**从竞品官网抓回来的原文**，
+  //   里面出现 < > & 是常态，不转义会被当成 HTML 执行。
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function cut(s, n) {
+    var t = String(s == null ? '' : s);
+    return t.length > n ? t.slice(0, n) + '…' : t;
+  }
+
+  // 与后端 _time_cn 的 "10-27 20:22" 对齐 —— 同一个气泡里两种日期格式很扎眼。
+  function fmtTime(iso) {
+    if (!iso) return '未知时间';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '未知时间';
+    function p(n) { return n < 10 ? '0' + n : '' + n; }
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
+      + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  // 只有 http(s) 才渲染成链接。抓回来的 URL 里若出现 javascript: 之类，
+  // 直接铺成文本 —— 转义挡不住协议本身。
+  function renderUrl(url) {
+    var u = String(url || '');
+    if (!/^https?:\/\//i.test(u)) return esc(u || '来源未知');
+    return '<a class="pixel-chat-src" href="' + esc(u) + '" target="_blank" rel="noopener noreferrer">' +
+      esc(u) + '</a>';
+  }
+
+  function renderChatItem(body, taskId) {
+    return '<div class="pixel-chat-item"' +
+      (taskId ? ' data-task="' + esc(taskId) + '"' : '') + '>' + body + '</div>';
+  }
+
+  function statusCn(s) {
+    var hit = STATUS_MAP[s];
+    return hit ? hit.label : (s || '');
+  }
+
+  function renderLookupItem(it) {
+    var comps = (it.competitors && it.competitors.length)
+      ? it.competitors.join(' / ') : '竞品未记录';
+    var ver = it.version ? ('v' + it.version) : '尚无报告';
+    return renderChatItem(
+      '<div class="pixel-chat-item-head">' + esc(it.title || '未命名') + '</div>' +
+      '<div class="pixel-chat-item-sub">' + esc(comps) + ' · ' + esc(statusCn(it.status)) +
+        ' · ' + esc(fmtTime(it.created_at)) + ' · 报告 ' + esc(ver) + '</div>',
+      it.task_id
+    );
+  }
+
+  function renderTraceItem(it) {
+    return renderChatItem(
+      '<div class="pixel-chat-item-head">' + esc(cut(it.claim, 100)) + '</div>' +
+      renderUrl(it.source_url) +
+      '<div class="pixel-chat-item-sub">' +
+        (it.dimension ? esc(it.dimension) + ' · ' : '') +
+        '抓取于 ' + esc(fmtTime(it.observed_at)) + '</div>',
+      it.task_id
+    );
+  }
+
+  function renderVerifyItem(it) {
+    var st = it.status === 'stale'
+      ? { t: '超过保鲜期', cls: 'pixel-badge-warning' }
+      : it.status === 'fresh'
+        ? { t: '保鲜期内', cls: 'pixel-badge-success' }
+        : { t: '时间未知', cls: 'pixel-badge-info' };
+    var age = (it.age_days == null) ? '抓取时间未知' : (it.age_days + ' 天前抓取');
+    return renderChatItem(
+      '<span class="pixel-badge ' + st.cls + '">' + st.t + '</span>' +
+      '<div class="pixel-chat-item-head pixel-mt-xs">' + esc(cut(it.claim, 100)) + '</div>' +
+      '<div class="pixel-chat-item-sub">' + esc(age) +
+        ' · 保鲜期 ' + esc(it.ttl_days) + ' 天</div>',
+      it.task_id
+    );
+  }
+
+  function renderItems(intent, items) {
+    if (!items || !items.length) return '';
+    var fn = intent === 'trace' ? renderTraceItem
+           : intent === 'verify' ? renderVerifyItem
+           : renderLookupItem;   // lookup 是默认，也是唯一一定能走到这里的分支
+    return '<div class="pixel-chat-items">' + items.map(fn).join('') + '</div>';
+  }
+
+  function renderChatMessage(m) {
+    if (m.role === 'user') {
+      return '<div class="pixel-chat-row user">' +
+        '<div class="pixel-chat-bubble user">' + esc(m.text) + '</div></div>';
     }
 
-    btnSubmitAdv.disabled = true;
-    btnSubmitAdv.textContent = '\u5904\u7406\u4E2D...';
+    if (m.kind === 'pending') {
+      return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+        '<span class="pixel-spinner" style="margin-right:8px;vertical-align:middle"></span>' +
+        '判定意图中...</div></div>';
+    }
+
+    if (m.kind === 'error') {
+      return '<div class="pixel-chat-row">' +
+        '<div class="pixel-chat-bubble bot err">' + esc(m.text) + '</div></div>';
+    }
+
+    if (m.kind === 'clarify') {
+      // 两种澄清共用 type=clarify，靠 intent 区分：
+      //   unknown   → 不知道要什么（L4）
+      //   analysis  → 知道要分析，但缺竞品/维度
+      var meta = m.intent === 'analysis' ? '缺少参数' : '意图未判定';
+      var opts = (m.options || []).map(function(o) {
+        return '<button class="pixel-chat-opt" data-msg="' + esc(o.message) + '">' +
+          esc(o.label) + '</button>';
+      }).join('');
+      return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+        '<div class="pixel-chat-meta">' + esc(meta) + '</div>' +
+        '<div>' + esc(m.question) + '</div>' +
+        (opts ? '<div class="pixel-chat-opts">' + opts + '</div>' : '') +
+        '</div></div>';
+    }
+
+    if (m.kind === 'task') {
+      var e = m.entities || {};
+      var comps = (e.competitors && e.competitors.length) ? e.competitors.join(' / ') : '—';
+      var dims = (e.dimensions && e.dimensions.length) ? e.dimensions.join(' / ') : '—';
+      return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+        '<div class="pixel-chat-meta">任务已创建 · 后台运行</div>' +
+        renderChatItem(
+          '<div class="pixel-chat-item-head">竞品：' + esc(comps) + '</div>' +
+          '<div class="pixel-chat-item-sub">维度：' + esc(dims) + '</div>' +
+          '<div class="pixel-chat-item-action">&blacktriangleright; 查看进度 ' +
+            esc(String(m.taskId || '').slice(0, 8)) + '</div>',
+          m.taskId
+        ) +
+        '</div></div>';
+    }
+
+    // answer
+    var label = INTENT_LABEL[m.intent] || m.intent || '';
+    var hit = m.layer ? (' · ' + m.layer) : '';
+    var conf = (typeof m.confidence === 'number' && m.confidence > 0)
+      ? (' ' + m.confidence.toFixed(2)) : '';
+    return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+      '<div class="pixel-chat-meta">' + esc(label) + esc(hit) + esc(conf) + '</div>' +
+      '<div>' + esc(m.summary || '没有结果。') + '</div>' +
+      renderItems(m.intent, m.items) +
+      '</div></div>';
+  }
+
+  function renderChatLog() {
+    if (!chatLog) return;
+    if (!chatMessages.length) {
+      chatLog.innerHTML = '<div class="pixel-chat-empty">' +
+        '<p style="font-size:24px;margin-bottom:10px">&#x1f4ac;</p>' +
+        '<p>试试这几句：</p>' +
+        '<p>· 我以前跑过的竞品分析报告在哪</p>' +
+        '<p>· 报告里飞书比钉钉便宜这个结论的证据在哪</p>' +
+        '<p>· 分析飞书和钉钉在功能和定价上的表现</p>' +
+        '</div>';
+      return;
+    }
+    chatLog.innerHTML = chatMessages.map(renderChatMessage).join('');
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function botMessageFrom(d) {
+    if (d.type === 'task') {
+      return { role: 'bot', kind: 'task', taskId: d.task_id, entities: d.entities || {} };
+    }
+    if (d.type === 'clarify') {
+      return {
+        role: 'bot', kind: 'clarify',
+        question: d.question, options: d.options || [], intent: d.intent,
+      };
+    }
+    return {
+      role: 'bot', kind: 'answer',
+      intent: d.intent, layer: d.layer, confidence: d.confidence,
+      summary: d.summary, items: d.items || [],
+    };
+  }
+
+  async function sendChat(text) {
+    if (chatBusy) return;
+    var q = String(text || '').trim();
+    if (!q) { SFX.error(); return; }
+
+    chatBusy = true;
+    if (btnSubmitChat) { btnSubmitChat.disabled = true; btnSubmitChat.textContent = '\u5224\u5B9A\u4E2D...'; }
+    chatMessages.push({ role: 'user', text: q });
+    chatMessages.push({ role: 'bot', kind: 'pending' });
+    renderChatLog();
+    if (chatInput) chatInput.value = '';
 
     try {
-      var data = await API.post('/api/tasks', { title: query.substring(0, 80), query: query });
-      showMsg('> \u4EFB\u52A1\u5DF2\u521B\u5EFA :: ' + data.task_id, 'success');
-      SFX.confirm();
-      setTimeout(function() { window.location.hash = '#/task/' + data.task_id; }, 600);
+      var data = await API.post('/api/chat', { message: q, conversation_id: chatConvId });
+      // 后端每轮都回 conversation_id：首轮新建、后续原样带回，这里只管覆盖
+      if (data && data.conversation_id) {
+        chatConvId = data.conversation_id;
+        try { localStorage.setItem(CHAT_CONV_KEY, chatConvId); } catch (e) { /* 隐私模式忽略 */ }
+      }
+      chatMessages.pop();  // 撤掉"判定中"
+      chatMessages.push(botMessageFrom(data));
+      if (data.type === 'task') {
+        SFX.confirm();
+        loadTasks();   // 任务卡进列表，用户不跳页也能看到它
+      } else {
+        SFX.blip();
+      }
     } catch (e) {
-      // 抽不出竞品/维度时后端给 400，detail 已经是给用户看的话，直接透出
-      showMsg('> \u9519\u8BEF: ' + e.message, 'error');
+      chatMessages.pop();
+      chatMessages.push({ role: 'bot', kind: 'error', text: '错误: ' + (e.message || '请求失败') });
       SFX.error();
-      btnSubmitAdv.disabled = false;
-      btnSubmitAdv.textContent = '\u25B6 \u5F00\u59CB\u5206\u6790';
+    } finally {
+      chatBusy = false;
+      if (btnSubmitChat) { btnSubmitChat.disabled = false; btnSubmitChat.textContent = '\u25B6 \u53D1\u9001'; }
+      renderChatLog();
+      if (chatInput) chatInput.focus();
     }
   }
 
-  if (advQuery) {
-    advQuery.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && e.ctrlKey) {
+  if (btnNewChat) {
+    btnNewChat.addEventListener('click', function() {
+      SFX.click();
+      // 只丢本地指针，不删库：上一段对话留在 conversations 表里可查，
+      // 但新一段从零开始（否则用户永远在同一个会话里打转，摘要越滚越糊）
+      chatConvId = null;
+      try { localStorage.removeItem(CHAT_CONV_KEY); } catch (e) { /* ignore */ }
+      chatMessages = [];
+      renderChatLog();
+      if (chatInput) chatInput.focus();
+    });
+  }
+
+  if (chatLog) {
+    chatLog.addEventListener('click', function(e) {
+      var t = e.target;
+      if (!t || !t.closest) return;
+
+      // 来源链接要能直接打开，别被下面的"点条目跳任务"抢先拦截
+      if (t.closest('a')) return;
+
+      var opt = t.closest('.pixel-chat-opt');
+      if (opt) {
+        SFX.click();
+        // ★ 发的是选项自带的 message（完整句子），不是 label、更不是序号。
+        //   发"②"这种序号 → 下一轮漏斗再判一次"②" → 四层全判不出 → 再反问 → 死循环。
+        sendChat(opt.getAttribute('data-msg'));
+        return;
+      }
+
+      var item = t.closest('.pixel-chat-item');
+      if (item && item.getAttribute('data-task')) {
+        SFX.click();
+        window.location.hash = '#/task/' + item.getAttribute('data-task');
+      }
+    });
+  }
+
+  if (chatInput) {
+    chatInput.addEventListener('keydown', function(e) {
+      // 对话里 Enter 就该发送（Shift+Enter 换行）。沿用旧版的 Ctrl+Enter
+      // 会把"多说一句"的成本抬高一倍，跟对话形态不符。
+      if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        submitAdvanced();
+        sendChat(chatInput.value);
       }
     });
   }
@@ -255,18 +525,25 @@ export function mount() {
   }
 
   if (btnSubmitStd) btnSubmitStd.addEventListener('click', submitStandard);
-  if (btnSubmitAdv) btnSubmitAdv.addEventListener('click', submitAdvanced);
+  if (btnSubmitChat) btnSubmitChat.addEventListener('click', function() {
+    sendChat(chatInput ? chatInput.value : '');
+  });
   if (btnRefresh) btnRefresh.addEventListener('click', function() { SFX.click(); loadTasks(); });
   if (btnLogout) btnLogout.addEventListener('click', function() { SFX.click(); Auth.logout(); });
 
   // 默认落在标准模式：第一个该填的是竞品，不是标题
   if (stdCompetitors) stdCompetitors.focus();
+  renderChatLog();   // 对话面板先摆出空态示例，切过去不是一片空白
 
   loadTasks();
 }
 
 var STATUS_MAP = {
   'pending':     { label: '\u7B49\u5F85\u4E2D',   cls: 'pixel-badge-warning' },
+  // ★ running 是库里真实存在的状态（实测 4 条），原先漏了 → 卡片和对话框都会
+  //   把英文原样透出来。库里的状态全集：pending / running / completed / failed
+  //   + 执行中四个阶段（collecting / analyzing / writing / qa）。
+  'running':     { label: '\u8FD0\u884C\u4E2D',   cls: 'pixel-badge-warning' },
   'collecting':  { label: '\u91C7\u96C6\u4E2D',   cls: 'pixel-badge-warning' },
   'analyzing':   { label: '\u5206\u6790\u4E2D',   cls: 'pixel-badge-warning' },
   'writing':     { label: '\u64B0\u5199\u4E2D',   cls: 'pixel-badge-warning' },
@@ -357,11 +634,17 @@ function renderTaskCard(t) {
   '</div>';
 }
 
-/* API.post 拦截 — 自动记录 task_id 到 localStorage */
+/* API.post 拦截 — 自动记录 task_id 到 localStorage
+   ⚠️ 两条路径都要记：表单走 /api/tasks 直接回 task_id；
+      对话走 /api/chat，只有 type=task 才有 task_id（answer/clarify 没有）。
+      漏掉 chat 的话，对话里建的任务不会出现在下方任务队列里 —— 看着像没建成功。*/
 var _origPost = API.post;
 API.post = async function(path, body) {
   var result = await _origPost.call(API, path, body);
   if (path === '/api/tasks' && result.task_id) {
+    addLocalTaskId(result.task_id);
+  }
+  if (path === '/api/chat' && result.type === 'task' && result.task_id) {
     addLocalTaskId(result.task_id);
   }
   return result;

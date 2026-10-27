@@ -51,8 +51,8 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-tab { border: none; border-radius: 0; background: transparent; color: var(--pixel-light); font-family: var(--pixel-font); font-size: 14px; padding: 12px 24px; cursor: pointer; text-transform: uppercase; letter-spacing: 2px; border-bottom: 3px solid var(--pixel-mid); transition: color 0.1s ease, border-color 0.1s ease; }
 .pixel-tab:hover { color: var(--pixel-white); }
 .pixel-tab.active { color: var(--pixel-green); border-bottom-color: var(--pixel-green); }
-/* 模式说明：标准=结构化入参走 Pipeline，高级=一句话走 Supervisor。
-   一行小字把「哪条更慢更不可控」写在用户点之前，免得名字把人骗去探索模式。 */
+/* 模式说明：标准=结构化入参走 Pipeline（一定出报告），对话=一句话经漏斗判意图（只有分析出报告）。
+   一行小字写在用户点之前，免得名字把人骗去不适合的形态。 */
 .pixel-mode-hint { color: var(--pixel-light); font-family: var(--pixel-mono); font-size: 13px; line-height: 1.6; margin: 0 0 16px; }
 .pixel-mode-hint::before { content: '\25B8 '; color: var(--pixel-green); }
 .pixel-mode-hint.pixel-text-amber::before { color: var(--pixel-amber); }
@@ -137,3 +137,33 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 
 /* —— Monitor Card Title —— */
 .pixel-card-title { font-family: var(--pixel-font); font-size: 11px; color: var(--pixel-light); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 2px solid var(--pixel-mid); }
+
+/* —— 对话模式（2026-10-27 D4）——
+   气泡不用圆角、不用阴影模糊，全部走 2px 硬边 —— 和整体像素风格一致；
+   .pixel-chat-log 固定高度 + 内部滚动，是为了发到第五句时输入框不会跑到屏幕外。 */
+.pixel-chat-log { display: flex; flex-direction: column; gap: 14px; max-height: 540px; min-height: 200px; overflow-y: auto; padding: 16px; margin-bottom: 14px; background: var(--pixel-black); box-shadow: 0 0 0 2px var(--pixel-mid); }
+.pixel-chat-row { display: flex; }
+.pixel-chat-row.user { justify-content: flex-end; }
+.pixel-chat-bubble { max-width: 78%; padding: 12px 16px; font-family: var(--pixel-mono); font-size: 15px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; box-shadow: 0 0 0 2px var(--pixel-mid); background: var(--pixel-dark); color: var(--pixel-white); }
+.pixel-chat-bubble.user { background: var(--pixel-green-dark); color: var(--pixel-green); box-shadow: 0 0 0 2px var(--pixel-green-dim); }
+.pixel-chat-bubble.err { color: var(--pixel-red); box-shadow: 0 0 0 2px var(--pixel-red); }
+.pixel-chat-meta { font-family: var(--pixel-font); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--pixel-light); margin-bottom: 8px; }
+.pixel-chat-items { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.pixel-chat-item { padding: 10px 12px; background: var(--pixel-black); box-shadow: 0 0 0 2px var(--pixel-mid); font-size: 14px; line-height: 1.6; cursor: pointer; transition: box-shadow 0.1s ease; }
+.pixel-chat-item:hover { box-shadow: 0 0 0 2px var(--pixel-green); }
+.pixel-chat-item-head { color: var(--pixel-white); }
+.pixel-chat-item-sub { color: var(--pixel-light); font-size: 13px; margin-top: 4px; }
+.pixel-chat-item-action { color: var(--pixel-green); font-size: 13px; margin-top: 6px; }
+.pixel-chat-src { display: block; color: var(--pixel-cyan); font-size: 13px; margin-top: 4px; word-break: break-all; }
+.pixel-chat-src:hover { color: var(--pixel-white); text-decoration: underline; }
+.pixel-chat-opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.pixel-chat-opt { border: none; border-radius: 0; background: transparent; color: var(--pixel-cyan); font-family: var(--pixel-mono); font-size: 14px; padding: 8px 14px; cursor: pointer; box-shadow: 0 0 0 2px var(--pixel-mid); transition: color 0.1s ease, background 0.1s ease, box-shadow 0.1s ease; }
+.pixel-chat-opt:hover { color: var(--pixel-black); background: var(--pixel-cyan); box-shadow: 0 0 0 2px var(--pixel-cyan); }
+.pixel-chat-empty { color: var(--pixel-light); font-family: var(--pixel-mono); font-size: 14px; line-height: 1.9; }
+.pixel-chat-empty p { margin: 0; }
+
+/* 会话条：一行提示 + 新对话（M1 多轮上线后加，避免用户永远困在同一个会话里） */
+.pixel-chat-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.pixel-chat-conv { font-family: var(--pixel-mono); font-size: 12px; letter-spacing: 1px; color: var(--pixel-light); }
+.pixel-chat-new { border: none; border-radius: 0; background: transparent; color: var(--pixel-cyan); font-family: var(--pixel-mono); font-size: 12px; letter-spacing: 1px; padding: 4px 10px; cursor: pointer; box-shadow: 0 0 0 2px var(--pixel-mid); }
+.pixel-chat-new:hover { color: var(--pixel-black); background: var(--pixel-cyan); box-shadow: 0 0 0 2px var(--pixel-cyan); }

@@ -247,6 +247,21 @@ class TaskRequest(BaseModel):
             raise ValueError("请提供 competitors+dimensions 或 query")
 
 
+class ChatRequest(BaseModel):
+    """对话入口请求体（2026-10-27）。
+
+    与 TaskRequest 的区别：TaskRequest 承诺"一定产出一份报告"，
+    ChatRequest 只承诺"处理这一句话"——可能是建任务、可能是一次查询、
+    也可能是一句澄清反问。所以 message 是自由文本，不预设结构。
+    """
+
+    message: str = Field(..., min_length=1, max_length=2000, description="一句话，可以是任意意图")
+    conversation_id: str | None = Field(
+        None,
+        description="多轮会话标识；为空则服务端新建一个并在响应的 conversation_id 里回传",
+    )
+
+
 class TaskResponse(BaseModel):
     """任务查询响应。"""
     task_id: str
@@ -461,76 +476,33 @@ def _get_pool(request: Request) -> Pool:
     return pool
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LLM 实体提取：从自然语言 query 提取 competitors + dimensions
-# ═════════════════════════════════════════════════════════════════════════════
-
-_ENTITY_EXTRACT_PROMPT = """从用户的竞品分析需求中提取结构化信息。
-
-输出格式（仅 JSON，无其他文字）：
-{"competitors": ["竞品名1", "竞品名2", ...], "dimensions": ["维度1", "维度2", ...]}
-
-规则：
-- competitors: 用户提到的竞品名称列表（产品/公司/品牌名），如果没有明确提到则返回 []
-- dimensions: 用户关心的分析维度列表（如"定价""功能""技术架构""市场"等），如果没提到也返回 []
-
-用户输入：%s
-JSON 输出："""
-
+# ── LLM 实体提取：从自然语言 query 提取 competitors + dimensions ──────────
+# ★ 2026-10-27（D1）：prompt 与解析器改由 intent_funnel 提供，两个入口共用。
+#   两份 prompt 必然漂移，同一个 query 在 /api/tasks 与 /api/chat 会抽出不同实体。
+#   /api/tasks 只关心实体，所以只取 competitors/dimensions，忽略 intent/keyword。
 
 async def _extract_entities_from_query(query: str, request: Request) -> dict:
     """用 LLM 从自然语言 query 中提取竞品名和维度。
 
-    【2026-07-29 新增】修复 routes.py 中"交给 IntentRouter 的 LLM 实体提取"
-    只有注释没有实现的问题。
-
-    Args:
-        query: 用户自然语言输入
-        request: FastAPI Request（用于获取 settings 中的 API key）
+    2026-07-29 修复：这里原先只有"交给 IntentRouter 的 LLM 实体提取"的注释、
+    没有实现，导致纯 query 请求抽出空实体、被路由进 supervisor 空转。
 
     Returns:
-        {"competitors": [str], "dimensions": [str]}
-        失败时返回 {"competitors": [], "dimensions": []}
+        {"competitors": [str], "dimensions": [str]}；失败时两项皆空。
     """
-    import json as _json
     from src.agents import create_llm_client
+    from src.supervisor.intent_funnel import (
+        INTENT_PROMPT,
+        normalize_entities,
+        parse_intent_json,
+    )
 
     try:
         settings = request.app.state.settings
         llm = create_llm_client(settings, temperature=0.0)
-        prompt = _ENTITY_EXTRACT_PROMPT % query
-        resp = await llm.ainvoke(prompt)
-        text = (resp.content or "").strip()
-
-        # 清理 markdown 代码块
-        if text.startswith("```"):
-            text = text[3:]
-            nl = text.find("\n")
-            if nl >= 0:
-                text = text[nl:].strip()
-            if text.endswith("```"):
-                text = text[:-3].strip()
-
-        # 提取 JSON 对象
-        brace_idx = text.find("{")
-        if brace_idx >= 0:
-            brace_end = text.rfind("}")
-            if brace_end > brace_idx:
-                text = text[brace_idx:brace_end + 1]
-
-        parsed = _json.loads(text)
-        competitors = parsed.get("competitors", []) or []
-        dimensions = parsed.get("dimensions", []) or []
-
-        # 类型防御：LLM 可能返回字符串而非列表
-        if isinstance(competitors, str):
-            competitors = [competitors]
-        if isinstance(dimensions, str):
-            dimensions = [dimensions]
-
-        # 过滤非法值
-        competitors = [c for c in competitors if isinstance(c, str) and c.strip()]
-        dimensions = [d for d in dimensions if isinstance(d, str) and d.strip()]
+        resp = await llm.ainvoke(INTENT_PROMPT % query)
+        data = parse_intent_json((resp.content or "").strip())
+        competitors, dimensions = normalize_entities(data)
 
         logger.info(
             "LLM 实体提取: query=%r → competitors=%s, dimensions=%s",
@@ -752,24 +724,38 @@ async def create_task(
     request: Request,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> JSONResponse:
-    """创建竞品分析任务（异步后台执行）。
+    """建任务入口 —— 只做限流，逻辑在 _create_task_impl。
 
-    【L4 工程】POST 返回 202 Accepted 而非 200 OK：
-      — 任务在后台异步执行，不等待完成
-      — 客户端拿到 task_id 后通过 GET /api/tasks/{id} 或 SSE 跟进
-
-    【L5 决策】限流顺序：
-      1. TokenBucket（入口 QPS）→ 329
-      2. 参数校验 → 400
-      3. 写入 DB → 202
-      4. asyncio.create_task() → 后台执行
+    ★ 限流为什么留在这里、不进 impl（2026-10-27）：
+      /api/chat 判出 analysis 后直接调 impl，而它自己已经 `tb.acquire()` 过一次。
+      若 impl 也扣令牌，对话路径就**双扣**：高并发下走对话的用户先撞 429、
+      走表单的不会。同一条链路两种限流待遇，是最难查的那类 bug。
     """
-    # ── Layer 1: 入口限流（token_bucket=None 时跳过，测试/开发环境兼容）──
     tb = request.app.state.token_bucket
     if tb is not None and not await tb.acquire():
         record_rate_limit_hit("global")
         raise HTTPException(429, "请求过多，请稍后重试")
+    return await _create_task_impl(body, request, current_user)
 
+
+async def _create_task_impl(
+    body: TaskRequest,
+    request: Request,
+    current_user: CurrentUser,
+    prefill: dict | None = None,
+) -> JSONResponse:
+    """真正建任务：校验 → 实体定稿 → 写库 → 后台起任务。
+
+    【L4 工程】返回 202 Accepted 而非 200：任务在后台异步跑，
+      客户端拿 task_id 后走 GET /api/tasks/{id} 或 SSE 跟进。
+
+    【L5 决策】校验顺序：参数校验 → 400 / 写库 → 202 / create_task() → 后台执行。
+
+    prefill: 调用方已用 LLM 抽好的实体（/api/chat 的 L3 结果）。
+      非空 ⇒ 不再抽第二次，只拿它补空缺字段。
+      ⚠️ 缺了这一步，同一句话在对话入口要付两次抽取：L3 一次、
+         "query 缺字段"分支再一次，还多烧 300~800ms。
+    """
     # ── Layer 2: 参数校验 ──
     # Pydantic model_post_init 已保证 competitors+dimensions 或 query 至少传一组；
     # 这里追加**业务级**校验：
@@ -789,11 +775,24 @@ async def create_task(
     if body.query:
         llm_parsed["query"] = body.query
 
-    # ── LLM 实体提取：有 query 但无 competitors/dimensions 时自动从自然语言提取 ──
-    # 【2026-07-29 BUG修复】之前注释写"交给 IntentRouter 的 LLM 实体提取"，
-    # 但代码从没实现这一步。导致 "对比王者荣耀和英雄联盟在玩法设计、美术风格上的表现"
-    # → competitors=[], dimensions=[] → classify → supervisor → "待探索" → 死循环。
-    if body.query and (not llm_parsed["competitors"] or not llm_parsed["dimensions"]):
+    # ── 实体定稿：有 prefill 就用它补缺，否则才调 LLM 抽取 ──
+    if prefill is not None:
+        # chat 路径：L3 已经抽过，这里绝不再抽（也绝不用空值覆盖已有值）
+        if not llm_parsed["competitors"]:
+            llm_parsed["competitors"] = _dedupe(list(prefill.get("competitors") or []))
+        if not llm_parsed["dimensions"]:
+            llm_parsed["dimensions"] = _dedupe(list(prefill.get("dimensions") or []))
+        llm_parsed["intent_is_clear"] = bool(
+            llm_parsed["competitors"] and llm_parsed["dimensions"]
+        )
+        # prefill 也可能一次带来超上限的实体（"对比 A B C D E F G"），同样 400 不截断
+        _reject_over_limit(
+            llm_parsed["competitors"], llm_parsed["dimensions"],
+            request.app.state.settings,
+        )
+    # 【2026-07-29 BUG修复】这段原先的注释写"交给 IntentRouter 的 LLM 实体提取"，
+    # 但代码从没实现，导致 "对比王者荣耀和英雄联盟…" → 实体全空 → supervisor 空转。
+    elif body.query and (not llm_parsed["competitors"] or not llm_parsed["dimensions"]):
         extracted = await _extract_entities_from_query(body.query, request)
         # 去重：LLM 抽取可能重复输出同一实体，静默归一，不让用户背锅
         if extracted["competitors"]:
@@ -823,12 +822,18 @@ async def create_task(
     task_id = UUID(uuid4().hex)
     task = _make_task_dict(task_id, body, current_user.user_id)
 
+    # ★ 写库用**定稿后**的实体，不是 body 原值（2026-10-27 修）。
+    #   query 模式下 body.competitors 是 None，实体全是 LLM 抽的；
+    #   以前这里写的是 body 副本 → tasks.competitors 恒为 [] →
+    #   lookup 的"按竞品筛选"永远查不到（实测 huayue 30 个历史任务全是空数组）。
+    #   执行侧不受影响（_execute_task 一直读 llm_parsed），
+    #   所以这个 bug **只脏查询层**：报告是对的，查不回来而已。
     await task_dao.create(
         task_id=str(task_id),
         user_id=current_user.user_id,
         title=body.title,
-        competitors=task["competitors"],
-        dimensions=task["dimensions"],
+        competitors=llm_parsed["competitors"],
+        dimensions=llm_parsed["dimensions"],
         pipeline_mode="pipeline",  # 初始值，IntentRouter 可能改为 supervisor
     )
     record_task_created()
@@ -840,6 +845,190 @@ async def create_task(
         status_code=202,
         content={"task_id": str(task_id), "status": "pending"},
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §5.5 路由 — POST /api/chat（意图识别漏斗入口，2026-10-27）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _title_from_message(message: str, limit: int = 60) -> str:
+    """从一句话里裁出任务标题。
+
+    ⚠️ 只做截断不做摘要——标题是给列表看的，再调一次 LLM 起标题
+    等于为一行文字付一次调用费。
+    """
+    text = " ".join((message or "").split())
+    return text[:limit] or "竞品分析"
+
+
+@app.post("/api/chat")
+async def chat(
+    body: ChatRequest,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> JSONResponse:
+    """对话入口：一句话进来，按漏斗判意图后分派到四条链路。
+
+    【与 POST /api/tasks 的分工】
+      /api/tasks 只承诺"建一个分析任务"，参数不合规就 400；
+      /api/chat 承诺"处理这句话"，所以它能把"查报告""查证据"这类
+      **不产出报告**的请求也接住 —— 这是加对话入口的全部理由。
+
+    【返回形态（前端按 type 分支渲染）】
+      type=task     202  {task_id, entities}      → 跳任务详情页
+      type=answer   200  {intent, summary, items} → 直接渲染气泡
+      type=clarify  200  {question, options}      → 渲染四个选项按钮
+      三者都带 conversation_id —— 前端存下来，下一轮带回即是多轮上下文。
+
+    【会话记忆（M1）】
+      写：每轮落两行（user + assistant），超过 6 轮后按 3 轮间隔刷新会话摘要；
+      读：最近 6 行原文 + 摘要 → 只喂 L3（见 intent_funnel.l3_llm 注释）。
+      写失败只记日志，不让对话 500。
+
+    【L5 决策】analysis 直接调用 create_task()，不复制一份建任务逻辑：
+    限流、去重、规模上限、无锚点校验、写库、后台起任务全在那一条链路里，
+    复制一份 = 以后每改一次校验都要改两处（必漏）。
+    """
+    import json as _json
+
+    tb = request.app.state.token_bucket
+    if tb is not None and not await tb.acquire():
+        record_rate_limit_hit("global")
+        raise HTTPException(429, "请求过多，请稍后重试")
+
+    settings = request.app.state.settings
+    from src.supervisor.conversation import (
+        ensure_conversation,
+        format_history_block,
+        load_context,
+        remember_turn,
+    )
+    from src.supervisor.intent_funnel import (
+        CLARIFY_CHOICES,
+        FUNNEL_OFF_QUESTION,
+        NO_ANCHOR_CHOICES,
+        NO_ANCHOR_QUESTION,
+        run_funnel,
+    )
+    from src.supervisor.query_handlers import (
+        check_freshness,
+        lookup_reports,
+        trace_evidence,
+    )
+
+    # ── 会话记忆：先拿到会话，再把历史拼给 L3 ──
+    #   没给 conversation_id → 新建；给了但查不到/不属于自己 → 统一 404
+    #   （不区分"不存在"与"没有权限"，否则等于告诉别人"这个 id 是真的"）
+    pool = _get_pool(request)
+    conversation = await ensure_conversation(
+        pool, current_user.user_id, body.conversation_id,
+        title=_title_from_message(body.message),
+    )
+    if conversation is None:
+        raise HTTPException(404, "会话不存在")
+
+    context = await load_context(pool, conversation)
+    history_block = format_history_block(context["summary"], context["turns"])
+
+    funnel = await run_funnel(
+        query=body.message, settings=settings, history_block=history_block
+    )
+    base = {"intent": funnel.intent, "layer": funnel.layer, "confidence": funnel.confidence}
+
+    async def finish(
+        status_code: int,
+        content: dict,
+        reply_text: str,
+        ref_task_id: str | None = None,
+    ) -> JSONResponse:
+        """落两行会话流水后返回 —— 四个分支都走这里，避免漏写某一路。
+
+        ⚠️ 落库在**返回之前**做、且失败只记日志（见 remember_turn），
+           顺序反了的话响应一旦发出，进程被杀就丢这一轮。
+        """
+        await remember_turn(
+            pool, conversation,
+            user_message=body.message,
+            intent=funnel.intent,
+            reply_text=reply_text,
+            ref_task_id=ref_task_id,
+            settings=settings,
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content={**content, "conversation_id": conversation["id"]},
+        )
+
+    # ── L4 澄清：不入库、不建任务，只回一句反问 ──
+    if funnel.intent == "unknown":
+        question = funnel.clarify or "能再说具体一点吗？"
+        return await finish(200, {
+            "type": "clarify",
+            **base,
+            "question": question,
+            "options": list(CLARIFY_CHOICES),
+            "echo": body.message,
+        }, f"（反问）{question}")
+
+    # ── analysis：复用 /api/tasks 的整条链路 ──
+    if funnel.intent == "analysis":
+        entities = funnel.entities or {}
+        # LLM 可能重复输出同一实体，先归一 —— 否则 _reject_duplicates 会把它当用户输入报 400
+        competitors = _dedupe(list(entities.get("competitors") or []))
+        dimensions = _dedupe(list(entities.get("dimensions") or []))
+
+        # ★ 判出"要分析"但一个锚点都没有：对话里该问一句，不该弹表单式 400。
+        #   与上面的 L4 澄清不是一回事 —— 这里知道要什么，只是缺参数，文案与选项都不同。
+        if not competitors and not dimensions:
+            question = (
+                FUNNEL_OFF_QUESTION if funnel.layer == "off" else NO_ANCHOR_QUESTION
+            )
+            return await finish(200, {
+                "type": "clarify",
+                **base,
+                "question": question,
+                "options": list(NO_ANCHOR_CHOICES),
+                "echo": body.message,
+            }, f"（反问）{question}")
+
+        task_body = TaskRequest(
+            title=_title_from_message(body.message),
+            competitors=competitors or None,
+            dimensions=dimensions or None,
+            query=body.message,
+        )
+        # ★ 带 prefill 进 impl：L3 已经付过的那次抽取不许再付一次
+        resp = await _create_task_impl(
+            task_body, request, current_user,
+            prefill={"competitors": competitors, "dimensions": dimensions},
+        )
+        payload = _json.loads(resp.body.decode())
+        task_id = payload.get("task_id")
+        return await finish(202, {
+            "type": "task",
+            **base,
+            "task_id": task_id,
+            "entities": {"competitors": competitors, "dimensions": dimensions},
+            "echo": body.message,
+        }, f"已开始分析：{'、'.join(competitors) or '（未指定竞品）'}", ref_task_id=task_id)
+
+    # ── lookup / trace / verify：零 LLM 的 SQL 执行器 ──
+    competitors = funnel.entities.get("competitors") or None
+
+    if funnel.intent == "lookup":
+        data = await lookup_reports(pool, current_user.user_id, competitors)
+    elif funnel.intent == "trace":
+        data = await trace_evidence(pool, current_user.user_id, competitors, funnel.keyword)
+    else:
+        data = await check_freshness(pool, current_user.user_id, competitors, funnel.keyword)
+
+    return await finish(200, {
+        "type": "answer",
+        **base,
+        "summary": data["summary"],
+        "items": data["items"],
+        "echo": body.message,
+    }, data["summary"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
