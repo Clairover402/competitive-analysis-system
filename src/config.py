@@ -73,6 +73,21 @@ class Settings(BaseSettings):
     max_competitors: int = 4
     max_dimensions: int = 4
 
+    # ---- 意图识别分层漏斗（2026-10-27，L1 确定性 → L2 语义 → L3 LLM → L4 澄清）----
+    # 【为什么阈值必须可配】floor / margin 是**经验值**，换语料就飘：
+    #   floor 太低 → 域外问题被硬塞进某个意图；太高 → 全部下沉，L2 白付 embedding。
+    #   上线前用 `intent_funnel.calibrate()` 在自己语料上扫一遍再定，别直接抄默认。
+    # 【2026-10-27 实测标定，10 句 4 类】margin 是**唯一能把两组分开**的判据：
+    #   应接受组 gap = 0.124 / 0.188 / 0.247 / 0.318 / 0.318（最小 0.124）
+    #   应下沉组 gap = 0.051 / 0.052 / 0.062 / 0.067 / 0.074（最大 0.074）
+    #   → 取 0.10 落在空档正中；原来的 0.03 会让"这东西怎么样"以 gap=0.067 蒙过 L2，
+    #     被判成 verify 并答"没有可核对的事实记录"——**回答看着合理，实际是错接受**。
+    # ⚠️ floor 分不开这两组（应下沉组的 top1 最高到 0.915，"飞书和钉钉谁更好"），
+    #   它只能粗筛掉明显无关句，别指望它做精度。所以 0.55 只是第二道门。
+    intent_funnel_enabled: bool = True
+    intent_funnel_floor: float = 0.55
+    intent_funnel_margin: float = 0.10
+
     # ---- RAGAS 评估运行参数（ragas_core 唯一口径，构造见 llm_factory）----
     # 【2026-10-16 新增】主因是一次实测事故：`钉钉@功能` 的 context_precision
     #   恒为 NaN，日志只有一行 `Job[12]: TimeoutError()`。
