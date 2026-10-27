@@ -20,6 +20,7 @@ CACHEDIR.TAG
 .lock
 .DS_Store
 Thumbs.db
+tests/
 
 # 前端
 frontend/node_modules/
