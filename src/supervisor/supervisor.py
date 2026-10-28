@@ -54,8 +54,8 @@ Supervisor 是竞品分析系统的"探索模式控制器"。
               _make_node_observe(summarizer, ...) → node_observe
 
   闭包工厂的优势:
-  — 依赖精确到节点: think 持有 LLM+router+retrieval+memory，act 只持有 router
-  — 最小权限: 节点函数看不到不需要的依赖（act 不需要 retrieval_strategy）
+  — 依赖精确到节点: think 持有 LLM+router，act 只持有 router
+  — 最小权限: 节点函数看不到不需要的依赖（act 不需要 memory_engine）
   — 可测试: 单元测试只想测 think → 只创建 node_think，不构建完整图
 
 
@@ -79,10 +79,11 @@ Supervisor 是竞品分析系统的"探索模式控制器"。
     后每个节点自动持久化 + 同一 thread_id 自动断点续传。
 
   决策 2: 闭包工厂 → DI 注入
-    每节点只持有必要的依赖，act 不需要 retrieval_strategy，observe 不需要 router。
+    每节点只持有必要的依赖，act 不需要 memory_engine，observe 不需要 router。
 
-  决策 3: 长期记忆永不阻塞
-    think 前检索（同步，必须等结果）→ observe 后写入（异步，不阻塞下一轮）。
+  决策 3: 长期记忆只写不读
+    写入发生在 observe 之后（异步，不阻塞下一轮）；think 不再检索记忆。
+    读取长期记忆是 verify 意图的事，靠 subject 精确键，不走向量、不进 prompt。
 
   决策 4: 假阴代价 > 假阳 → 每次 think 都注入 Top 5 记忆
     不让 LLM 决定"要不要查记忆"，每次都传，LLM 自己判断相关性。
@@ -115,7 +116,6 @@ if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
     from src.mcp.server import MCPServer
     from src.memory.summarizer import MemorySummarizer
-    from src.memory.retrieval import MemoryRetrievalStrategy
     from src.memory.long_term import LongTermMemoryEngine
 
 logger = logging.getLogger(__name__)
@@ -148,9 +148,6 @@ _SUPERVISOR_SKELETON = (
 
     "## 历史推理轨迹（最近3轮）\n"
     "{reasoning_trace}\n\n"               # ← state.reasoning_trace[-3:]
-
-    "## 长期记忆上下文\n"
-    "{memory_context}\n\n"                # ← MemoryRetrievalStrategy Top 5
 
     "## 输出格式\n"
     "请以 JSON 格式输出下一步决策：\n"
@@ -307,7 +304,6 @@ def _extract_json(text: str) -> dict | None:
 def _make_node_think(
     llm: ChatDeepSeek,
     router: A2ARouter,
-    retrieval_strategy: MemoryRetrievalStrategy | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
     log_dao: AgentLogDAO | None = None,
 ):
@@ -317,27 +313,31 @@ def _make_node_think(
     ────────────────────────────────
     外层函数 _make_node_think 是"工厂"，接收依赖 → 内层函数 node_think 是"产品"，
     持有工厂注入的依赖。LangGraph 调 node_think(state) 时，内部直接用闭包捕获的
-    llm/router/retrieval/memory_engine。
+    llm/router/memory_engine。
 
     调用链: build_supervisor_graph(顶层) → _make_node_think(llm, router, ...)
             → 返回 node_think(state) → LangGraph 每轮调 node_think(state)
 
-    think 节点的 4 步执行流程:
+    【2026-10-28 移除长期记忆检索】这里曾有一个「检索 Top 5 条记忆拼进 prompt」
+    的步骤（MemoryRetrievalStrategy.retrieve_if_needed）。删掉的理由是它从来没有
+    真正接过线：build_supervisor_graph 一直只传 4 个参数，retrieval_strategy 恒为
+    None，那段代码在任何一次线上请求里都没执行过。而"给 supervisor 注入历史结论"
+    本身也是错的方向 —— 决策靠当前进度，不靠三个月前的结论。
+
+    think 节点的 3 步执行流程:
     ┌─────┬────────────────────────────┬──────────────────────────────────┐
     │ 步骤 │ 做什么                     │ 产出                             │
     ├─────┼────────────────────────────┼──────────────────────────────────┤
     │  ①  │ 构建进度描述 + 读轨迹      │ progress 文本 + trace_text        │
-    │  ②  │ 长期记忆检索               │ memory_context（Top 5 条记忆）     │
-    │  ③  │ 拼装 Prompt + LLM 调用     │ LLM 响应文本                      │
-    │  ④  │ JSON 解析（2 次重试）      │ pending_decision / reasoning_trace │
+    │  ②  │ 拼装 Prompt + LLM 调用     │ LLM 响应文本                      │
+    │  ③  │ JSON 解析（2 次重试）      │ pending_decision / reasoning_trace │
     │     │                            │ is_complete / final_output        │
     └─────┴────────────────────────────┴──────────────────────────────────┘
 
     Args:
         llm: Supervisor 专用 ChatDeepSeek（temperature=0.3）
         router: A2ARouter（提供 list_capabilities() 给 Prompt）
-        retrieval_strategy: 可选长期记忆检索策略
-        memory_engine: 可选长期记忆引擎
+        memory_engine: 可选长期记忆引擎（本节点不读记忆，保留参数供后续写入路径共用）
 
     Returns:
         async def node_think(state: SupervisorState) -> dict: 满足 LangGraph
@@ -390,30 +390,7 @@ def _make_node_think(
         if not trace_text:
             trace_text = "（尚无推理记录）"
 
-        # ─── 步骤②: 长期记忆检索 ───
-        memory_context = ""
-        if retrieval_strategy is not None and memory_engine is not None:
-            try:
-                user_query = state.get("user_query", "")
-                memories = await retrieval_strategy.retrieve_if_needed(
-                    user_id=state["user_id"],
-                    message=user_query,
-                    engine=memory_engine,
-                )
-                if memories:
-                    memory_parts = []
-                    for m in memories[:5]:
-                        memory_parts.append(
-                            f"- [{m.get('type', '?')}] {m.get('content', '')}"
-                        )
-                    memory_context = "\n".join(memory_parts)
-                    logger.info("长期记忆检索: %d 条", len(memory_parts))
-            except Exception:
-                logger.exception("长期记忆检索失败，继续执行")
-        if not memory_context:
-            memory_context = "（无相关长期记忆）"
-
-        # ─── 步骤③: 拼装 Prompt + LLM 调用 ───
+        # ─── 步骤②: 拼装 Prompt + LLM 调用 ───
         dimensions = state.get("dimensions", [])
         competitors = state.get("found_competitors", [])
         prompt = _SUPERVISOR_SKELETON.format(
@@ -425,10 +402,9 @@ def _make_node_think(
             competitors_list=", ".join(competitors) if competitors else "（待探索）",
             progress=progress,
             reasoning_trace=trace_text,
-            memory_context=memory_context,
         )
 
-        # ─── 步骤④: LLM 调用 + JSON 解析（最多 2 次） ───
+        # ─── 步骤③: LLM 调用 + JSON 解析（最多 2 次） ───
         for attempt in range(2):
             try:
                 response = await llm.ainvoke(prompt)
@@ -1036,7 +1012,6 @@ async def build_supervisor_graph(
     router: A2ARouter,
     llm_supervisor: ChatDeepSeek,
     summarizer: MemorySummarizer | None = None,
-    retrieval_strategy: MemoryRetrievalStrategy | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
 ) -> CompiledStateGraph:
     """构建并编译 Supervisor StateGraph — 外部调用此函数获取可执行图。
@@ -1078,7 +1053,6 @@ async def build_supervisor_graph(
         router: A2A 路由器（已注册 4 个 Agent 的卡片+handler+LLM）
         llm_supervisor: Supervisor 专用 LLM（temperature=0.3，决策探索性）
         summarizer: 可选摘要记忆器
-        retrieval_strategy: 可选长期记忆检索策略
         memory_engine: 可选长期记忆引擎
 
     Returns:
@@ -1094,7 +1068,10 @@ async def build_supervisor_graph(
     # （前端 SSE 轮询这张表 → 实时看到"调度决策"），消除"步骤间等待"盲区。
     log_dao = AgentLogDAO(pool)
     node_think = _make_node_think(
-        llm_supervisor, router, retrieval_strategy, memory_engine, log_dao
+        llm=llm_supervisor,
+        router=router,
+        memory_engine=memory_engine,
+        log_dao=log_dao,
     )
     node_act = _make_node_act(router, log_dao)
     node_observe = _make_node_observe(summarizer, memory_engine, log_dao)
@@ -1141,7 +1118,6 @@ async def run_supervisor_task(
     router: A2ARouter,
     llm_supervisor: ChatDeepSeek,
     summarizer: MemorySummarizer | None = None,
-    retrieval_strategy: MemoryRetrievalStrategy | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
 ) -> dict:
     """运行 Supervisor 模式竞品分析——外部调用的一键入口。
@@ -1178,7 +1154,6 @@ async def run_supervisor_task(
         router: A2A 路由器（已注册 4 Agent）
         llm_supervisor: Supervisor 专用 LLM
         summarizer: 可选
-        retrieval_strategy: 可选
         memory_engine: 可选
 
     Returns:
@@ -1196,7 +1171,6 @@ async def run_supervisor_task(
         router=router,
         llm_supervisor=llm_supervisor,
         summarizer=summarizer,
-        retrieval_strategy=retrieval_strategy,
         memory_engine=memory_engine,
     )
 

@@ -26,15 +26,13 @@
   如果调用方直接 import 子模块:
     from src.memory.long_term import LongTermMemoryEngine
     from src.memory.summarizer import MemorySummarizer
-    from src.memory.retrieval import MemoryRetrievalStrategy
 
   通过 __init__.py 聚合:
     from src.memory import (
         LongTermMemoryEngine,
         MemorySummarizer,
-        MemoryRetrievalStrategy,
     )
-  效果: 5 行 → 4 行（差距不大），但关键是调用方不需要知道"LongTermMemoryEngine 在哪个文件"。
+  效果: 行数差不多，但关键是调用方不需要知道"LongTermMemoryEngine 在哪个文件"。
   就像你去餐厅点菜不需要知道每道菜在哪个厨房做——__init__.py 是菜单。
 
   这种模式叫 Facade Pattern（门面模式）的直接应用。
@@ -56,16 +54,24 @@
                           【L5 架构 — 记忆模块在系统中的位置】
 ═══════════════════════════════════════════════════════════════════════════════
 
-记忆模块是竞品分析系统的"知识底座"。它存在于两个层面：
+记忆模块是竞品分析系统的"知识底座"。它现在只有两条真实通路：
 
-  层面1（当前）: Pipeline 集成
-    analyze 节点: LongTermMemoryEngine.retrieve() → 检索历史记忆 → 注入 prompt
-    finalize 节点: LongTermMemoryEngine.add_memory() → 提取本次关键决策 → 持久化
+  写: observe 节点之后 → write_task_facts() → LongTermMemoryEngine.add_memory()
+      事实来自 evidence_map（有 URL），不来自报告正文 —— 正文里的句子没有来源，
+      把"模型说过的话"升格成"观测到的事实"，之后就再也查不回来了。
 
-  层面2（Phase 7）: Supervisor 集成
-    MemorySummarizer 激活 — ReAct 循环提供对话轮次
-    MemoryRetrievalStrategy 扩能 — 增加轮次间隔条件
-    MemoryConflictResolver 前移 — 从任务结束后批处理 → 实时检测
+  读: verify 意图 → check_freshness() → 按 subject 精确键取 content
+      **不走向量**。表里有 vector(1024)，不等于这次查询该用向量 —— 判据永远是
+      "这次要找的是同一个键，还是相似的东西"。向量只服务写入时的取代判定
+      （同 subject 余弦 ≥0.90）。
+
+【2026-10-28 删除的内容】
+  原 `retrieval.py` 的 MemoryRetrievalStrategy（混合触发：关键词预检 + LLM 兜底）
+  与 `LongTermMemoryEngine.retrieve()`（五步检索流水线）一并删除。
+  它们在生产路径上从未接过线（build_supervisor_graph 一直只传 4 个参数，
+  retrieval_strategy 恒为 None），而且方向本身是错的：读取要靠键，不靠召回。
+  删掉比留着"以后可能用"干净 —— 留一个没人调用的向量检索实现，
+  只会让后来人以为读取真的走向量。
 
 当前代码的两层设计:
   — Summarizer 已写但不集成（留给 Supervisor）
@@ -79,7 +85,6 @@
     from src.memory import (
         MemorySummarizer,
         LongTermMemoryEngine,
-        MemoryRetrievalStrategy,
         MemoryConflictResolver,
         MemoryForgetting,
     )
@@ -90,16 +95,14 @@ from __future__ import annotations
 # 【L3】子模块导入 — 每种记忆能力封装在独立文件中
 from src.memory.summarizer import MemorySummarizer
 from src.memory.long_term import LongTermMemoryEngine
-from src.memory.retrieval import MemoryRetrievalStrategy
 from src.memory.conflict import MemoryConflictResolver
 from src.memory.forgetting import MemoryForgetting
 
-# 【L3】__all__ 白名单 — from src.memory import * 只导出这 5 个公开类
+# 【L3】__all__ 白名单 — from src.memory import * 只导出这 4 个公开类
 # 不导出内部工具函数、私有 helper、DAO 层。调用方只看到 API 面。
 __all__ = [
     "MemorySummarizer",
     "LongTermMemoryEngine",
-    "MemoryRetrievalStrategy",
     "MemoryConflictResolver",
     "MemoryForgetting",
 ]

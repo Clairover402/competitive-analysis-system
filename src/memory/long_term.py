@@ -1,138 +1,50 @@
-"""LongTermMemoryEngine — 五步混合检索引擎 + 记忆写入。
+"""LongTermMemoryEngine — 长期记忆的写入端（检索端已删除）。
 
 ═══════════════════════════════════════════════════════════════════════════════
-                          【L3 核心考点索引】
+                       【2026-10-28 删除检索端】
 ═══════════════════════════════════════════════════════════════════════════════
 
-  §1 五步检索流水线: 重写 → 混合检索 → RRF 融合 → 元数据过滤 → 精排
-  §2 RRF（Reciprocal Rank Fusion）: 排名融合解决跨检索器分数不可比问题
-  §3 三因子加权排序: 语义相似度 + 重要性 + 时间衰减，SQL 层一次完成
-  §4 检索精度分层: Bi-encoder 粗排（召回） → Cross-encoder 精排（精准）
+这里曾有 200 行「五步混合检索流水线」（Query 重写 → 向量/关键词双路 →
+RRF 融合 → 元数据过滤 → Cross-encoder 精排）和 60 行 `_rrf_fusion`。
+连同 `src/memory/retrieval.py` 的 MemoryRetrievalStrategy 一起删了。
 
+理由不是"用不上所以砍掉"，是**方向错了**：
 
-═══════════════════════════════════════════════════════════════════════════════
-                     【L4 工程 — 五步检索全链路详解】
-═══════════════════════════════════════════════════════════════════════════════
+  · 生产路径从未接过线 —— `build_supervisor_graph` 一直只传 4 个参数，
+    retrieval_strategy 恒为 None，`retrieve_if_needed` 在任何一次线上请求里
+    都没执行过。它一直是死代码，只是没人注意。
 
-Step 1: Query 重写（LLM 泛化 + 去口语化）
-  ──────────────────────────────────────
-  输入: "飞书上次调查的那个定价是不是改了"
-  输出: "飞书 定价变化"
-  原理: LLM 去掉填充词（"上次调查的那个"/"是不是"）→ 提取关键词组合
-  价值: 口语化 query 直接做向量检索 → embedding 模型被干扰 → 召回质量下降
-  重写后 query 更"像"训练数据中的搜索查询 → embedding 质量 ↑
+  · 即便接上也会答错 —— 用户问「飞书定价现在多少」，要的是
+    subject = '飞书·定价' 这一个键；语义召回给的是"看起来像"的 60 条，
+    同竞品同维度没有任何保证，取回来还得按 subject 再过滤一遍。
+    那不如一开始就按 subject 查。`WHERE content ILIKE '%定价%'` 也不行 ——
+    对比句「与飞书相比，钉钉…」会被串到别的竞品头上。
 
-  fallback: LLM 重写失败 → 返回原始 query（不失功能，仅降精度）
+  · **读取靠键，写入靠向量** —— 表里有 vector(1024) 是真的在用，但它服务的是
+    写入时的取代判定（同 subject 余弦 ≥0.90 → 旧观测退出 active），不是读取。
+    把这个区别写进代码，比留一套没人调用的检索实现诚实。
 
-Step 2: 混合检索（双路并行）
-  ──────────────────────────
-  路 A: Bi-encoder 向量检索（BGE-M3 1024 维）
-    — 将重写后 query → embed → pgvector <=> 余弦距离算子
-    — top_k=60 → 返回最相似的 60 条记忆
-    — 优点: 语义层面匹配（"定价" 能匹配 "收费"/"费用" 等近义词）
-    — 限制: 对精确术语和数字的匹配一般
-
-  路 B: 关键词检索（zhparser 分词 + pg_bigm N-gram）
-    — zhparser 中文分词 → to_tsvector('zhparse', content)
-    — 纯文本匹配: "飞书 定价" 只返回包含这两个词的内容
-    — top_k=30 → 返回匹配度最高的 30 条
-    — 优点: 精确匹配产品名/品牌/数字等
-    — 限制: "飞书多少钱" 和 "飞书定价" 不匹配（词不同）
-
-  双路并行的原因: 语义检索和精确检索是互补的——
-    向量能召回 "定价策略" 但可能漏掉 "飞书2025Q1定价更新"（精确术语）
-    关键词能命中 "飞书" 和 "定价" 但召回不了 "飞书收费模式"（词不同但语义相近）
-
-Step 3: RRF 融合（排名级融合）
-  ──────────────────────────────
-  问题: 向量检索和关键词检索的分数不可比
-    向量: 余弦相似度 0.95（范围 0~1）
-    关键词: pg_bigm 匹配度 4.2（无固定范围）
-  直接用分数加权 → 关键词会碾压或完全被忽略
-
-  RRF 解法: 用排名代替分数
-    RRF(doc) = Σ 1/(k + rank_i)
-    k=60: 来自 Cormack 2009 原论文，使头部权重平滑
-    效果: rank#1 和 rank#2 的 RRF 差距仅 ~1.02 倍
-
-  RRF 对不对称召回的处理:
-    向量返回 60 条，关键词返回 30 条
-    → 关键词没返回的 doc 在关键词路的 RRF 得分 = 0
-    → 不影响向量路的排名
-    这就是 RRF 的优雅之处——不要求两个检索器返回同样数量的结果
-
-  RRF 融合后取前 60 条 doc
-
-Step 4: 元数据过滤（SQL 层）
-  ─────────────────────────
-  在 similarity_search 和 keyword_search 的 SQL 中已加入:
-    WHERE is_active = true             — 排除已归档/删除的记忆
-    AND user_id = $1                    — 多用户隔离
-  不需要 Python 层再过滤——DB 层已经做了。
-
-Step 5: Cross-encoder 精排
-  ─────────────────────────
-  将 RRF 融合后的 Top 60 → query + document 拼接 → Cross-encoder 模型
-  → 重新排序 → 取 Top K（默认 10）
-  
-  Cross-encoder vs Bi-encoder 的本质区别:
-  ┌─────────────────┬──────────────────────┬──────────────────────┐
-  │                 │ Bi-encoder（粗排）     │ Cross-encoder（精排） │
-  ├─────────────────┼──────────────────────┼──────────────────────┤
-  │ 输入            │ query 和 doc 分别编码   │ query + doc 拼接编码 │
-  │ query-doc 交互  │ 无（独立编码后算余弦）   │ 有（Attention 跨句） │
-  │ 速度            │ 快（doc 可预计算缓存）   │ 慢（每次新 query 重算）│
-  │ 精度            │ 中                      │ 高                   │
-  │ 适用            │ 大规模候选（>1000 条）    │ 小规模精排（<100 条） │
-  └─────────────────┴──────────────────────┴──────────────────────┘
-  
-  为什么不在 Step 2 中用 Cross-encoder 检索全部？
-  全量 Cross-encoder: 1000 条 × 每条拼接编码 → 不可行（太慢 + 太贵）
-  分层策略: Bi-encoder 快速捞 Top 60 → Cross-encoder 精准排 Top 10
-  这就是"粗排 + 精排"的工程精髓——不追求一步到位，分两层逼近最优。
-
+删掉的知识点没丢（RRF 为什么用排名不用分数、粗排/精排为什么分两层），
+但它们属于"做过的方案"，不属于"现在跑的代码"。代码里留一份不存在的实现，
+只会让后来人以为读取真的走向量。
 
 ═══════════════════════════════════════════════════════════════════════════════
-               【L5 架构 — 三因子加权排序公式】
+                       【L3 核心概念 — 三因子加权排序】
 ═══════════════════════════════════════════════════════════════════════════════
 
-三条记忆，同一次检索:
+score = 0.6 × 语义相似度 + 0.3 × 重要性 + 0.1 × 时间衰减
 
-  记忆 A: "飞书企业版 ¥200/人/月"（创建 3 天前，importance=0.7，相似度=0.94）
-  记忆 B: "飞书企业版 ¥180/人/月"（创建 30 天前，importance=0.8，相似度=0.89）
-  记忆 C: "飞书标准版免费"（创建 90 天前，importance=0.5，相似度=0.72）
+为什么从乘法改为加法？
+  — 乘法: 任一因子接近 0 就整条淘汰。sim=0.95 × imp=0.9 × decay=0.25 = 0.21，
+    一条半年前的 decision 极其相关却被淘汰。
+  — 加法: 三因子独立贡献，不互相钳制。同一条记忆 = 0.87，排序正常。
 
-按原始相似度排序: A(0.94) > B(0.89) > C(0.72)
+为什么相似度权重最大（0.6）？"找到最相关的内容"是检索的本义；
+重要性 0.3 用来抬 memory_type 的影响；时间 0.1 只做轻微调节 ——
+旧但重要的记忆不该被过度打压。
 
-加入三因子加权后:
-  记忆 A: 0.6×0.94 + 0.3×0.7 + 0.1×0.5^(3/90) = 0.564+0.21+0.098 = 0.872
-  记忆 B: 0.6×0.89 + 0.3×0.8 + 0.1×0.5^(30/90) = 0.534+0.24+0.077 = 0.851
-  记忆 C: 0.6×0.72 + 0.3×0.5 + 0.1×0.5^(90/90) = 0.432+0.15+0.05 = 0.632
-
-最终排序: A(0.872) > B(0.851) > C(0.632)
-
-记忆 A(0.872) 仍排第一（相似度 0.94 主导 60% 权重），但记忆 B(0.851)
-凭借更高的 importance(0.8 vs 0.7) 大幅缩小差距。
-对比乘法公式：A=0.614 vs B=0.356（差距 0.258，A 是 B 的 1.72 倍），
-加法公式：A=0.872 vs B=0.853（差距 0.019，几乎平手）。
-这才是正确行为——两条高相关近期记忆不应因 importance 微小差异被拉大差距。
-
-为什么是 (0.6, 0.3, 0.1) 的权重分配？
-  — 相似度 60%: 检索的核心是"找到最相关的内容"，因此权重最大（与旧版一致）
-  — 重要性 30%: 从 20% 提升至 30%，加强 memory_type 对排序的影响
-  — 时间 10%: 从 20% 降至 10%，减弱时间衰减的影响——旧但重要的记忆不再被过度打压
-
-  为什么从乘法改为加法？
-  — 乘法的问题: 任一因子接近 0 时整条记忆直接被淘汰
-    例: sim=0.95 脳 imp=0.9 脳 decay=0.25 = 0.21（半年前的 decision，极其相关但被淘汰）
-  — 加法的优势: 三因子独立贡献，不互相钳制
-    例: 0.6脳0.95 + 0.3脳0.9 + 0.1脳0.25 = 0.87（同一条记忆，加法下排名正常）
-
-SQL 层排序的优势:
-  — 一次查询到结果，不在 Python 和 DB 之间来回传数据
-  — PostgreSQL 的 ORDER BY 表达式可以包含算术运算、函数调用
-  — 不需要把 100 条结果取到 Python、算加权分、再排序——这些在 DB 里全做完
-
+⚠️ 这段排序现在跑在 SQL 里（`AgentMemoryDAO.similarity_search` 的 ORDER BY），
+   不在这个类里。本类只剩**写入**。
 
 ═══════════════════════════════════════════════════════════════════════════════
                【L5 架构 — add_memory 的冲突检测流水线】
@@ -140,15 +52,12 @@ SQL 层排序的优势:
 
 写入一条新记忆时:
   1. 映射 importance + half_life（从 _IMPORTANCE_MAP 查类型默认值）
-  2. embed(content) → 1024 维向量
-  3. 如果有 conflict_resolver → detect_conflict → resolve → soft_delete
+  2. embed(content) → 1024 维向量（失败不阻塞写入，存 NULL）
+  3. 有 conflict_resolver → detect_conflict → resolve → soft_delete
   4. 插入 agent_memories（含 embedding + importance + half_life_days）
 
-冲突检测的可选性:
-  — 有 conflict_resolver → 写入前做冲突检测（标准流程）
-  — conflict_resolver=None → 直接插入（不检测冲突，更快但可能有重复记忆）
-  可选让 Pipeline 和单测用例可以复用同一个 engine——Pipeline 传 resolver，
-  单测不传（避免 mock 额外的依赖）。
+冲突检测可选：传 resolver 走标准流程；不传直接插入（更快，可能有重复），
+好处是 Pipeline 与单测能复用同一个 engine，单测不必 mock 额外依赖。
 """
 
 from __future__ import annotations
@@ -158,23 +67,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from src.db.dao import AgentMemoryDAO
-from src.mcp.tools_rag import embed_query, rerank
+from src.mcp.tools_rag import embed_query
 
 if TYPE_CHECKING:
     from langchain_deepseek import ChatDeepSeek
     from src.memory.conflict import MemoryConflictResolver
 
 logger = logging.getLogger(__name__)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LLM Prompt — Query 重写
-# ══════════════════════════════════════════════════════════════════════════════
-
-_REWRITE_PROMPT = """你是查询改写器。将口语化问题转化为关键词检索查询。
-
-用户问题: %s
-
-只返回改写后的检索关键词（不要其他文字）。去掉填充词和口语化表达。"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 记忆类型 → (默认 importance, 默认 half_life_days)
@@ -209,93 +108,24 @@ def importance_for(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RRF（Reciprocal Rank Fusion）— 排名级跨检索器融合
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _rrf_fusion(
-    vec_results: list[dict],
-    kw_results: list[dict],
-    k: int = 60,
-) -> list[dict]:
-    """双向检索结果 RRF 融合: RRF(doc) = Σ 1/(k + rank_i)。
-
-    【L3 核心考点】RRF 的三个核心问题
-
-    问题 1: 为什么不能用分数直接加权？
-    ─────────────────────────────
-      向量检索分数: 余弦相似度 0.0 ~ 1.0（有界）
-      关键词检索分数: pg_bigm 匹配度 0 ~ ∞（无界）
-      两个尺度完全不同 → 直接 0.6×vec + 0.4×kw → 关键词可能碾压一切
-
-    问题 2: 为什么用排名而不是分数？
-    ─────────────────────────────
-      "排名" 是统一尺度——向量检索的 #1 和关键词检索的 #1 都是 #1。
-      不关心分数大不大，只关心谁排前面。
-
-    问题 3: k=60 的作用？
-    ──────────────────
-      RRF 公式: 1/(k + rank)
-      k=0:  rank#1=1.0, rank#2=0.5, rank#3=0.33 → 头部极陡
-      k=60: rank#1≈0.0164, rank#2≈0.0161, rank#3≈0.0159 → 头部平滑
-      大 k 使排名差异的影响变小——不会因为某个检索器把 A 排第一、
-      另一个把 A 排第五而导致 A 直接掉出 Top 10。
-
-    【L4 工程】去重键为什么用 content[:80]？
-    ──────────────────────────────────────
-      不能用 memory_id 去重——两条不同检索器返回的同一 doc 有不同 ID。
-      content[:80] 是一个"近似文档指纹"——前面 80 个字符几乎不可能
-      出现在两篇不相关的文档中。长了浪费内存，短了可能碰撞。
-
-    实现细节:
-      — 两个检索器各贡献一轮 1/(k+rank) 加分
-      — 同一文档在两边都出现 → 两次加分累加 → 排名提升
-      — 只在关键词路出现（不在向量路）→ RRF = 1/(k+rank_kw)（正常，不被惩罚）
-    """
-    # ── 向量路贡献 ──
-    rrf_scores: dict[str, float] = {}
-    rrf_docs: dict[str, dict] = {}
-
-    for rank, doc in enumerate(vec_results):
-        doc_id = doc.get("content", "")[:80]
-        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-        rrf_docs[doc_id] = doc
-
-    # ── 关键词路贡献 ──
-    for rank, doc in enumerate(kw_results):
-        doc_id = doc.get("content", "")[:80]
-        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-        if doc_id not in rrf_docs:
-            rrf_docs[doc_id] = doc
-
-    # ── 按 RRF 分数降序排列，取前 k 条 ──
-    merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    return [rrf_docs[doc_id] for doc_id, _ in merged[:k]]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # LongTermMemoryEngine — 五步检索引擎
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LongTermMemoryEngine:
-    """长期记忆检索引擎——五步流水线 + 记忆写入。
+    """长期记忆写入引擎——事实提炼结果落库、取代判定、冲突消解。
 
-    【L3 核心概念】五步流水线
-    ──────────────────────
-    Step 1: Query 重写 — LLM 去口语化 + 提取关键词
-    Step 2: 混合检索 — Bi-encoder 向量(top_k=60) + pg_bigm 关键词(top_k=30)
-    Step 3: RRF 融合 — 排名级双路合并，取前 60
-    Step 4: 元数据过滤 — SQL 层 WHERE is_active + user_id（已在 DAO 中）
-    Step 5: Cross-encoder 精排 — top_k 条精准排序
+    【职责边界】只写不读。
+      — 写：semantic.write_task_facts() 把 evidence_map 里的事实升格成
+        agent_memories 一行（带 embedding、importance、half_life_days）。
+      — 读：不在这里。verify 走 subject 精确键（见 query_handlers.check_freshness），
+        lookup 走 source_task_id。两者都不碰 embedding。
 
-    【L3 核心概念】精度分层（Two-Stage Retrieval）
-    ─────────────────────────────────────────
-      粗排（Step 2-3）: Bi-encoder → 高召回低精度，海量文档中快速筛选
-      精排（Step 5）: Cross-encoder → 高精度低速度，少量候选精准排序
-      两层合起来: 既不掉召回（粗排覆盖全），又不失精度（精排筛精准）
+    【取代判定为什么用向量】同一个 subject（如「飞书·定价」）可能有新旧两条观测，
+    判断"新的是不是在取代旧的"需要看内容像不像 —— 这是全文里唯一需要余弦的地方。
+    余弦 ≥0.90 → 旧观测 status 置 replaced，保证一个 subject 只有一个 active。
 
     用法:
         engine = LongTermMemoryEngine(llm, dao, conflict_resolver)
-        results = await engine.retrieve(user_id, "定价策略", top_k=10)
         memory_id = await engine.add_memory(user_id, "飞书企业版 ¥200/人/月", "fact")
     """
 
@@ -337,130 +167,6 @@ class LongTermMemoryEngine:
         让"我知道这是内部依赖"这件事写在代码里而不是藏在调用点。
         """
         return self._dao
-
-    # ══════════════════════════════════════════════════════════════════════
-    # 检索 — 五步流水线
-    # ══════════════════════════════════════════════════════════════════════
-
-    async def retrieve(
-        self, user_id: str, query: str, top_k: int = 10
-    ) -> list[dict]:
-        """五步检索流水线入口。
-
-        【L4 工程】三条 early return 路径
-        ─────────────────────────────
-        0. 该用户一条活跃记忆都没有 → 直接返回（M2 新增，见 Step 0）
-        1. RRF 融合后为空 → 返回空列表（两种检索器都没命中）
-        2. RRF 候选数 ≤ top_k → 跳过精排直接返回
-
-        【2026-10-27 M2 修正】原来"embed_query 失败 → return []"这条已删除。
-        真实代价不是"退化成关键词查"，而是**索引层一挂、读取整体归零**——
-        连那些本来就不需要向量的行（embedding IS NULL）也一起瞎了。
-        写入侧允许 embed 失败（存 NULL 照常插入），读取侧却不容忍，
-        这个不对称会让"embed 服务抖 30 秒"变成"记忆功能全停 30 秒"。
-        现在改成只跳过向量路，关键词路照常进 RRF 与精排。
-
-        【L3 核心考点】top_k 的三层含义
-        ───────────────────────────
-        Step 2 向量检索: top_k=60（固定——需要足够大的候选池让 RRF 有意义）
-        Step 2 关键词检索: top_k=30（固定——关键词命中比向量少，设少点合理）
-        Step 5 精排: top_k 由调用方指定（默认 10）——这是最终返回数量
-        """
-        # ── Step 0: 空表短路（2026-10-27 M2）──
-        # 表里没记忆时 Step 1 的 LLM 改写 + Step 2 的 embedding 全是白烧；
-        # 而"没记忆"在新用户、新环境、刚清库时是常态，不是异常。
-        if await self._dao.count(user_id) == 0:
-            logger.debug("记忆表为空，跳过检索 user=%s", user_id)
-            return []
-
-        # ── Step 1: Query 重写 ──
-        rewritten = await self._rewrite_query(query)
-
-        # ── Step 2: 混合检索（向量路可降级，关键词路必跑）──
-        query_vec = await embed_query(rewritten)
-        vec_results: list[dict] = []
-        if query_vec:
-            vec_results = await self._dao.similarity_search(
-                user_id, query_vec, top_k=60, model_version=self.model_version
-            )
-        else:
-            # ⚠️ 不 return：降级成单路检索，总比整块读不出来强
-            logger.warning("embed_query 失败，本次只走关键词路: %r", rewritten)
-        # 【L5 决策】向量和关键词的 top_k 不对称的原因
-        # 向量检索（top_k=60）: 语义层面匹配更广，需要更大的候选池
-        # 关键词检索（top_k=30）: 精确匹配，通常命中少于向量
-        kw_results = await self._dao.keyword_search(user_id, rewritten, top_k=30)
-
-        # ── Step 3: RRF 融合 ──
-        merged = _rrf_fusion(vec_results, kw_results, k=60)
-
-        # ── Step 4: 元数据过滤（SQL 层已做，Python 层无需额外操作） ──
-        if not merged:
-            return []  # early return: 两路都没命中
-
-        # ── Step 5: Cross-encoder 精排 ──
-        documents = [d.get("content", "") for d in merged]
-        if len(documents) <= top_k:
-            # 【L4 工程】如果 RRF 候选数 ≤ 需要的 top_k，跳过精排
-            # 精排 5 条里取 5 条是无意义的——就是换个顺序
-            return merged
-
-        ranked = await rerank(query, documents, top_k=top_k)
-        if not ranked:
-            # 【L4 工程】rerank 失败 → 降级返回 RRF 融合的 top_k 结果
-            # 宁可没有精排，也不能没有结果
-            return merged[:top_k]
-
-        # ── 构造最终结果（附加 rerank score） ──
-        result = []
-        for r in ranked:
-            idx = r.get("index", 0)
-            if idx < len(merged):
-                doc = dict(merged[idx])
-                doc["rerank_score"] = r.get("score", 0)
-                result.append(doc)
-
-        logger.info("检索完成: 查询=%r, 候选=%d, 返回=%d",
-                     query, len(merged), len(result))
-        return result
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Query 重写（内部方法）
-    # ══════════════════════════════════════════════════════════════════════
-
-    async def _rewrite_query(self, query: str) -> str:
-        """Step 1: LLM Query 重写（去口语化 + 泛化）。
-
-        【L3 核心概念】为什么需要 query 重写？
-        ──────────────────────────────────
-        embedding 模型（BGE-M3）在训练时看到的 query 是搜索风格的:
-          "飞书定价"  → embedding 精准
-          "飞书上次调研的那个定价是不是改了" → embedding 被填充词干扰 → 失真
-
-        LLM 重写的作用: 去掉填充词，提取核心关键词组合。
-        就像把"那个什么来着，上次说的那个地方的天气" → "XX 天气"——
-        embedding 模型只看到那 2-3 个核心词。
-
-        【L4 工程】重写失败的 fallback
-        ──────────────────────────
-        LLM 异常 → 返回原始 query（不优雅但可用）
-        原始 query 直接给 embedding 模型 → 精度降低但不会零召回
-        """
-        try:
-            prompt = _REWRITE_PROMPT % query
-            resp = await self._llm.ainvoke(prompt)
-            rewritten = resp.content.strip()
-            if len(rewritten) > 3:          # 重写结果至少 3 个字符才有效
-                logger.debug("Query 重写: %r → %r", query, rewritten)
-                return rewritten
-        except Exception as e:
-            logger.warning("Query 重写失败 query=%r error=%s", query, e,
-                            exc_info=True)
-        return query  # fallback: 用原始 query
-
-    # ══════════════════════════════════════════════════════════════════════
-    # 记忆写入 — 含冲突检测
-    # ══════════════════════════════════════════════════════════════════════
 
     async def add_memory(
         self,
