@@ -11,8 +11,8 @@
 
 【关键决策】
   ★ 层级按**单位成本递增**排，不按准确率递增 ← 同一次判断能用便宜的就别上贵的
-  ★ analysis 一律下沉 L3，不信 L2 的 analysis 判定 ← 抽实体本来就要一次 LLM，
-    L2 给不出 competitors/dimensions，判出来也接不上执行
+  ★ 需要槽位的意图一律下沉 L3，只有槽位全可选的 lookup 停在 L2 ← L2 是纯分类器，
+    恒返回零实体；analysis 缺竞品接不上执行，trace/verify 缺 keyword 会"问 A 答 B"
   ★ L2 用 top1 与 top2 的**差值**判犹豫，不用绝对相似度 ← 绝对分随句长与领域漂移
   ★ 判不出来就下沉，L4 只问不猜 ← 猜错要跑一整份报告，多问一句便宜得多
   ★ 漏斗只决定"走哪条执行链路"，不决定执行策略 ← 后者仍归 IntentRouter.classify()
@@ -40,8 +40,19 @@ logger = logging.getLogger(__name__)
 
 INTENTS = ("analysis", "lookup", "trace", "verify")
 
+# ── 哪些意图允许停在 L2 ────────────────────────────────────────────────────
+# ★ 判据是「这个意图有没有**必填槽位**」，不是它叫什么名字
+#   L2 是纯分类器：`l2_semantic` 返回的 entities 恒为 _empty_entities()、keyword 恒 None，
+#   它一个槽位都给不出。所以能停在 L2 的，必须「没有槽位也能把活干对」。
+#     lookup  → competitors / dimensions / skip 全可选，缺了就是"查最近一次"，语义完整
+#     trace   → keyword 定生死：没有它，会把该报告引用的**全部** URL 列出来
+#     verify  → 同上：没有它，核对的是整份报告的新鲜度
+#   后两者的失败是"问 A 答 B"（答错），比多付一次 LLM 严重 —— 故下沉。
+INTENTS_L2_SAFE = ("lookup",)
+INTENTS_NEED_SLOTS = ("trace", "verify")
+
 # ── 各意图的示例句（L2 的原型）────────────────────────────────────────────
-# 这 24 句就是 L2 的"训练集"，改动等于改模型行为。加句子要同步跑 calibrate()。
+# 这 22 句（6/6/5/5）就是 L2 的"训练集"，改动等于改模型行为。加句子要同步跑 calibrate()。
 EXEMPLARS: dict[str, tuple[str, ...]] = {
     "analysis": (
         "对比飞书和钉钉在功能和定价上的表现",
@@ -461,9 +472,13 @@ async def run_funnel(
         )
 
     semantic = await l2_semantic(text, cfg)
-    if semantic is not None and semantic.intent != "analysis":
-        # ★ 只有非分析类可信 L2：analysis 需要实体，必须走 L3
+    # ★ 只有槽位全可选的意图才允许停在 L2 —— analysis 要实体，trace/verify 要 keyword。
+    #   这里放开一个，就等于允许一次"问 A 答 B"，比多付一次 LLM 贵。
+    if semantic is not None and semantic.intent in INTENTS_L2_SAFE:
         return semantic
+    if semantic is not None and semantic.intent in INTENTS_NEED_SLOTS:
+        # 记一行：下沉不是免费的，要能回答"这个规则到底多花了多少"
+        logger.info("L2 判出 %s 但缺必填槽位，下沉 L3: %r", semantic.intent, text[:40])
 
     llm_result = await l3_llm(text, cfg, history_block)
     if llm_result.intent in INTENTS:
