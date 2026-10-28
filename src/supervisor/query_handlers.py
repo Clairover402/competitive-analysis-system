@@ -453,9 +453,17 @@ def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None) ->
         return "没有找到匹配的历史任务。" + ("（按竞品筛选后为空）" if competitors else "")
 
     head = items[0]
-    # 称呼必须跟着 skip 走：跳过了两条还说"最近一次是…"，
-    # 用户会以为拿到的是最新的那份。
-    lead = f"倒数第{_ordinal_cn(skip + 1)}次是" if skip else "最近一次是"
+    # 称呼必须跟着 skip 和条数走：
+    #   · 跳过了两条还说"最近一次是…" → 用户以为拿到的是最新的那份
+    #   · 返回了两条却只说"最近一次是…" → 用户以为只要到一条
+    if skip:
+        lead = f"倒数第{_ordinal_cn(skip + 1)}次是"
+    elif len(items) > 1:
+        # 数量用阿拉伯数字：「两次」对、「二次」不对，而 _ordinal_cn 给的是后者。
+        # 序数说「倒数第二次」、数量说「最近 2 次」，各用各的才都像人话。
+        lead = f"最近 {len(items)} 次里最新的是"
+    else:
+        lead = "最近一次是"
     # ⚠️ report 是 LEFT JOIN：跑完没出报告时 version 也是 None，
     #   直接 `v{version}` 会念成"报告版本 vNone"（实测踩过）。
     report_desc = (
