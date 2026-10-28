@@ -15,7 +15,12 @@ async function _handle(res) {
     var body;
     try { body = await res.json(); } catch(e) { body = {}; }
     var msg = body.detail || body.message || res.statusText || 'request failed';
-    throw new Error(msg);
+    var err = new Error(msg);
+    /* 把状态码挂到 Error 上：调用方常需要区分「404 该清本地指针」与
+       「500 该重试」。只给一句 message 的话，只能靠字符串匹配 detail 文案，
+       后端改一个字就失效。 */
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }

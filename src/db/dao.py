@@ -1275,6 +1275,82 @@ class ConversationDAO:
                 conversation_id, summary,
             )
 
+    async def list_for_user(self, user_id: str, limit: int = 20) -> list[dict]:
+        """列出该用户的会话，最近活跃的在前，并带最后一句**用户原话**。
+
+        【为什么副标题要单独取 user 行，而不是取最后一行】
+          一个会话的最后一行永远是 assistant 的回复。直接拿它当副标题，
+          列表里每条都会以「好的，已为你创建任务…」开头 —— 认不出这是哪一段。
+          用户认自己的会话，靠的是"我当时问的是什么"。
+
+        【为什么是 LEFT JOIN LATERAL】
+          刚建好还没说话的会话没有 user 行。LEFT 才留得下来（前端显示「还没开始」），
+          换成 INNER JOIN 会让空会话凭空消失，用户以为自己点错了。
+
+        时间字段保持 datetime 原样返回，由 routes 层 isoformat ——
+        与本文件其余 DAO 一致（只有 uuid 在 DAO 边界转 str，见 get() 的注释）。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT c.id, c.title, c.summary, c.turn_count,
+                          c.created_at, c.updated_at,
+                          l.content AS last_user_message
+                     FROM conversations c
+                     LEFT JOIN LATERAL (
+                           SELECT content
+                             FROM conversation_turns
+                            WHERE conversation_id = c.id AND role = 'user'
+                            ORDER BY seq DESC
+                            LIMIT 1
+                     ) l ON TRUE
+                    WHERE c.user_id = $1
+                    ORDER BY c.updated_at DESC
+                    LIMIT $2""",
+                user_id, limit,
+            )
+        out = []
+        for r in rows:
+            item = dict(r)
+            item["id"] = str(item["id"])
+            out.append(item)
+        return out
+
+    async def all_turns(
+        self,
+        conversation_id: str,
+        user_id: str,
+        limit: int = 200,
+    ) -> list[dict]:
+        """取一个会话的完整流水（seq 正序），用于前端回放。
+
+        ⚠️ 归属校验写进 JOIN 的 WHERE，不靠调用方先 get() 再调这里：
+           多一步校验就多一个"忘了调"的可能，而漏掉就是越权读别人的对话。
+           返回空列表时无法区分"没这个会话"和"会话是空的" —— 需要区分的话
+           调用方自己先 get() 一次（当前 API 就是这么做的，为了回 404）。
+
+        limit 兜底 200 行：理论上会话可以无限长，但没有分页的情况下
+        一次全量返给前端会拖死渲染；超过长度时截断而不是报错。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT t.seq, t.role, t.content, t.intent,
+                          t.ref_task_id, t.ref_report_id, t.created_at
+                     FROM conversation_turns t
+                     JOIN conversations c ON c.id = t.conversation_id
+                    WHERE t.conversation_id = $1 AND c.user_id = $2
+                    ORDER BY t.seq
+                    LIMIT $3""",
+                conversation_id, user_id, limit,
+            )
+        out = []
+        for r in rows:
+            item = dict(r)
+            for key in ("ref_task_id", "ref_report_id"):
+                if item.get(key) is not None:
+                    item[key] = str(item[key])
+            out.append(item)
+        return out
+
 
 class PreferenceDAO:
     """程序性记忆（默认值/偏好）数据访问 —— 一张 (user_id, key) 的 KV 表。

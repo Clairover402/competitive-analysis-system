@@ -41,7 +41,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from src.config import Settings
 from src.db.connection import close_pool, create_pool
-from src.db.dao import PreferenceDAO, ReportDAO, TaskDAO
+from src.db.dao import ConversationDAO, PreferenceDAO, ReportDAO, TaskDAO
 from src.observability.logging import BoundLogger
 from src.observability.metrics import (
     record_agent_call,
@@ -1276,6 +1276,103 @@ async def delete_preference(
     """删掉一条偏好（含"忽略"提案）。"""
     dao = PreferenceDAO(_get_pool(request))
     return {"key": key, "deleted": await dao.delete(current_user.user_id, key)}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §5.5 路由 — 会话列表与回放（GET /api/conversations…）
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# 【为什么这组接口迟到了】
+#   写入侧（POST /api/chat）一直在往 conversations / conversation_turns 里落，
+#   conversations.title 的字段注释甚至写着「首句话裁出来的标题，仅给会话列表看」——
+#   为列表准备好了数据，却没有任何接口把它读出来。
+#   结果是：点「新对话」把本地指针清成 null 后，那段对话就再也找不回来，
+#   而库里一条没少。**丢的是入口，不是数据。**
+#
+# 【为什么回放不做分页】
+#   单个会话的轮数天然有上限（摘要机制就是为了不让它无限长），
+#   200 行的兜底已经远超实际；加分页会让前端多一层状态，
+#   而这次要解决的只是"找不回来"。
+
+@app.get("/api/conversations")
+async def list_conversations(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+    limit: int = 20,
+) -> dict:
+    """列出该用户的历史会话（最近活跃的在前），供前端「历史对话」用。"""
+    limit = max(1, min(int(limit), 100))
+    dao = ConversationDAO(_get_pool(request))
+    rows = await dao.list_for_user(current_user.user_id, limit=limit)
+
+    items = []
+    for r in rows:
+        # 副标题取最后一句用户原话：标题是首句裁的，聊了七八轮之后
+        # 首句和实际主题常常已经不是一回事了。
+        last = " ".join((r.get("last_user_message") or "").split())
+        items.append({
+            "id": r["id"],
+            "title": r["title"] or "（未命名会话）",
+            "turn_count": r["turn_count"],
+            "last_user_message": last[:120],
+            "has_summary": bool(r.get("summary")),
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        })
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/conversations/{conversation_id}/turns")
+async def get_conversation_turns(
+    conversation_id: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+    limit: int = 200,
+) -> dict:
+    """回放一个会话的完整流水（seq 正序），让前端把气泡重铺出来。
+
+    【为什么 404 要靠 get() 判，不能靠「turns 为空」判】
+      新建但还没说过话的会话，turns 也是空。拿空列表当 404，
+      会把「空会话」误报成「不存在」—— 用户刚点开就被踢回列表，莫名其妙。
+      所以先 get() 拿归属，再取流水。
+
+    【回放拿不到 card，只能拿到文本】
+      turns 里存的是当轮 assistant 的 reply_text，卡片的结构化结果没存。
+      这是刻意的：卡片是「那次任务的产物」，产物在 tasks / reports 里，
+      靠 ref_task_id 跳详情即可。再存一份等于给同一件事造第二个真相
+      （与 episode 那次同构的坑）。
+    """
+    limit = max(1, min(int(limit), 500))
+    pool = _get_pool(request)
+    dao = ConversationDAO(pool)
+
+    conv = await dao.get(conversation_id, current_user.user_id)
+    if conv is None:
+        # 与 /api/chat 一致：不区分「不存在」与「不是你的」，避免探测别人的会话
+        raise HTTPException(404, "会话不存在")
+
+    turns = await dao.all_turns(conversation_id, current_user.user_id, limit=limit)
+    return {
+        "conversation": {
+            "id": conv["id"],
+            "title": conv["title"] or "（未命名会话）",
+            "summary": conv["summary"],
+            "turn_count": conv["turn_count"],
+            "updated_at": conv["updated_at"].isoformat() if conv["updated_at"] else None,
+        },
+        "items": [
+            {
+                "seq": t["seq"],
+                "role": t["role"],
+                "content": t["content"],
+                "intent": t["intent"],
+                "ref_task_id": t["ref_task_id"],
+                "ref_report_id": t["ref_report_id"],
+                "created_at": t["created_at"].isoformat() if t["created_at"] else None,
+            }
+            for t in turns
+        ],
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════

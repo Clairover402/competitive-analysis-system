@@ -168,6 +168,22 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-chat-new { border: none; border-radius: 0; background: transparent; color: var(--pixel-cyan); font-family: var(--pixel-mono); font-size: 12px; letter-spacing: 1px; padding: 4px 10px; cursor: pointer; box-shadow: 0 0 0 2px var(--pixel-mid); }
 .pixel-chat-new:hover { color: var(--pixel-black); background: var(--pixel-cyan); box-shadow: 0 0 0 2px var(--pixel-cyan); }
 
+/* 历史对话（2026-10-28）
+ * 列表复用 .pixel-chat-log 当容器（同位置、同滚动），所以这里只管卡片本身。
+ * 三个按钮挤在 .pixel-chat-acts 里，避免 space-between 把两个按钮拉开到两端。 */
+.pixel-chat-acts { display: flex; gap: 8px; }
+.pixel-conv-item {
+  padding: 12px 14px; background: var(--pixel-dark);
+  box-shadow: 0 0 0 2px var(--pixel-mid); cursor: pointer;
+  transition: box-shadow 0.1s ease;
+}
+.pixel-conv-item:hover { box-shadow: 0 0 0 2px var(--pixel-green); }
+/* active = 当前 localStorage 里那一段，打开列表时一眼看出"我停在哪" */
+.pixel-conv-item.active { box-shadow: 0 0 0 2px var(--pixel-cyan); }
+.pixel-conv-title { color: var(--pixel-white); font-size: 14px; line-height: 1.5; word-break: break-word; }
+.pixel-conv-sub { color: var(--pixel-light); font-size: 13px; margin-top: 4px; line-height: 1.5; word-break: break-word; }
+.pixel-conv-meta { font-family: var(--pixel-font); font-size: 10px; letter-spacing: 1px; color: var(--pixel-light); opacity: 0.7; margin-top: 6px; }
+
 /* 偏好确认卡（M4）：一张卡一条规则，两个动作。
  * 用虚线边框与普通气泡区分——它不是一个"回答"，是等用户拍板的东西。 */
 .pixel-chat-pref { border-top: 2px dashed var(--pixel-mid); padding-top: 8px; margin-top: 8px; }

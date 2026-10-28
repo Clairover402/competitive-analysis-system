@@ -84,9 +84,15 @@ export function render() {
           '<p class="pixel-mode-hint">\u4E00\u53E5\u8BDD\u8BF4\u6E05\u8981\u505A\u4EC0\u4E48 \u00B7 \u81EA\u52A8\u5224\u65AD\u610F\u56FE\uFF1A\u5206\u6790\u7ADE\u54C1 / \u627E\u5386\u53F2\u62A5\u544A / \u67E5\u8BC1\u636E\u51FA\u5904 / \u6838\u5BF9\u6570\u636E\u65B0\u65E7\uFF1B\u53EA\u6709\u300C\u5206\u6790\u300D\u4F1A\u4EA7\u51FA\u62A5\u544A</p>' +
           '<div class="pixel-chat-bar">' +
             '<span class="pixel-chat-conv">\u591A\u8F6E\u5BF9\u8BDD\uFF1A\u540E\u9762\u7684\u8BDD\u4F1A\u5E26\u4E0A\u524D\u6587</span>' +
-            '<button id="btn-new-chat" class="pixel-chat-new" type="button">+ \u65B0\u5BF9\u8BDD</button>' +
+            '<div class="pixel-chat-acts">' +
+              '<button id="btn-conv-list" class="pixel-chat-new" type="button">\u25C7 \u5386\u53F2</button>' +
+              '<button id="btn-new-chat" class="pixel-chat-new" type="button">+ \u65B0\u5BF9\u8BDD</button>' +
+            '</div>' +
           '</div>' +
           '<div id="chat-log" class="pixel-chat-log"></div>' +
+          /* 历史列表与 chat-log 同位置切换（不是浮层）：
+             浮层要处理定位、层级、点外部关闭三件事，而这里只需要"换个视图看"。 */
+          '<div id="conv-list" class="pixel-chat-log pixel-hidden"></div>' +
           '<textarea id="chat-input" class="pixel-textarea pixel-mb-sm" rows="3"' +
                     ' placeholder="> \u4F8B\u5982\uFF1A\u4EE5\u524D\u8DD1\u8FC7\u7684\u7ADE\u54C1\u5206\u6790\u62A5\u544A\u5728\u54EA\uFF08Enter \u53D1\u9001\uFF0CShift+Enter \u6362\u884C\uFF09"></textarea>' +
           '<button id="btn-submit-chat" class="pixel-btn">' +
@@ -127,6 +133,8 @@ export function mount() {
   var chatLog = document.getElementById('chat-log');
   var chatInput = document.getElementById('chat-input');
   var btnNewChat = document.getElementById('btn-new-chat');
+  var btnConvList = document.getElementById('btn-conv-list');
+  var convListEl = document.getElementById('conv-list');
   var btnSubmitStd = document.getElementById('btn-submit-std');
   var btnSubmitChat = document.getElementById('btn-submit-chat');
   var btnRefresh = document.getElementById('btn-refresh-tasks');
@@ -393,6 +401,26 @@ export function mount() {
         '<div>' + esc(m.text) + '</div></div></div>';
     }
 
+    if (m.kind === 'replay') {
+      // 回放气泡：conversation_turns 里只有当轮的回答文本，卡片的结构化结果没存。
+      // 所以这里只铺文本 + 一条任务入口 —— 产物在任务详情里，不在这伪造一份。
+      // ⚠️ 别想着"顺手把 cards 也存进 turns"：那等于给同一次任务造第二个真相，
+      //    和当初砍掉的 episode 摘要是一个坑（见记忆系统文档第六节）。
+      var rlabel = INTENT_LABEL[m.intent] || m.intent || '历史';
+      var rwhen = (m.when || '').slice(0, 16).replace('T', ' ');
+      return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+        '<div class="pixel-chat-meta">' + esc(rlabel) +
+          (rwhen ? ' · ' + esc(rwhen) : '') + '</div>' +
+        '<div>' + esc(m.text) + '</div>' +
+        (m.taskId
+          ? renderChatItem(
+              '<div class="pixel-chat-item-action">&blacktriangleright; 查看那次任务 ' +
+              esc(String(m.taskId).slice(0, 8)) + '</div>',
+              m.taskId)
+          : '') +
+        '</div></div>';
+    }
+
     if (m.kind === 'task') {
       var e = m.entities || {};
       var comps = (e.competitors && e.competitors.length) ? e.competitors.join(' / ') : '—';
@@ -545,10 +573,148 @@ export function mount() {
       chatConvId = null;
       try { localStorage.removeItem(CHAT_CONV_KEY); } catch (e) { /* ignore */ }
       chatMessages = [];
+      hideConvList();
       renderChatLog();
       if (chatInput) chatInput.focus();
     });
   }
+
+  /* ── 历史对话（2026-10-28）────────────────────────────────────────────
+   *
+   * 起因：点「新对话」只清掉本地指针，那段对话还在库里，界面上却再也找不回来。
+   * conversations.title 的字段注释写的是"仅给会话列表看" —— 数据一直为列表
+   * 准备着，只是从来没建过读它的接口。这次补的就是读。
+   *
+   * 三个刻意的取舍：
+   *   1. 列表与对话同位置切换，不做浮层 —— 浮层要额外处理定位、层级、点外关闭。
+   *   2. 回放只还原文本 + 任务入口，不还原卡片（见 renderChatMessage 的 replay 分支）。
+   *   3. 刷新后自动把当前会话拉回来。否则视觉上是空对话、实际下一句会接在旧会话上,
+   *      这种错位比"找不到历史"更容易误导人。
+   */
+
+  function convItemHtml(c) {
+    var title = c.title || '（未命名会话）';
+    var when = (c.updated_at || '').slice(0, 16).replace('T', ' ');
+    var turns = c.turn_count ? ('共 ' + c.turn_count + ' 轮') : '还没开始';
+    var sub = c.last_user_message || '';
+    // 只有一轮时 title 就是首句，和 sub 几乎重复；重复显示只会让列表更难扫
+    if (sub && (sub === title || sub.indexOf(title) === 0)) sub = '';
+    return '<div class="pixel-conv-item' + (c.id === chatConvId ? ' active' : '') +
+      '" data-conv="' + esc(c.id) + '">' +
+      '<div class="pixel-conv-title">' + esc(title) + '</div>' +
+      (sub ? '<div class="pixel-conv-sub">' + esc(sub) + '</div>' : '') +
+      '<div class="pixel-conv-meta">' + esc(when) + ' · ' + esc(turns) + '</div>' +
+      '</div>';
+  }
+
+  async function showConvList() {
+    if (!convListEl || !chatLog) return;
+    chatLog.classList.add('pixel-hidden');
+    convListEl.classList.remove('pixel-hidden');
+    // 输入框一并收起来：列表视图下发出的话会落到 chatConvId 指向的那段会话，
+    // 但屏幕上没有对话可看 —— 用户会不知道这句话发到哪去了。
+    if (chatInput) chatInput.classList.add('pixel-hidden');
+    if (btnSubmitChat) btnSubmitChat.classList.add('pixel-hidden');
+    if (btnConvList) btnConvList.textContent = '\u2190 \u8FD4\u56DE\u5BF9\u8BDD';
+    convListEl.innerHTML = '<div class="pixel-chat-empty"><p>载入中...</p></div>';
+    try {
+      var d = await API.get('/api/conversations?limit=20');
+      var items = (d && d.items) || [];
+      if (!items.length) {
+        convListEl.innerHTML = '<div class="pixel-chat-empty">' +
+          '<p style="font-size:24px;margin-bottom:10px">&#x1f5c2;</p>' +
+          '<p>还没有历史对话。</p></div>';
+        return;
+      }
+      convListEl.innerHTML = items.map(convItemHtml).join('');
+    } catch (e) {
+      convListEl.innerHTML = '<div class="pixel-chat-empty"><p>历史对话读不出来：' +
+        esc(e.message || '请求失败') + '</p></div>';
+    }
+  }
+
+  function hideConvList() {
+    if (!convListEl || !chatLog) return;
+    convListEl.classList.add('pixel-hidden');
+    chatLog.classList.remove('pixel-hidden');
+    if (chatInput) chatInput.classList.remove('pixel-hidden');
+    if (btnSubmitChat) btnSubmitChat.classList.remove('pixel-hidden');
+    if (btnConvList) btnConvList.textContent = '\u25C7 \u5386\u53F2';
+  }
+
+  function replayFromTurns(d) {
+    var msgs = [];
+    ((d && d.items) || []).forEach(function(t) {
+      if (t.role === 'user') {
+        msgs.push({ role: 'user', text: t.content || '' });
+      } else {
+        msgs.push({
+          role: 'bot', kind: 'replay',
+          text: t.content || '',
+          intent: t.intent,
+          taskId: t.ref_task_id || null,
+          when: t.created_at,
+        });
+      }
+    });
+    chatMessages = msgs;
+    renderChatLog();
+  }
+
+  async function openConversation(id, opts) {
+    opts = opts || {};
+    try {
+      var d = await API.get('/api/conversations/' + encodeURIComponent(id) + '/turns');
+      replayFromTurns(d);
+      chatConvId = d.conversation.id;
+      try { localStorage.setItem(CHAT_CONV_KEY, chatConvId); } catch (e) { /* 隐私模式 */ }
+      hideConvList();
+      if (!opts.silent) {
+        SFX.blip();
+        chatMessages.push({
+          role: 'bot', kind: 'note', meta: '已载入历史对话',
+          text: '接着说话会接在这段后面；想从零开始点「+ 新对话」。',
+        });
+        renderChatLog();
+      }
+      return true;
+    } catch (e) {
+      // 404 = 这段会话没了（被删，或换了账号还带着旧指针）。
+      // 必须顺手清指针，否则之后每句话都 404，界面看着像"发送一直失败"。
+      if (e.status === 404) {
+        chatConvId = null;
+        try { localStorage.removeItem(CHAT_CONV_KEY); } catch (err) { /* ignore */ }
+      }
+      if (!opts.silent) {
+        chatMessages.push({
+          role: 'bot', kind: 'error',
+          text: '历史对话打不开：' + (e.message || '请求失败'),
+        });
+        renderChatLog();
+      }
+      return false;
+    }
+  }
+
+  if (btnConvList) {
+    btnConvList.addEventListener('click', function() {
+      SFX.click();
+      if (convListEl && convListEl.classList.contains('pixel-hidden')) showConvList();
+      else hideConvList();
+    });
+  }
+
+  if (convListEl) {
+    convListEl.addEventListener('click', function(e) {
+      var el = (e.target && e.target.closest) ? e.target.closest('[data-conv]') : null;
+      if (!el) return;
+      openConversation(el.getAttribute('data-conv'));
+    });
+  }
+
+  // 刷新后把当前会话拉回来：localStorage 里还留着指针，但气泡是空的。
+  // 不拉的话，界面像新对话、实际下一句接在旧会话上 —— 用户会以为系统记错了。
+  if (chatConvId) openConversation(chatConvId, { silent: true });
 
   if (chatLog) {
     chatLog.addEventListener('click', function(e) {
