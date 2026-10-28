@@ -5,7 +5,9 @@
   不做：不做语义匹配（那是 L3 的事）、不写库、不调 Agent、不生成报告。
 
 【输入 → 输出】
-  lookup_reports(pool, user_id, competitors, dimensions)  -> {"items": [...], "summary": str}
+  parse_ordinal(text) -> {"skip": n, "limit": m} | {"unsupported": "最早"} | None
+  lookup_reports(pool, user_id, competitors, dimensions, limit, skip)
+      -> {"items": [...], "total": int | None, "summary": str}
   trace_evidence(pool, user_id, competitors, keyword)     -> 同上
   check_freshness(pool, user_id, competitors, keyword)    -> 同上（附 fresh/stale 判定）
 
@@ -13,6 +15,13 @@
   ★ 三跳全走 SQL，零 LLM ← 用户问的是**确定指代**（"上次""那份"），
     语义相似度会召回错任务，确定性查询只能用确定性工具
   ★ 排序一律 created_at DESC ← "上次"的字面含义就是时间最近，不需要模型理解
+  ★ 序数（上上次 / 前两次 / 第五次）由 `parse_ordinal` 用**规则**抽，不进 L3 ←
+    封闭词表能穷举，交给模型只会多一次调用且拿不到结构化字段；L2 更不行，
+    它返回的是类别得分。三条链路各自的分工见 parse_ordinal 上方注释
+  ★ `ORDER BY` 必须带 `t.id DESC` 兜底 ← created_at 只到毫秒，批量建任务会并列，
+    加了 OFFSET 之后一并列两次请求就会拿到不同行（"上上次"漂移）
+  ★ SQL 的 WHERE 只写一份（_TASKS_FILTER），lookup 与 count 共用 ← 两处各写一遍
+    就等于两个真相，改一处忘一处会让"一共几次"数错
   ★ lookup 也念事实正文（2026-10-28 补）← 问「上次钉钉定价多少」要的是那句话，
     不是"有这么一份报告"。取法与 verify 相同：subject 定位 + content 第 2 行，
     读的是同一张表、同一个 `_fact_claim`，不新增检索路径、不走向量
@@ -35,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -198,7 +208,94 @@ def _effective_ttl(
 
 # ── ① lookup：找历史任务 ────────────────────────────────────────────────
 
-_LOOKUP_SQL = """
+# ── 序数抽取：只在这一层用规则 ───────────────────────────────────────────
+# 判据是「能不能枚举」：
+#   封闭词表（第几次 / 前几次 / 全部 / 最早）→ 正则，零成本、可测、错了能改
+#   开放词表（竞品名 / 维度 / 结论短语）      → 只能交给 L3 的 LLM
+# 这也正是它**不放进 L3 prompt** 的原因：两处都能抽就是两套真相。
+# L2 更不行 —— 它返回的是类别得分，给不出结构化字段（见 INTENT_L2_SAFE）。
+#
+# ⚠️ 中文的时间方向有歧义：「第 2 次」可以是"从最早数"也可以是"从最近数"。
+#    这里一律按**从最近往回数**（= 倒数），因为 lookup 的语境天然是"上次/之前"。
+#    因此「第一次 / 最早」不按 1 处理，走 unsupported 明说查不了 —— 答"最近一次"
+#    是错的，承认做不到才对。
+_ALL_LIMIT = 50          # "全部 / 都列出来"的上限；超过就明说只列这么多
+_MAX_SKIP = 20
+_MAX_LIMIT = 50
+
+_CN_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_NUM_CN = "一二三四五六七八九十"
+
+
+def _cn_int(token: str) -> int | None:
+    """把「两」「三」「7」转成 int；认不出返回 None（"一百"这种不展开）。"""
+    if token.isdigit():
+        return int(token)
+    return _CN_NUM.get(token)
+
+
+def _ordinal_cn(n: int) -> str:
+    """1~10 说成中文（"倒数第二次"比"倒数第 2 次"像人话），其余用数字。"""
+    return _NUM_CN[n - 1] if 1 <= n <= 10 else str(n)
+
+
+def parse_ordinal(text: str | None) -> dict | None:
+    """从用户原话里抽「第几次」。不命中返回 None，走默认（最近一次）。
+
+    ⚠️ 顺序敏感，三处都不能调换：
+       ① 「上上上次」必须先于「上上次」—— 后者是前者的子串
+       ② 「第一次/最早」必须先于「第 N 次」—— 否则会被当成 skip=0 的"最近一次"
+       ③ 「第 N 次」单独一条正则，不能和「前/最近 N 次」共用 —— 前缀不同，
+          共用会让「前两次」被解析成 skip=1
+    ⚠️ 「上次 / 最近一次」**故意不在表里**：它们等于默认行为，写进来只是把
+       "不命中"改写成"命中 skip=0"，多一个分支却没有行为差异。
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    if re.search(r"上上上次|上上上回", s):
+        return {"skip": 2, "limit": 1}
+    if re.search(r"上上次|上上回", s):
+        return {"skip": 1, "limit": 1}
+
+    m = re.search(r"倒数第\s*([一二两三四五六七八九十]+|\d+)\s*[次回个]", s)
+    if m:
+        n = _cn_int(m.group(1))
+        return {"skip": n - 1, "limit": 1} if n and n - 1 <= _MAX_SKIP else None
+
+    m = re.search(r"(?:最近|前)\s*([一二两三四五六七八九十]+|\d+)\s*[次回个]", s)
+    if m:
+        n = _cn_int(m.group(1))
+        # ⚠️ n 必须 ≥ 2：「最近一次」「前一次」就等于默认行为，命中只会把
+        #    limit 从 5 压到 1，反而丢掉"还有 N 条"那半句。
+        return {"skip": 0, "limit": n} if n and 2 <= n <= _MAX_LIMIT else None
+
+    if re.search(r"全部|所有|都列出|每一条", s):
+        return {"skip": 0, "limit": _ALL_LIMIT}
+
+    if re.search(r"最早|最初|头一次|第一次", s):
+        return {"unsupported": "最早"}
+
+    m = re.search(r"第\s*([一二两三四五六七八九十]+|\d+)\s*[次回]", s)
+    if m:
+        n = _cn_int(m.group(1))
+        return {"skip": n - 1, "limit": 1} if n and 0 < n - 1 <= _MAX_SKIP else None
+
+    return None
+
+
+# ★ 只写一份 WHERE：正常查询与"越界后补 count"必须用同一个过滤条件，
+#   否则数出来的总数和列表对不上（改了一处忘了另一处，是这类 bug 的固定来源）。
+_TASKS_FILTER = """
+ WHERE t.user_id = $1
+   AND ($2::text[] IS NULL OR t.competitors ?| $2::text[])
+"""
+
+_COUNT_TASKS_SQL = f"SELECT count(*) AS n FROM tasks t{_TASKS_FILTER}"
+
+_LOOKUP_SQL = f"""
 SELECT t.id::text        AS task_id,
        t.title           AS title,
        t.competitors     AS competitors,
@@ -239,10 +336,11 @@ SELECT t.id::text        AS task_id,
                  ORDER BY observed_at DESC NULLS LAST
                  LIMIT 8) m
   ) f ON TRUE
- WHERE t.user_id = $1
-   AND ($2::text[] IS NULL OR t.competitors ?| $2::text[])
- ORDER BY t.created_at DESC
- LIMIT $3
+{_TASKS_FILTER}
+ -- ★ t.id DESC 不是装饰：created_at 只到毫秒，批量建任务会并列；
+ --   加了 OFFSET 之后，一并列两次请求就会拿到不同行，"上上次"会漂。
+ ORDER BY t.created_at DESC, t.id DESC
+ LIMIT $3 OFFSET $4
 """
 
 # 回落查询：该任务没提炼到时要找的那条事实。
@@ -336,7 +434,7 @@ def _pick_facts(
     return picked
 
 
-def describe_tasks(items, *, total=None, dims=None, competitors=None) -> str:
+def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None) -> str:
     """把一次 lookup 的结果说成人话。纯函数：不查库、不读时钟、不看全局状态。
 
     【为什么要单独一个函数】SQL 变了而文案忘了改，产出的是比"答不上"更糟的东西：
@@ -348,9 +446,16 @@ def describe_tasks(items, *, total=None, dims=None, competitors=None) -> str:
        只吃字符串），所以这函数不是"给任何 row 都能用"的通用格式化器。
     """
     if not items:
+        # ★ 空结果有两种，别混成一句：库里真没有，和"有，但跳过这么多条就没了"。
+        #   后者回"没有找到匹配的历史任务"是谎报 —— 库里有，只是不在这个位置。
+        if skip and total:
+            return f"你一共只有 {total} 次分析记录，没有倒数第{_ordinal_cn(skip + 1)}次。"
         return "没有找到匹配的历史任务。" + ("（按竞品筛选后为空）" if competitors else "")
 
     head = items[0]
+    # 称呼必须跟着 skip 走：跳过了两条还说"最近一次是…"，
+    # 用户会以为拿到的是最新的那份。
+    lead = f"倒数第{_ordinal_cn(skip + 1)}次是" if skip else "最近一次是"
     # ⚠️ report 是 LEFT JOIN：跑完没出报告时 version 也是 None，
     #   直接 `v{version}` 会念成"报告版本 vNone"（实测踩过）。
     report_desc = (
@@ -359,53 +464,60 @@ def describe_tasks(items, *, total=None, dims=None, competitors=None) -> str:
         else "尚无报告"
     )
     summary = (
-        f"最近一次是「{head['title']}」，竞品 {'/'.join(head['competitors']) or '未记录'}，"
+        f"{lead}「{head['title']}」，竞品 {'/'.join(head['competitors']) or '未记录'}，"
         f"{_status_cn(head['status'])}，创建于 {_time_cn(head['created_at'])}；{report_desc}。"
     )
 
-    # 若念的结论全都不是这次分析提的，先交代一句 —— 否则读者会以为
-    # 上面那份报告 v1 里写着这句话，而它其实来自更早的一次分析。
-    cross = [f for f in head["facts"] if f.get("source_task_id") != head["task_id"]]
-    if cross and len(cross) == len(head["facts"]):
-        summary += "\n这次分析没提炼到对应结论，最新一条相关观测在更早的分析里："
+    # ★ 结论只在单条时念。多任务时把 head 的结论混进列表，读者会把"某一次的
+    #   结论"读成"这几次的共同结论" —— 一条摘要里混两个任务的判断，就是这个来源。
+    #   多任务的活是"让你看见有哪几次"，结论要点进去看。
+    if len(items) == 1:
+        # 若念的结论全都不是这次分析提的，先交代一句 —— 否则读者会以为
+        # 上面那份报告 v1 里写着这句话，而它其实来自更早的一次分析。
+        cross = [f for f in head["facts"] if f.get("source_task_id") != head["task_id"]]
+        if cross and len(cross) == len(head["facts"]):
+            summary += "\n这次分析没提炼到对应结论，最新一条相关观测在更早的分析里："
 
-    # 念结论时**必须带观测日期**：只报"45 元"不报是哪天观测的，
-    # 等于把旧价当现价念 —— 那比答不上更糟。
-    for fact in head["facts"]:
-        when = (fact["observed_at"] or "")[:10] or "未知日期"
-        age = _age_cn(fact["age_days"])
-        tail = f"，{age}" if age else ""
-        # 结论不是这次分析提的，要说清出处，否则用户会以为它出自上面那份报告
-        origin = ""
-        if fact.get("source_task_id") and fact["source_task_id"] != head["task_id"]:
-            origin = f" · 来自「{_short(fact.get('source_title') or '更早一次分析', 18)}」"
+        # 念结论时**必须带观测日期**：只报"45 元"不报是哪天观测的，
+        # 等于把旧价当现价念 —— 那比答不上更糟。
+        for fact in head["facts"]:
+            when = (fact["observed_at"] or "")[:10] or "未知日期"
+            age = _age_cn(fact["age_days"])
+            tail = f"，{age}" if age else ""
+            # 结论不是这次分析提的，要说清出处，否则用户会以为它出自上面那份报告
+            origin = ""
+            if fact.get("source_task_id") and fact["source_task_id"] != head["task_id"]:
+                origin = f" · 来自「{_short(fact.get('source_title') or '更早一次分析', 18)}」"
+            summary += (
+                f"\n{fact['competitor']}·{fact['dimension']}："
+                f"{_short(fact['claim'], 60)}（观测于 {when}{tail}{origin}）"
+            )
+        if not head["facts"]:
+            # 诚实降级。两种情况回话不同，混成一句会误导：
+            #   ① 一条事实都没有 → 任务可能没跑完，或提炼失败
+            #   ② 有事实但没有这个维度 → 是该维度没提炼，不是整个没提炼
+            dim_desc = f"「{'/'.join(dims)}」的" if dims else ""
+            if head["fact_count"] and dims:
+                summary += f"\n这次分析没提炼到{dim_desc}结论，只有其他维度的事实。"
+            elif head["fact_count"]:
+                # 有事实行但一条都念不出来（空正文/占位串）——不能说"有其他维度"，
+                # 因为没有"其他维度"这回事，只是这批行不可用。
+                summary += "\n这次分析的事实里没有可用结论，要看报告正文。"
+            else:
+                summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
+                    else "\n这次分析还没提炼成事实，结论要看报告正文。"
+    # ⚠️ 判据是 rest > 0，不是 len(items) > 1。skip=1、limit=1 时只返回一条，
+    #    但确实还有更早的记录要说 —— 旧条件会把这句话吞掉。
+    # ⚠️ 必须减掉 skip：跳过 1 条、显示 1 条时，剩下的不是 total-1 而是 total-2。
+    #    这两个错在 C3（没有 skip）里都看不见，加了 OFFSET 才会露出来 ——
+    #    也正是"改 SQL 和改文案必须在一处"的理由。
+    rest = (total - skip - len(items)) if total else (len(items) - 1)
+    if rest > 0:
+        # 恰好取满且没有更多时，别念"另有 0 条"
         summary += (
-            f"\n{fact['competitor']}·{fact['dimension']}："
-            f"{_short(fact['claim'], 60)}（观测于 {when}{tail}{origin}）"
+            f"\n另有 {rest} 条更早的记录"
+            + (f"（一共 {total} 次分析）" if total else "") + "。"
         )
-    if not head["facts"]:
-        # 诚实降级。两种情况回话不同，混成一句会误导：
-        #   ① 一条事实都没有 → 任务可能没跑完，或提炼失败
-        #   ② 有事实但没有这个维度 → 是该维度没提炼，不是整个没提炼
-        dim_desc = f"「{'/'.join(dims)}」的" if dims else ""
-        if head["fact_count"] and dims:
-            summary += f"\n这次分析没提炼到{dim_desc}结论，只有其他维度的事实。"
-        elif head["fact_count"]:
-            # 有事实行但一条都念不出来（空正文/占位串）——不能说"有其他维度"，
-            # 因为没有"其他维度"这回事，只是这批行不可用。
-            summary += "\n这次分析的事实里没有可用结论，要看报告正文。"
-        else:
-            summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
-                else "\n这次分析还没提炼成事实，结论要看报告正文。"
-    if len(items) > 1:
-        # ⚠️ total 优先：`len(items) - 1` 最多只能说出 limit-1 条，而用户要的是
-        #    「一共还有几条」。库里有 20 次的时候，旧说法会回"另有 4 条"。
-        #    total 拿不到（假池 / 越界空结果）才退回窗口内计数。
-        rest = (total - len(items)) if total else (len(items) - 1)
-        if rest > 0:
-            # 恰好取满且没有更多时，别念"另有 0 条"
-            tail = f"（一共 {total} 次分析）" if total else ""
-            summary += f"\n另有 {rest} 条更早的记录{tail}。"
     return summary
 
 
@@ -415,6 +527,7 @@ async def lookup_reports(
     competitors: list[str] | None = None,
     dimensions: list[str] | None = None,
     limit: int = 5,
+    skip: int = 0,
 ) -> dict:
     """按用户（可选再按竞品、维度）取最近的任务与报告，并把结论一并念出来。
 
@@ -422,13 +535,23 @@ async def lookup_reports(
     只答得上"有这么一份报告"。现在多挂一条 LATERAL 取该任务提炼的 fact，
     读 content 第 2 行当答案 —— 与 verify 用的是同一张表、同一个 `_fact_claim`，
     不新增检索路径，也不走向量（见模块头"读取靠键、写入靠向量"）。
+
+    【skip 从哪来】由 `parse_ordinal` 在 routes 层按规则抽好，这里只收数字。
+    刻意不在这里解析自然语言 —— 本模块的性质是"只依赖 pool.fetch 的 SQL 执行器"，
+    一旦开始 import re 读用户原话，"给个假池就能测"就没了。
     """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
     dims = [d for d in (dimensions or []) if str(d).strip()] or None
-    rows = await pool.fetch(_LOOKUP_SQL, user_id, competitors, limit)
+    rows = await pool.fetch(_LOOKUP_SQL, user_id, competitors, limit, skip)
     # 库里的真实总数（窗口函数给的），用来把"另有 N 条"说准。
     # 空结果时无从得知，留 None 让 describe_tasks 退回窗口内计数。
     total = rows[0].get("total") if rows else None
+    if not rows and skip:
+        # ⚠️ OFFSET 越界时一行都不返回，窗口函数算好的 total 也就拿不到 ——
+        #    窗口函数是"每行带上总数"，没有行就没有总数。这里补问一次。
+        #    只在越界路径上多花这一条查询，常规路径仍然只有一条 SQL。
+        counted = await pool.fetch(_COUNT_TASKS_SQL, user_id, competitors)
+        total = counted[0]["n"] if counted else None
 
     items = []
     for row in rows:
@@ -465,7 +588,8 @@ async def lookup_reports(
     return {
         "items": items,
         "total": total,
-        "summary": describe_tasks(items, total=total, dims=dims, competitors=competitors),
+        "summary": describe_tasks(items, total=total, skip=skip, dims=dims,
+                                  competitors=competitors),
     }
 
 

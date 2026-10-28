@@ -998,6 +998,7 @@ async def chat(
     from src.supervisor.query_handlers import (
         check_freshness,
         lookup_reports,
+        parse_ordinal,
         trace_evidence,
     )
 
@@ -1138,12 +1139,26 @@ async def chat(
     if funnel.intent == "lookup":
         # dimensions 一路传下去：之前这里只给小了 competitors，"定价"这个词
         # 在调用处就丢了，SQL 再准也只剩「钉钉」这一个条件。
-        data = await lookup_reports(
-            pool,
-            current_user.user_id,
-            competitors,
-            funnel.entities.get("dimensions"),
-        )
+        # 序数（上上次 / 前两次 / 全部）由规则抽，不占 LLM —— 封闭词表能穷举，
+        # 且 L2 收走 lookup 时走不到 L3，只能在这里抽。
+        ordv = parse_ordinal(body.message) or {}
+        if ordv.get("unsupported"):
+            # 识别到了但做不了。这比答成"最近一次"好：那是自信地答错。
+            data = {
+                "items": [],
+                "total": None,
+                "summary": f"「{ordv['unsupported']}」这个方向暂时查不了 —— "
+                           f"现在只能从最近一次往前数（上上次、前两次、倒数第三次）。",
+            }
+        else:
+            data = await lookup_reports(
+                pool,
+                current_user.user_id,
+                competitors,
+                funnel.entities.get("dimensions"),
+                limit=ordv.get("limit", 5),
+                skip=ordv.get("skip", 0),
+            )
     elif funnel.intent == "trace":
         data = await trace_evidence(pool, current_user.user_id, competitors, funnel.keyword)
     else:
