@@ -332,6 +332,72 @@ def _pick_facts(
     return picked
 
 
+def describe_tasks(items, *, dims=None, competitors=None) -> str:
+    """把一次 lookup 的结果说成人话。纯函数：不查库、不读时钟、不看全局状态。
+
+    【为什么要单独一个函数】SQL 变了而文案忘了改，产出的是比"答不上"更糟的东西：
+    跳过了几条还说"最近一次"、库里有 20 次却说"另有 4 条"。抽成函数是为了让
+    「改 SQL」和「改说法」落在同一个视线里，也让文案能被直接断言而不必造池子。
+
+    ⚠️ 输入契约：items 是 `lookup_reports` 建好的那种形态 —— created_at 已由
+       `_iso()` 转成字符串、facts 已挑过。直接喂 asyncpg 的原始记录会崩（`_time_cn`
+       只吃字符串），所以这函数不是"给任何 row 都能用"的通用格式化器。
+    """
+    if not items:
+        return "没有找到匹配的历史任务。" + ("（按竞品筛选后为空）" if competitors else "")
+
+    head = items[0]
+    # ⚠️ report 是 LEFT JOIN：跑完没出报告时 version 也是 None，
+    #   直接 `v{version}` 会念成"报告版本 vNone"（实测踩过）。
+    report_desc = (
+        f"报告版本 v{head['version']}（{head['report_id']}）"
+        if head["version"] is not None
+        else "尚无报告"
+    )
+    summary = (
+        f"最近一次是「{head['title']}」，竞品 {'/'.join(head['competitors']) or '未记录'}，"
+        f"{_status_cn(head['status'])}，创建于 {_time_cn(head['created_at'])}；{report_desc}。"
+    )
+
+    # 若念的结论全都不是这次分析提的，先交代一句 —— 否则读者会以为
+    # 上面那份报告 v1 里写着这句话，而它其实来自更早的一次分析。
+    cross = [f for f in head["facts"] if f.get("source_task_id") != head["task_id"]]
+    if cross and len(cross) == len(head["facts"]):
+        summary += "\n这次分析没提炼到对应结论，最新一条相关观测在更早的分析里："
+
+    # 念结论时**必须带观测日期**：只报"45 元"不报是哪天观测的，
+    # 等于把旧价当现价念 —— 那比答不上更糟。
+    for fact in head["facts"]:
+        when = (fact["observed_at"] or "")[:10] or "未知日期"
+        age = _age_cn(fact["age_days"])
+        tail = f"，{age}" if age else ""
+        # 结论不是这次分析提的，要说清出处，否则用户会以为它出自上面那份报告
+        origin = ""
+        if fact.get("source_task_id") and fact["source_task_id"] != head["task_id"]:
+            origin = f" · 来自「{_short(fact.get('source_title') or '更早一次分析', 18)}」"
+        summary += (
+            f"\n{fact['competitor']}·{fact['dimension']}："
+            f"{_short(fact['claim'], 60)}（观测于 {when}{tail}{origin}）"
+        )
+    if not head["facts"]:
+        # 诚实降级。两种情况回话不同，混成一句会误导：
+        #   ① 一条事实都没有 → 任务可能没跑完，或提炼失败
+        #   ② 有事实但没有这个维度 → 是该维度没提炼，不是整个没提炼
+        dim_desc = f"「{'/'.join(dims)}」的" if dims else ""
+        if head["fact_count"] and dims:
+            summary += f"\n这次分析没提炼到{dim_desc}结论，只有其他维度的事实。"
+        elif head["fact_count"]:
+            # 有事实行但一条都念不出来（空正文/占位串）——不能说"有其他维度"，
+            # 因为没有"其他维度"这回事，只是这批行不可用。
+            summary += "\n这次分析的事实里没有可用结论，要看报告正文。"
+        else:
+            summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
+                else "\n这次分析还没提炼成事实，结论要看报告正文。"
+    if len(items) > 1:
+        summary += f"\n另有 {len(items) - 1} 条更早的记录。"
+    return summary
+
+
 async def lookup_reports(
     pool,
     user_id: str,
@@ -369,21 +435,8 @@ async def lookup_reports(
             "facts": _pick_facts(raw_facts, dims),
         })
 
-    if not items:
-        summary = "没有找到匹配的历史任务。" + ("（按竞品筛选后为空）" if competitors else "")
-    else:
+    if items:
         head = items[0]
-        # ⚠️ report 是 LEFT JOIN：跑完没出报告时 version 也是 None，
-        #   直接 `v{version}` 会念成"报告版本 vNone"（实测踩过）。
-        report_desc = (
-            f"报告版本 v{head['version']}（{head['report_id']}）"
-            if head["version"] is not None
-            else "尚无报告"
-        )
-        summary = (
-            f"最近一次是「{head['title']}」，竞品 {'/'.join(head['competitors']) or '未记录'}，"
-            f"{_status_cn(head['status'])}，创建于 {_time_cn(head['created_at'])}；{report_desc}。"
-        )
         # 先看「上次那次分析」自己提炼了什么；没有就回落到全库最新一条。
         # 回落这一步单独一次查询，且只在 miss 时走 —— 常走的路径仍然是一条 SQL。
         if not head["facts"]:
@@ -395,43 +448,10 @@ async def lookup_reports(
             fact.setdefault("source_task_id", head["task_id"])
             fact.setdefault("source_title", head["title"])
 
-        # 若念的结论全都不是这次分析提的，先交代一句 —— 否则读者会以为
-        # 上面那份报告 v1 里写着这句话，而它其实来自更早的一次分析。
-        cross = [f for f in head["facts"] if f.get("source_task_id") != head["task_id"]]
-        if cross and len(cross) == len(head["facts"]):
-            summary += "\n这次分析没提炼到对应结论，最新一条相关观测在更早的分析里："
-
-        # 念结论时**必须带观测日期**：只报"45 元"不报是哪天观测的，
-        # 等于把旧价当现价念 —— 那比答不上更糟。
-        for fact in head["facts"]:
-            when = (fact["observed_at"] or "")[:10] or "未知日期"
-            age = _age_cn(fact["age_days"])
-            tail = f"，{age}" if age else ""
-            # 结论不是这次分析提的，要说清出处，否则用户会以为它出自上面那份报告
-            origin = ""
-            if fact.get("source_task_id") and fact["source_task_id"] != head["task_id"]:
-                origin = f" · 来自「{_short(fact.get('source_title') or '更早一次分析', 18)}」"
-            summary += (
-                f"\n{fact['competitor']}·{fact['dimension']}："
-                f"{_short(fact['claim'], 60)}（观测于 {when}{tail}{origin}）"
-            )
-        if not head["facts"]:
-            # 诚实降级。两种情况回话不同，混成一句会误导：
-            #   ① 一条事实都没有 → 任务可能没跑完，或提炼失败
-            #   ② 有事实但没有这个维度 → 是该维度没提炼，不是整个没提炼
-            dim_desc = f"「{'/'.join(dims)}」的" if dims else ""
-            if head["fact_count"] and dims:
-                summary += f"\n这次分析没提炼到{dim_desc}结论，只有其他维度的事实。"
-            elif head["fact_count"]:
-                # 有事实行但一条都念不出来（空正文/占位串）——不能说"有其他维度"，
-                # 因为没有"其他维度"这回事，只是这批行不可用。
-                summary += "\n这次分析的事实里没有可用结论，要看报告正文。"
-            else:
-                summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
-                    else "\n这次分析还没提炼成事实，结论要看报告正文。"
-        if len(items) > 1:
-            summary += f"\n另有 {len(items) - 1} 条更早的记录。"
-    return {"items": items, "summary": summary}
+    return {
+        "items": items,
+        "summary": describe_tasks(items, dims=dims, competitors=competitors),
+    }
 
 
 # ── ② trace：按 report_id 取证据链 ──────────────────────────────────────
