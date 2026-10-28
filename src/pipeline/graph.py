@@ -85,9 +85,6 @@ from src.agents import (
 )
 from src.pipeline.state import AgentState
 from src.pipeline.checkpoint import PostgresSaver
-from src.memory.long_term import LongTermMemoryEngine
-from src.memory.conflict import MemoryConflictResolver
-from src.db.dao import AgentMemoryDAO
 from src.db.dao import TaskDAO
 from src.db.connection import create_pool
 from src.mcp import create_mcp_server
@@ -188,11 +185,19 @@ def _make_node_collect(mcp_server: MCPServer, llm: ChatDeepSeek):
     return node_collect
 
 
-def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek, engine: LongTermMemoryEngine):
+def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek):
     """创建 analyze 节点函数（闭包注入 LLM t=0.1）。
 
-    读取 collected_data 中的 task 元信息，调用 analyzer_agent。
+    读取 state 中的 task 元信息，调用 analyzer_agent。
     analyzer_agent 内部：每个维度并行 RAG 检索 + LLM 分析。
+
+    【2026-10-28 移除长期记忆注入】此处曾检索 5 条记忆拼成 memory_context
+    塞进 task，但 analyzer_agent 只读 id / competitors / dimensions，该字段
+    从没进过 prompt —— 检索照跑、日志照打「记忆=N」，是纯成本。
+    三个设想的目的逐条不成立：口径由 prompt 固定（不是靠看历史结论）；
+    补缺需要采集能力（analyze 只能读已有 chunk）；对照旧值该按 subject
+    精确键查（语义召回不保证同竞品同维度）。
+    ⇒ 竞品分析是快照型任务，长期记忆只服务 verify 意图，不是分析质量的杠杆。
     """
     async def node_analyze(state: AgentState) -> dict:
         """Analyzer 节点：RAG 检索 + LLM 分析，写入 analysis_results。
@@ -204,28 +209,17 @@ def _make_node_analyze(mcp_server: MCPServer, llm: ChatDeepSeek, engine: LongTer
         这是一种"State 瘦身"策略——只传控制信息（task_id），
         大体积数据（chunk 文本）留在 DB 中按需检索。
         """
-        user_id = state["user_id"]
-        query = f"{state['title']} {', '.join(state['dimensions'])}"
-        memories = await engine.retrieve(user_id, query)
-
-        memory_context = ""
-        if memories:
-            memory_context = "\n[历史记忆]\n"
-            for i, m in enumerate(memories[:5]):
-                memory_context += f"{i+1}. [{m.get('memory_type','?')}] {m.get('content','')[:200]}\n"
-
         task = {
             "id": state["task_id"],
             "title": state["title"],
             "competitors": state["competitors"],
             "dimensions": state["dimensions"],
-            "memory_context": memory_context,
         }
-        logger.info("【Pipeline】analyze node ── task=%s 维度=%d 记忆=%d 版本=%d(第%d轮)",
-                    state["task_id"], len(state["dimensions"]), len(memories),
+        logger.info("【Pipeline】analyze node ── task=%s 维度=%d 版本=%d(第%d轮)",
+                    state["task_id"], len(state["dimensions"]),
                     state.get("report_version", 1), state.get("remaining_steps", 3))
         result = await analyzer_agent(task, mcp_server, llm)
-        return {"analysis_results": result, "retrieved_memories": memories}
+        return {"analysis_results": result}
     return node_analyze
 
 
@@ -519,11 +513,6 @@ async def build_pipeline_graph(
     saver = PostgresSaver(pool)
     await saver.setup()  # 确保表存在（幂等）
 
-    # ─── 长期记忆引擎 ───
-    agent_memory_dao = AgentMemoryDAO(pool)
-    conflict_resolver = MemoryConflictResolver(llm_analyzer, agent_memory_dao)
-    ltm_engine = LongTermMemoryEngine(llm_analyzer, agent_memory_dao, conflict_resolver)
-
     # ─── 构建图 ───
     graph = StateGraph(AgentState)
 
@@ -532,7 +521,7 @@ async def build_pipeline_graph(
     # 第二个参数是节点函数（async def node_xxx(state) -> dict）
     # 节点名和节点函数分离：同一个函数可以用不同名字注册（虽然这里没用到）
     graph.add_node("collect", _make_node_collect(mcp_server, llm_collector))
-    graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer, ltm_engine))
+    graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer))
     graph.add_node("write", _make_node_write(mcp_server, llm_writer, pool))
     graph.add_node("quality", _make_node_quality(mcp_server, llm_quality))
     graph.add_node("finalize", _make_node_finalize(pool))

@@ -195,13 +195,6 @@ class AgentState(TypedDict):
 
     Analyzer 写入 → Writer 拼入报告 prompt / Quality 抽证据落 evidence_map。
     """
-    
-    retrieved_memories: list[dict]
-    """长期记忆检索结果列表，由 node_analyze 调用 LongTermMemoryEngine.retrieve 写入。
-
-    格式: [{\"content\": \"...\", \"memory_type\": \"...\", \"importance\": 0.8, ...}]
-    注入 Analyzer 的 LLM prompt 作为 memory_context，辅助分析。
-    """
 
     # ══════════════════════════════════════════════════════════════════════
     # Writer 产出 — node_write 写入

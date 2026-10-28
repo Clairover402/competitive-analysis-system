@@ -403,7 +403,6 @@ class A2ARouter:
                 "report_markdown": task.arguments.get("report_markdown", ""),
                 "rewrite_suggestions": task.arguments.get("rewrite_suggestions"),
                 "previous_quality": task.arguments.get("previous_quality"),
-                "memory_context": task.arguments.get("memory_context", ""),
             }
             # 调用 Agent handler（统一签名）
             result = await handler(task_dict, self._mcp_server, llm)
