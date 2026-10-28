@@ -191,3 +191,23 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-chat-pref-q { font-size: 13px; line-height: 1.5; margin-bottom: 8px; }
 .pixel-chat-opt.ghost { color: var(--pixel-light); }
 .pixel-chat-opt.ghost:hover { color: var(--pixel-black); background: var(--pixel-mid); }
+
+/* ── 偏好弹层（事实保鲜期的唯一 UI 入口） ─────────────────────────────
+   为什么单独做一个弹层而不是塞进输入框：保鲜期是 键→天数 的映射，
+   不是一句话能说清的偏好。用一行自由文本猜「定价 30 天」的格式，
+   解析失败时用户不知道错在哪。 */
+.pixel-modal-mask { position: fixed; inset: 0; background: rgba(10,10,10,0.82); display: flex; align-items: center; justify-content: center; z-index: 500; padding: 20px; }
+.pixel-modal { width: min(560px, 100%); max-height: 84vh; overflow-y: auto; padding: 22px; }
+.pixel-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.pixel-modal-title { font-family: var(--pixel-font); font-size: 14px; letter-spacing: 3px; color: var(--pixel-green); }
+.pixel-btn-compact { padding: 8px 14px; font-size: 12px; letter-spacing: 1px; }
+.pixel-ttl-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pixel-ttl-row .pixel-input { padding: 10px 12px; font-size: 14px; }
+.pixel-ttl-key { flex: 1 1 auto; min-width: 0; }
+.pixel-ttl-days { flex: 0 0 92px; }
+.pixel-ttl-unit { flex: 0 0 auto; font-size: 13px; color: var(--pixel-light); }
+.pixel-ttl-del { flex: 0 0 auto; background: transparent; border: none; color: var(--pixel-light); cursor: pointer; font-family: var(--pixel-mono); font-size: 16px; padding: 4px 6px; }
+.pixel-ttl-del:hover { color: var(--pixel-red); }
+.pixel-modal-actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+.pixel-ttl-head { display: flex; gap: 8px; margin-bottom: 6px; font-size: 12px; color: var(--pixel-light); }
+.pixel-ttl-head-days { flex: 0 0 122px; }

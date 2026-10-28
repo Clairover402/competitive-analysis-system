@@ -40,6 +40,18 @@ export const API = {
     return _handle(res);
   },
 
+  /* PUT：目前只有"UI 显式设置偏好"用到（保鲜期覆盖）。
+   * 与 POST 分开是因为语义不同——POST 是新建一条提案/任务，PUT 是
+   * "不管之前有没有，现在就是这个值"（后端 dao.upsert 幂等覆盖）。 */
+  async put(path, body) {
+    var res = await fetch(BASE_URL + path, {
+      method: 'PUT',
+      headers: _headers(),
+      body: JSON.stringify(body),
+    });
+    return _handle(res);
+  },
+
   /* DELETE：目前只有"删偏好/忽略提案"用到（M4）。
    * 单独开一个方法而不是用 post + 动词路径，是为了让接口语义与 HTTP 方法一致——
    * 忽略一条提案就是删掉它，不需要服务端再记一个"已忽略"状态。 */
