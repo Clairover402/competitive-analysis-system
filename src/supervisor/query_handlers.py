@@ -208,7 +208,11 @@ SELECT t.id::text        AS task_id,
        r.id::text        AS report_id,
        r.version         AS version,
        r.quality_score   AS quality_score,
-       f.facts           AS facts
+       f.facts           AS facts,
+       -- 窗口函数在 LIMIT 之前算，所以每行都带着全量总数。
+       -- ⚠️ 加 OFFSET 之后要记住：越界时一行都不返回，这个值也拿不到，
+       --    那种情况得由调用方补一次 count，别指望窗口函数兜。
+       COUNT(*) OVER ()  AS total
   FROM tasks t
   LEFT JOIN LATERAL (
         SELECT id, version, quality_score
@@ -332,7 +336,7 @@ def _pick_facts(
     return picked
 
 
-def describe_tasks(items, *, dims=None, competitors=None) -> str:
+def describe_tasks(items, *, total=None, dims=None, competitors=None) -> str:
     """把一次 lookup 的结果说成人话。纯函数：不查库、不读时钟、不看全局状态。
 
     【为什么要单独一个函数】SQL 变了而文案忘了改，产出的是比"答不上"更糟的东西：
@@ -394,7 +398,14 @@ def describe_tasks(items, *, dims=None, competitors=None) -> str:
             summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
                 else "\n这次分析还没提炼成事实，结论要看报告正文。"
     if len(items) > 1:
-        summary += f"\n另有 {len(items) - 1} 条更早的记录。"
+        # ⚠️ total 优先：`len(items) - 1` 最多只能说出 limit-1 条，而用户要的是
+        #    「一共还有几条」。库里有 20 次的时候，旧说法会回"另有 4 条"。
+        #    total 拿不到（假池 / 越界空结果）才退回窗口内计数。
+        rest = (total - len(items)) if total else (len(items) - 1)
+        if rest > 0:
+            # 恰好取满且没有更多时，别念"另有 0 条"
+            tail = f"（一共 {total} 次分析）" if total else ""
+            summary += f"\n另有 {rest} 条更早的记录{tail}。"
     return summary
 
 
@@ -415,6 +426,9 @@ async def lookup_reports(
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
     dims = [d for d in (dimensions or []) if str(d).strip()] or None
     rows = await pool.fetch(_LOOKUP_SQL, user_id, competitors, limit)
+    # 库里的真实总数（窗口函数给的），用来把"另有 N 条"说准。
+    # 空结果时无从得知，留 None 让 describe_tasks 退回窗口内计数。
+    total = rows[0].get("total") if rows else None
 
     items = []
     for row in rows:
@@ -450,7 +464,8 @@ async def lookup_reports(
 
     return {
         "items": items,
-        "summary": describe_tasks(items, dims=dims, competitors=competitors),
+        "total": total,
+        "summary": describe_tasks(items, total=total, dims=dims, competitors=competitors),
     }
 
 
