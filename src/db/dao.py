@@ -700,15 +700,14 @@ class AgentMemoryDAO:
         embedding: list[float] | None = None,
         source_task_id: str | None = None,
         half_life_days: int = 30,
-        dedupe: bool = False,
         *,
         observed_at: datetime | None = None,
         ttl_days: int | None = None,
         evidence_url: str | None = None,
         subject: str | None = None,
         model_version: str = "bge-m3",
-    ) -> str | None:
-        """插入长期记忆；`dedupe=True` 时撞唯一约束不报错，返回 None。
+    ) -> str:
+        """插入一条长期记忆，返回新行 id。
 
         【L4 工程】embedding 为什么是可选的（None）？
         ------------------------------------------------------------
@@ -717,15 +716,6 @@ class AgentMemoryDAO:
           存 embedding=None 省 2KB 存储。
         但无 embedding 的记忆只能用 keyword_search（zhparser），
         不能用 similarity_search。这是"按需求选择检索方式"的体现。
-
-        【为什么 dedupe 用 ON CONFLICT DO NOTHING 而不是捕异常】
-        ------------------------------------------------------------
-        任务重跑时"这条 episode 已存在"是**正常路径**，不是错误。
-        捕 UniqueViolationError 会让上层必须认识 asyncpg 的异常类型，
-        而且异常会把连接的事务状态弄脏（需要在 savepoint 里做）；
-        ON CONFLICT 让数据库自己判定，语义也更直白：写不进去就是已经有了。
-        ⚠️ 只有 episode 有部分唯一索引，所以这个分支只对 memory_type='episode' 有意义，
-           dedupe=True 配其他类型等于没开（会照常插入）。
 
         【M3 新增字段各自的用途，别混用】
         ------------------------------------------------------------
@@ -747,11 +737,8 @@ class AgentMemoryDAO:
                                             observed_at, ttl_days, evidence_url,
                                             subject, model_version)
                  VALUES ($1, $2, $3, $4, $5::vector, $6, $7,
-                         COALESCE($8::timestamptz, NOW()), $9, $10, $11, $12)"""
-        if dedupe:
-            # 谓词必须与部分唯一索引完全一致，否则 PG 推断不出该索引
-            sql += " ON CONFLICT (source_task_id) WHERE memory_type = 'episode' DO NOTHING"
-        sql += " RETURNING id"
+                         COALESCE($8::timestamptz, NOW()), $9, $10, $11, $12)
+                 RETURNING id"""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 sql,
@@ -759,7 +746,7 @@ class AgentMemoryDAO:
                 _vector_str(embedding) if embedding else None, source_task_id, half_life_days,
                 observed_at, ttl_days, evidence_url, subject, model_version,
             )
-            return str(row["id"]) if row else None
+            return str(row["id"])
 
     async def count(self, user_id: str) -> int:
         """该用户当前有几条活跃记忆。
@@ -884,8 +871,6 @@ class AgentMemoryDAO:
         同竞品同维度的两条不同事实（"支持多维表格" / "支持自动化流程"）
         句式高度相似，全库比会把它们判成同一条，然后**删掉一条真的信息**。
         subject（`飞书|定价`）先把候选压到"同一个竞品的同一个维度"，再比语义。
-
-        只比 fact —— episode 是追加式历史，不该被取代（见 M2 的取舍）。
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(

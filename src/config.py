@@ -88,21 +88,16 @@ class Settings(BaseSettings):
     intent_funnel_floor: float = 0.55
     intent_funnel_margin: float = 0.10
 
-    # ---- 长期记忆写入（2026-10-27 M2：episodic）----
+    # ---- 长期记忆写入（2026-10-27 M3：semantic 事实 + 时效）----
     # 【为什么加开关】写记忆是"任务完成后的附加动作"，一旦它出问题
     #   （embed 服务抖动 / 表被锁），最坏结果是"记忆没写进去"，
     #   但绝不能变成"任务被判失败"。开关是留给线上紧急止损用的：
     #   关掉即回到"每份报告都从零开始"，任务链路本身不受影响。
-    memory_episodic_enabled: bool = True
-    # 【为什么 episode 只留 200 字】它的消费端是 analyze 的 [历史记忆] 段，
-    #   注入 5 条就要占掉 1000 字预算；而 episode 要表达的只是
-    #   "分析过谁、用了哪些维度、结论朝哪边走"——具体的数字属于 M3 的 semantic，
-    #   那类才需要带 TTL 去管过期。
-    memory_episodic_max_chars: int = 200
-
-    # ---- 长期记忆写入（2026-10-27 M3：semantic 事实 + 时效）----
-    # 与 episode 分开开关：episode 出错只是"少一条历史"，fact 出错会污染
-    # verify 的答案（拿一条已失效的价格当当前事实念给用户），必须能单独停。
+    # 【为什么没有 episodic 开关】episode 不落记忆表 —— 一次任务的经过由
+    #   tasks + reports 承载（结构化查询、随版本更新）。要停掉情景记忆等于
+    #   停掉任务表本身，那不是记忆开关能承担的事。
+    #   fact 出错会污染 verify 的答案（拿一条已失效的价格当当前事实念给用户），
+    #   必须能单独停。
     memory_semantic_enabled: bool = True
     # 一个任务最多提炼多少条事实。报告证据行常见 8~20 条，全写会把
     # 一个任务的结论淹没在同一次爬取的复述里；20 条已覆盖结论骨架。

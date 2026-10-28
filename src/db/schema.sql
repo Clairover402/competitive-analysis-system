@@ -472,19 +472,15 @@ CREATE INDEX IF NOT EXISTS idx_agent_memories_is_active ON agent_memories (is_ac
 CREATE INDEX IF NOT EXISTS idx_agent_memories_embedding_hnsw
     ON agent_memories USING hnsw (embedding vector_cosine_ops);
 
--- 【幂等】一个任务只能有一条 episode —— 2026-10-27 M2
+-- 【已移除】uq_agent_memories_episode_task（2026-10-27 建，2026-10-28 撤）
 -- ------------------------------------------------------------
--- 为什么需要它：任务重跑（改写/失败重试/手动 resume）会再次走到收尾写入，
--- 没有这条约束就会**同一份分析留下两三条几乎相同的 episode**，
--- 而 analyze 注入 [历史记忆] 时它们会互相挤占 5 条配额。
--- 为什么是**部分**唯一索引（WHERE memory_type='episode'）：
---   M3 的 semantic 事实恰恰允许多条并存（"飞书定价 200" 被"飞书定价 180"取代前
---   属于 supersession 关系），只有 episode 是"一任务一条"的语义；
---   全表唯一会把 semantic 一起锁死。
--- ⚠️ 软删除的行也占这个坑（is_active=false 仍然冲突）：
---   这是刻意的——任务重跑不该把一条被人工归档的旧结论又插回来。
-CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_memories_episode_task
-    ON agent_memories (source_task_id) WHERE memory_type = 'episode';
+-- 原意是"一个任务只能有一条 episode"，靠部分唯一索引 + ON CONFLICT DO NOTHING 做幂等。
+-- 撤掉的原因是这条记录本身不该存在：情景记忆（"某年某月发生过什么"）的查询是
+-- 结构化的——按用户、时间、竞品精确查，而 `tasks` + `reports` 已经在存这件事，
+-- 还多带状态、版本、质量分。往 agent_memories 再写一条摘要是同一份事实的第二副本，
+-- 且重跑走 DO NOTHING 不更新，而 reports 的 version 在递增，两者会静默分叉。
+-- 留下这条 DROP 是为了让重跑本脚本的环境自动清掉旧索引。
+DROP INDEX IF EXISTS uq_agent_memories_episode_task;
 
 
 -- ============================================================

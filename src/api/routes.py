@@ -438,12 +438,12 @@ async def lifespan(app: FastAPI):
     from src.supervisor.router import IntentRouter
     app.state.router = IntentRouter(settings)
 
-    # ── 长期记忆写入口（M2，2026-10-27）──
+    # ── 长期记忆写入口（M3，2026-10-27）──
     # 只建一个实例供**写**用，和 pipeline 图内部那个读实例是两个对象，区别是：
-    #   · 这里刻意**不传 conflict_resolver** —— 冲突检测（相似度≥0.85 → LLM 仲裁 → 软删旧记忆）
-    #     的语义是"新观测取代旧观测"，只对 fact/decision 成立；
-    #     episode 是追加式历史，同批竞品同批维度的两条 episode 模板高度相似，
-    #     会被判成冲突而互相删除，于是"上个月那次分析"永久消失。
+    #   · 这里刻意**不传 conflict_resolver** —— 冲突检测（相似度≥0.85 → LLM 仲裁 →
+    #     软删旧记忆）的语义是"新观测取代旧观测"，而 fact 的取代要更严：
+    #     必须先同 subject 再比 0.90（见 `semantic.write_task_facts`），
+    #     走 resolver 会把"支持多维表格"和"支持自动化流程"判成同一条而误删。
     #   · 读路径继续用 pipeline 图里那个带 resolver 的实例（它只读，resolver 不会触发）。
     from src.db.dao import AgentMemoryDAO as _AgentMemoryDAO
     from src.memory.long_term import LongTermMemoryEngine
@@ -719,40 +719,18 @@ async def _execute_task(
             "elapsed_ms": int(elapsed * 1000),
         })
 
-        # ── 4.5 写一条 episode（长期记忆，2026-10-27 M2）──
-        # 【为什么在这里而不是 finalize 节点】pipeline 与 supervisor 两条路径
-        #   都会走到这行；分别写进两个图的 finalize 节点必然漏一处。
-        # 【为什么放在 completed 之后】记忆是任务完成后的附加动作：
-        #   写失败只影响"下次分析少一条参考"，绝不能把已完成的任务改成 failed。
-        #   write_task_episode 内部已 try/except 兜底，这里再包一层防 getattr 之类意外。
+        # ── 4.6 从证据链提事实（M3，2026-10-27）──
+        # 【为什么放在 completed 之后】记忆是任务完成后的附加动作：写失败只影响
+        #   "下次核对少一条依据"，绝不能把已完成的任务改成 failed。
+        # 【为什么只写 fact、不写 episode】一次任务的经过（分析了谁、什么时候、
+        #   出了哪份报告、质量多少分）已经由 tasks + reports 承载——那才是情景记忆
+        #   该在的地方，因为它要的是**结构化查询**（按用户/时间/竞品精确查），
+        #   不是向量召回。再往 agent_memories 写一条摘要，是同一份事实的第二副本，
+        #   且重跑走 DO NOTHING 不更新，会与 reports 的新版本静默分叉。
+        # 【为什么事实来自 evidence_map 而不是报告正文】正文里的句子没有来源 URL；
+        #   把"模型说过的话"升格成"观测到的事实"，之后就再也查不回来了。
         memory_engine = getattr(request.app.state, "memory_engine", None)
         if memory_engine is not None:
-            from src.memory.episode import write_task_episode
-
-            try:
-                await write_task_episode(
-                    engine=memory_engine,
-                    llm=getattr(request.app.state, "memory_llm", None),
-                    task=enriched_task,
-                    route_type=route_type,
-                    report_text=(
-                        final_state.get("final_report", "")
-                        if route_type == "pipeline"
-                        else final_state.get("final_output", "")
-                    ),
-                    quality_score=final_state.get("quality_score", 0.0),
-                    settings=request.app.state.settings,
-                )
-            except Exception:  # noqa: BLE001
-                logger.warning("episode 写入异常（已忽略） task=%s", task_id_str[:8],
-                               exc_info=True)
-
-            # ── 4.6 从证据链提事实（M3，2026-10-27）──
-            # 【为什么紧跟在 episode 之后、同一个 try 之外】两者独立失败：
-            #   episode 挂了不该连累 fact（fact 才是 verify 的数据源），
-            #   反之亦然。各自兜自己的异常，一个写了另一个没写仍算正常。
-            # 【为什么事实来自 evidence_map 而不是报告正文】正文里的句子没有来源 URL；
-            #   把"模型说过的话"升格成"观测到的事实"，之后就再也查不回来了。
             try:
                 from src.memory.semantic import write_task_facts
 
