@@ -1136,7 +1136,14 @@ async def chat(
     competitors = funnel.entities.get("competitors") or None
 
     if funnel.intent == "lookup":
-        data = await lookup_reports(pool, current_user.user_id, competitors)
+        # dimensions 一路传下去：之前这里只给小了 competitors，"定价"这个词
+        # 在调用处就丢了，SQL 再准也只剩「钉钉」这一个条件。
+        data = await lookup_reports(
+            pool,
+            current_user.user_id,
+            competitors,
+            funnel.entities.get("dimensions"),
+        )
     elif funnel.intent == "trace":
         data = await trace_evidence(pool, current_user.user_id, competitors, funnel.keyword)
     else:

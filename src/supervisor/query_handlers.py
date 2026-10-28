@@ -5,7 +5,7 @@
   不做：不做语义匹配（那是 L3 的事）、不写库、不调 Agent、不生成报告。
 
 【输入 → 输出】
-  lookup_reports(pool, user_id, competitors)              -> {"items": [...], "summary": str}
+  lookup_reports(pool, user_id, competitors, dimensions)  -> {"items": [...], "summary": str}
   trace_evidence(pool, user_id, competitors, keyword)     -> 同上
   check_freshness(pool, user_id, competitors, keyword)    -> 同上（附 fresh/stale 判定）
 
@@ -13,6 +13,9 @@
   ★ 三跳全走 SQL，零 LLM ← 用户问的是**确定指代**（"上次""那份"），
     语义相似度会召回错任务，确定性查询只能用确定性工具
   ★ 排序一律 created_at DESC ← "上次"的字面含义就是时间最近，不需要模型理解
+  ★ lookup 也念事实正文（2026-10-28 补）← 问「上次钉钉定价多少」要的是那句话，
+    不是"有这么一份报告"。取法与 verify 相同：subject 定位 + content 第 2 行，
+    读的是同一张表、同一个 `_fact_claim`，不新增检索路径、不走向量
   ★ verify 的数据源是 `agent_memories` 的 fact（带 observed_at / ttl_days），
     不是 evidence_map ← M3 之后两者分工明确：证据答"引用过什么"，
     事实答"当前有效观测是哪条"，只有后者能判"多久没核对"
@@ -58,6 +61,23 @@ def _as_list(value: Any) -> list:
             return []
         return parsed if isinstance(parsed, list) else []
     return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _as_objects(value: Any) -> list[dict]:
+    """`json_agg` 出来的对象数组 → list[dict]；asyncpg 未注册 codec 时给字符串。
+
+    与 `_as_list` 分开是因为两者校验的形态不同：一个是字符串数组，
+    一个是对象数组。混用一个「能解析就返回」的宽容实现，会把
+    `["a","b"]` 也悄悄放行，调用方随后对 str 取 `.get()` 才炸。
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def _iso(value: Any) -> str | None:
@@ -187,7 +207,8 @@ SELECT t.id::text        AS task_id,
        t.created_at      AS created_at,
        r.id::text        AS report_id,
        r.version         AS version,
-       r.quality_score   AS quality_score
+       r.quality_score   AS quality_score,
+       f.facts           AS facts
   FROM tasks t
   LEFT JOIN LATERAL (
         SELECT id, version, quality_score
@@ -196,25 +217,142 @@ SELECT t.id::text        AS task_id,
          ORDER BY version DESC
          LIMIT 1
   ) r ON TRUE
+  -- 该任务提炼出的事实。取的键是 source_task_id（不是 subject 全库最新）：
+  --   问的是「上次分析里定价多少」，答案就该是那一次提炼的那条。
+  --   LIMIT 8 是因为单任务 fact 通常 3~6 条，给足余量又不会把整行撑爆。
+  LEFT JOIN LATERAL (
+        SELECT json_agg(json_build_object(
+                   'subject',     m.subject,
+                   'content',     m.content,
+                   'observed_at', m.observed_at
+               ) ORDER BY m.observed_at DESC NULLS LAST) AS facts
+          FROM (SELECT subject, content, observed_at
+                  FROM agent_memories
+                 WHERE source_task_id = t.id
+                   AND memory_type = 'fact'
+                   AND status = 'active'          -- 被顶掉的旧观测不念
+                   AND is_active = true
+                 ORDER BY observed_at DESC NULLS LAST
+                 LIMIT 8) m
+  ) f ON TRUE
  WHERE t.user_id = $1
    AND ($2::text[] IS NULL OR t.competitors ?| $2::text[])
  ORDER BY t.created_at DESC
  LIMIT $3
 """
 
+# 回落查询：该任务没提炼到时要找的那条事实。
+# ★ 为什么要有它：问「飞书定价多少」，若最近一次分析恰好没提炼定价，
+#   而库里有一条三个月前的 active 事实，回一句"这次没提炼到"等于装作不知道。
+# ★ 这里才按 subject 前缀取全库最新（上限查询是按 task 取的），两者分工：
+#   先去答"上次那次说了什么"，答不上再答"最近一次知道的观测是哪条"。
+_FACT_BY_SUBJECT_SQL = """
+SELECT m.subject                         AS subject,
+       m.content                         AS content,
+       m.observed_at                     AS observed_at,
+       m.source_task_id::text            AS task_id,
+       t.title                           AS task_title
+  FROM agent_memories m
+  LEFT JOIN tasks t ON t.id = m.source_task_id
+ WHERE m.user_id = $1
+   AND m.memory_type = 'fact'
+   AND m.status = 'active'
+   AND m.is_active = true
+   -- 竞品过滤走 subject 前缀，不用 content LIKE：对比句会让 LIKE 串竞品
+   AND ($2::text[] IS NULL
+        OR m.subject ~ ('^(' || array_to_string($2::text[], '|') || ')\\|'))
+   AND ($3::text[] IS NULL
+        OR m.subject ~ ('\\|(' || array_to_string($3::text[], '|') || ')$'))
+ ORDER BY m.observed_at DESC NULLS LAST
+ LIMIT $4
+"""
+
+
+def _age_cn(age_days: int | None) -> str:
+    """距今天数的口语化。★ 「0 天前」不是人话，写成「今天」。"""
+    if age_days is None:
+        return ""
+    if age_days <= 0:
+        return "今天"
+    if age_days == 1:
+        return "昨天"
+    return f"{age_days} 天前"
+
+
+def _pick_facts(
+    raw_facts: Any,
+    dimensions: list[str] | None,
+    limit: int = 2,
+) -> list[dict]:
+    """从该任务的事实里挑出要给用户念的那几条。
+
+    ★ 维度优先：用户问「定价多少」时，把同一任务里「功能」的那条也念出来，
+      不是信息丰富，是答非所问。没给维度就按 observed_at 取最新一条。
+    ⚠️ 只挑不判：fresh / stale 是 verify 的职责（它还要叠用户偏好），
+      这里只报「观测于哪天、距今几天」，让用户自己看新旧。
+    """
+    wanted = [str(d).strip() for d in (dimensions or []) if str(d).strip()]
+    now = datetime.now(timezone.utc)
+    picked: list[dict] = []
+    for raw in _as_objects(raw_facts):
+        competitor, dimension = _split_subject(raw.get("subject"))
+        claim = _fact_claim(raw.get("content") or "")
+        if not claim:
+            continue
+        if wanted and not any(w in dimension or dimension in w for w in wanted):
+            continue
+        observed = raw.get("observed_at")
+        # ⚠️ json_agg 出来的时间戳是**字符串**（asyncpg 不对 json 里的值做类型转换），
+        #   只有直接查列的 verify 才拿到 datetime。两种形态都要认，
+        #   否则 age_days 恒为 None，摘要里就少一句"几天前"。
+        observed_dt = None
+        if isinstance(observed, datetime):
+            observed_dt = observed
+        elif isinstance(observed, str):
+            try:
+                observed_dt = datetime.fromisoformat(observed)
+            except ValueError:
+                observed_dt = None
+        if observed_dt is not None and observed_dt.tzinfo is None:
+            # naive 时间戳与 now(aware) 相减会 TypeError，按 UTC 补齐
+            observed_dt = observed_dt.replace(tzinfo=timezone.utc)
+        age_days = (now - observed_dt).days if observed_dt else None
+        picked.append({
+            "competitor": competitor,
+            "dimension": dimension,
+            "claim": claim,
+            "observed_at": _iso(observed_dt) or (observed if isinstance(observed, str) else None),
+            "age_days": age_days,
+            # 只有回落查询会带这两项；上限查询（同任务）由调用方补
+            "source_task_id": raw.get("task_id"),
+            "source_title": raw.get("task_title"),
+        })
+        if len(picked) >= limit:
+            break
+    return picked
+
 
 async def lookup_reports(
     pool,
     user_id: str,
     competitors: list[str] | None = None,
+    dimensions: list[str] | None = None,
     limit: int = 5,
 ) -> dict:
-    """按用户（可选再按竞品）取最近的任务与报告。"""
+    """按用户（可选再按竞品、维度）取最近的任务与报告，并把结论一并念出来。
+
+    【2026-10-28 补缺口】此前只回标题/状态/版本，问「上次钉钉定价多少」
+    只答得上"有这么一份报告"。现在多挂一条 LATERAL 取该任务提炼的 fact，
+    读 content 第 2 行当答案 —— 与 verify 用的是同一张表、同一个 `_fact_claim`，
+    不新增检索路径，也不走向量（见模块头"读取靠键、写入靠向量"）。
+    """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
+    dims = [d for d in (dimensions or []) if str(d).strip()] or None
     rows = await pool.fetch(_LOOKUP_SQL, user_id, competitors, limit)
 
     items = []
     for row in rows:
+        raw_facts = _as_objects(row.get("facts"))
         items.append({
             "task_id": row["task_id"],
             "title": row["title"],
@@ -225,6 +363,10 @@ async def lookup_reports(
             "report_id": row["report_id"],
             "version": row["version"],
             "quality_score": row["quality_score"],
+            # fact_count 是「这个任务一共提炼了几条」，用于区分「没提炼」与
+            # 「提炼了但没有你要的维度」——两种情况的回话不一样，别混成一句。
+            "fact_count": len(raw_facts),
+            "facts": _pick_facts(raw_facts, dims),
         })
 
     if not items:
@@ -242,8 +384,53 @@ async def lookup_reports(
             f"最近一次是「{head['title']}」，竞品 {'/'.join(head['competitors']) or '未记录'}，"
             f"{_status_cn(head['status'])}，创建于 {_time_cn(head['created_at'])}；{report_desc}。"
         )
+        # 先看「上次那次分析」自己提炼了什么；没有就回落到全库最新一条。
+        # 回落这一步单独一次查询，且只在 miss 时走 —— 常走的路径仍然是一条 SQL。
+        if not head["facts"]:
+            # ⚠️ 这里要显式 dict(row)：直查拿到的是 asyncpg.Record，
+            #   不是 dict，`_pick_facts` 会把它当"非对象"整批丢掉（踩过，静默空）。
+            fallback_rows = await pool.fetch(_FACT_BY_SUBJECT_SQL, user_id, competitors, dims, 6)
+            head["facts"] = _pick_facts([dict(r) for r in fallback_rows], dims)
+        for fact in head["facts"]:
+            fact.setdefault("source_task_id", head["task_id"])
+            fact.setdefault("source_title", head["title"])
+
+        # 若念的结论全都不是这次分析提的，先交代一句 —— 否则读者会以为
+        # 上面那份报告 v1 里写着这句话，而它其实来自更早的一次分析。
+        cross = [f for f in head["facts"] if f.get("source_task_id") != head["task_id"]]
+        if cross and len(cross) == len(head["facts"]):
+            summary += "\n这次分析没提炼到对应结论，最新一条相关观测在更早的分析里："
+
+        # 念结论时**必须带观测日期**：只报"45 元"不报是哪天观测的，
+        # 等于把旧价当现价念 —— 那比答不上更糟。
+        for fact in head["facts"]:
+            when = (fact["observed_at"] or "")[:10] or "未知日期"
+            age = _age_cn(fact["age_days"])
+            tail = f"，{age}" if age else ""
+            # 结论不是这次分析提的，要说清出处，否则用户会以为它出自上面那份报告
+            origin = ""
+            if fact.get("source_task_id") and fact["source_task_id"] != head["task_id"]:
+                origin = f" · 来自「{_short(fact.get('source_title') or '更早一次分析', 18)}」"
+            summary += (
+                f"\n{fact['competitor']}·{fact['dimension']}："
+                f"{_short(fact['claim'], 60)}（观测于 {when}{tail}{origin}）"
+            )
+        if not head["facts"]:
+            # 诚实降级。两种情况回话不同，混成一句会误导：
+            #   ① 一条事实都没有 → 任务可能没跑完，或提炼失败
+            #   ② 有事实但没有这个维度 → 是该维度没提炼，不是整个没提炼
+            dim_desc = f"「{'/'.join(dims)}」的" if dims else ""
+            if head["fact_count"] and dims:
+                summary += f"\n这次分析没提炼到{dim_desc}结论，只有其他维度的事实。"
+            elif head["fact_count"]:
+                # 有事实行但一条都念不出来（空正文/占位串）——不能说"有其他维度"，
+                # 因为没有"其他维度"这回事，只是这批行不可用。
+                summary += "\n这次分析的事实里没有可用结论，要看报告正文。"
+            else:
+                summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
+                    else "\n这次分析还没提炼成事实，结论要看报告正文。"
         if len(items) > 1:
-            summary += f"另有 {len(items) - 1} 条更早的记录。"
+            summary += f"\n另有 {len(items) - 1} 条更早的记录。"
     return {"items": items, "summary": summary}
 
 
