@@ -240,32 +240,45 @@ def _ordinal_cn(n: int) -> str:
     return _NUM_CN[n - 1] if 1 <= n <= 10 else str(n)
 
 
+# ★ 量词在中文里几乎是自由变量（次 / 回 / 个 / 遍），**按说法枚举必然漏**：
+#   实测漏过一次 —— 表里只写了「上上次|上上回」，用户说「上上个任务」就没命中，
+#   静默退回 skip=0（最近一次），把倒数第二次的分析当最新的答出去。
+#   不报错、不崩，只是答错 —— 所以这里枚举的是**结构**：
+#   「上」重复几次 = 往前数几次，量词交给字符类自由匹配。
+# ⚠️ 统一带 (?!月)：「上上个」结尾没有量词也算序号，但「上上个月」「第 3 个月」
+#   说的是时间不是序号，两个都不能当 skip 用。
+_W = r"[次回个遍](?!月)"
+
+
 def parse_ordinal(text: str | None) -> dict | None:
     """从用户原话里抽「第几次」。不命中返回 None，走默认（最近一次）。
 
-    ⚠️ 顺序敏感，三处都不能调换：
-       ① 「上上上次」必须先于「上上次」—— 后者是前者的子串
-       ② 「第一次/最早」必须先于「第 N 次」—— 否则会被当成 skip=0 的"最近一次"
-       ③ 「第 N 次」单独一条正则，不能和「前/最近 N 次」共用 —— 前缀不同，
+    ⚠️ 顺序敏感，两处不能调换：
+       ① 「第一次/最早」必须先于「第 N 次」—— 否则会被当成 skip=0 的"最近一次"
+       ② 「第 N 次」单独一条正则，不能和「前/最近 N 次」共用 —— 前缀不同，
           共用会让「前两次」被解析成 skip=1
     ⚠️ 「上次 / 最近一次」**故意不在表里**：它们等于默认行为，写进来只是把
        "不命中"改写成"命中 skip=0"，多一个分支却没有行为差异。
+    ⚠️ 不命中是**静默**的 —— 这是本函数唯一危险的地方。新增说法时先补测试，
+       否则用户问「上上个」会得到「最近一次」的答案而不自知。
     """
     s = (text or "").strip()
     if not s:
         return None
 
-    if re.search(r"上上上次|上上上回", s):
-        return {"skip": 2, "limit": 1}
-    if re.search(r"上上次|上上回", s):
-        return {"skip": 1, "limit": 1}
+    # 「上上」= 倒数第二、「上上上」= 倒数第三。数「上」的个数，不枚举说法：
+    # 老写法把「上上上次」「上上次」写成两条并列正则，量词换个字就漏。
+    m = re.search(rf"(上{{2,}})\s*{_W}", s)
+    if m:
+        skip = len(m.group(1)) - 1
+        return {"skip": skip, "limit": 1} if skip <= _MAX_SKIP else None
 
-    m = re.search(r"倒数第\s*([一二两三四五六七八九十]+|\d+)\s*[次回个]", s)
+    m = re.search(rf"倒数第\s*([一二两三四五六七八九十]+|\d+)\s*{_W}", s)
     if m:
         n = _cn_int(m.group(1))
         return {"skip": n - 1, "limit": 1} if n and n - 1 <= _MAX_SKIP else None
 
-    m = re.search(r"(?:最近|前)\s*([一二两三四五六七八九十]+|\d+)\s*[次回个]", s)
+    m = re.search(rf"(?:最近|前)\s*([一二两三四五六七八九十]+|\d+)\s*{_W}", s)
     if m:
         n = _cn_int(m.group(1))
         # ⚠️ n 必须 ≥ 2：「最近一次」「前一次」就等于默认行为，命中只会把
@@ -275,10 +288,10 @@ def parse_ordinal(text: str | None) -> dict | None:
     if re.search(r"全部|所有|都列出|每一条", s):
         return {"skip": 0, "limit": _ALL_LIMIT}
 
-    if re.search(r"最早|最初|头一次|第一次", s):
+    if re.search(r"最早|最初|头一次|第一次|第一回|头一个|第一个", s):
         return {"unsupported": "最早"}
 
-    m = re.search(r"第\s*([一二两三四五六七八九十]+|\d+)\s*[次回]", s)
+    m = re.search(rf"第\s*([一二两三四五六七八九十]+|\d+)\s*{_W}", s)
     if m:
         n = _cn_int(m.group(1))
         return {"skip": n - 1, "limit": 1} if n and 0 < n - 1 <= _MAX_SKIP else None
@@ -494,22 +507,29 @@ def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None) ->
             tail = f"，{age}" if age else ""
             # 结论不是这次分析提的，要说清出处，否则用户会以为它出自上面那份报告
             origin = ""
-            if fact.get("source_task_id") and fact["source_task_id"] != head["task_id"]:
+            src_task = fact.get("source_task_id")
+            # ⚠️ 判据是 `src_task is None or !=`，不是 `src_task and !=`：
+            #   None 是"出处未知"（回落来的行 source_task_id 可能为空），
+            #   它同样不等于当前任务，照样得标出处。用 and 会让这批悄悄不标，
+            #   读者就以为这话出自上面那份报告。
+            if src_task is None or src_task != head["task_id"]:
                 origin = f" · 来自「{_short(fact.get('source_title') or '更早一次分析', 18)}」"
             summary += (
                 f"\n{fact['competitor']}·{fact['dimension']}："
                 f"{_short(fact['claim'], 60)}（观测于 {when}{tail}{origin}）"
             )
         if not head["facts"]:
-            # 诚实降级。两种情况回话不同，混成一句会误导：
-            #   ① 一条事实都没有 → 任务可能没跑完，或提炼失败
-            #   ② 有事实但没有这个维度 → 是该维度没提炼，不是整个没提炼
+            # 诚实降级。先按"有没有报告"分叉：没有报告时说"结论要看报告正文"
+            # 是空话 —— 用户翻不到。三种情况的回话互不替代：
+            #   ① 没产出报告 → 直说，别让人去翻
+            #   ② 有报告但没提炼到你要的维度 → 只有其他维度
+            #   ③ 有报告、有事实行，但一条都念不出来（空正文/占位串）
             dim_desc = f"「{'/'.join(dims)}」的" if dims else ""
-            if head["fact_count"] and dims:
+            if head["report_id"] is None:
+                summary += "\n这次分析没有产出报告。"
+            elif head["fact_count"] and dims:
                 summary += f"\n这次分析没提炼到{dim_desc}结论，只有其他维度的事实。"
             elif head["fact_count"]:
-                # 有事实行但一条都念不出来（空正文/占位串）——不能说"有其他维度"，
-                # 因为没有"其他维度"这回事，只是这批行不可用。
                 summary += "\n这次分析的事实里没有可用结论，要看报告正文。"
             else:
                 summary += f"\n这次分析还没提炼成事实（{dim_desc}结论要看报告正文）。" if dims \
@@ -582,13 +602,20 @@ async def lookup_reports(
 
     if items:
         head = items[0]
-        # 先看「上次那次分析」自己提炼了什么；没有就回落到全库最新一条。
+        # 先看「上次那次分析」自己提炼了什么；没有就回落到库里的同竞品事实。
         # 回落这一步单独一次查询，且只在 miss 时走 —— 常走的路径仍然是一条 SQL。
         if not head["facts"]:
-            # ⚠️ 这里要显式 dict(row)：直查拿到的是 asyncpg.Record，
-            #   不是 dict，`_pick_facts` 会把它当"非对象"整批丢掉（踩过，静默空）。
-            fallback_rows = await pool.fetch(_FACT_BY_SUBJECT_SQL, user_id, competitors, dims, 6)
-            head["facts"] = _pick_facts([dict(r) for r in fallback_rows], dims)
+            # ⚠️ 回落的锚点必须是**这个任务自己的竞品**，不能是请求里的过滤条件。
+            #   请求没带竞品时 $2 是 NULL，条件退化成"全库最新 6 条"，于是把
+            #   不相干竞品的结论挂到这个任务头上（实测：「我上上个任务是啥」答出
+            #   一个"竞品未记录、尚无报告"的任务，底下却念着 GitHub Copilot 的定价）。
+            #   连竞品都没记的任务根本无从对齐，跳过回落比乱念好。
+            scope = head.get("competitors") or []
+            if scope:
+                # ⚠️ 显式 dict(row)：直查拿到的是 asyncpg.Record 不是 dict，
+                #   `_pick_facts` 会把它当"非对象"整批丢掉（踩过，静默空）。
+                fallback_rows = await pool.fetch(_FACT_BY_SUBJECT_SQL, user_id, scope, dims, 6)
+                head["facts"] = _pick_facts([dict(r) for r in fallback_rows], dims)
         for fact in head["facts"]:
             fact.setdefault("source_task_id", head["task_id"])
             fact.setdefault("source_title", head["title"])
