@@ -13,6 +13,7 @@
   `effective()`               → `{key: value}`（只含 user_set/confirmed）
   `for_injection()`           → (可注入 dict, 被压制的 [(key, 原因)])
   `format_block()`            → writer prompt 的一段文本
+  `load_overrides()`          → 保鲜期覆盖 `{关键词: 天数}`（给 verify 与 fact 写入用）
   `detect_proposals()`        → 待确认提案列表（进确认卡，不进 prompt）
 
 【关键决策】
@@ -28,6 +29,11 @@
       真正的优先级由"压制"实现；放前面是为了让它影响后续所有写法描述
   · 提案识别先过关键词门 ← 每轮对话都调一次 LLM 判"有没有在说偏好"，
       90% 的轮次是白烧；命中"以后/默认/每次"才花这次钱
+  · `ttl_overrides` 标 `inject=False`，不进 writer prompt ← 其余三个键改的是
+      "报告长什么样"，它改的是"多久算旧"（verify 的判断标准）。混进 prompt
+      只会让 writer 去操心它并不掌握的时效信息
+  · 保鲜期覆盖**只按纯配置走**，不做对话自动推断 ← 猜错会静默改掉判断标准，
+      正是三级写入纪律要防的那类错误；而它是纯配置项，显式设置成本极低
 
 【读法/注意事项】
   ⚠️ `proposed` 永不进 prompt。`PreferenceDAO.get_effective()` 已在 SQL 层过滤，
@@ -82,6 +88,35 @@ def _check_report_style(value: Any) -> str | None:
     return None
 
 
+_TTL_MIN_DAYS = 1
+_TTL_MAX_DAYS = 3650        # 10 年；再长就等于"永不过期"，那是关掉判断，不是配保鲜期
+_TTL_MAX_ITEMS = 8
+
+
+def _check_ttl_overrides(value: Any) -> str | None:
+    """保鲜期覆盖：{"定价": 7, "融资": 180}。键是维度/正文里的关键词。"""
+    if not isinstance(value, dict) or not value:
+        return "需要是非空对象，如 {\"定价\": 7}"
+    if len(value) > _TTL_MAX_ITEMS:
+        return f"最多 {_TTL_MAX_ITEMS} 项，实际 {len(value)} 项"
+    for raw_key, days in value.items():
+        name = str(raw_key).strip()
+        if not name:
+            return "存在空的维度关键词"
+        if len(name) > 16:
+            return f"关键词「{name}」超过 16 字"
+        # ⚠️ bool 是 int 的子类：不显式挡住，{"定价": true} 会被当成 1 天存进去
+        if isinstance(days, bool) or not isinstance(days, int):
+            return f"「{name}」的天数需要是整数"
+        if not _TTL_MIN_DAYS <= days <= _TTL_MAX_DAYS:
+            return f"「{name}」的天数需在 {_TTL_MIN_DAYS}~{_TTL_MAX_DAYS} 之间，实际 {days}"
+    return None
+
+
+def _describe_ttl(value: dict) -> str:
+    return "、".join(f"{k} {v} 天" for k, v in value.items())
+
+
 KNOWN_KEYS: dict[str, dict] = {
     "default_dimensions": {
         "label": "默认分析维度",
@@ -100,6 +135,17 @@ KNOWN_KEYS: dict[str, dict] = {
         "check": _check_report_style,
         "describe": lambda v: _describe_style(v),
         "proposal_question": lambda v: f"以后报告都按「{_describe_style(v)}」来写？",
+    },
+    "ttl_overrides": {
+        "label": "事实保鲜期",
+        "check": _check_ttl_overrides,
+        "describe": _describe_ttl,
+        # ★ inject=False：这一项**不写进 writer prompt**。
+        #   前三个键改的是"报告长什么样"，这个键改的是"多久算旧"，
+        #   属于 verify 的判断标准。混进 prompt 只会让 writer 去操心时效，
+        #   而它对"这条结论多少天前观测的"一无所知。
+        "inject": False,
+        "proposal_question": lambda v: f"以后「{_describe_ttl(v)}」按这个保鲜期算？",
     },
 }
 
@@ -184,11 +230,15 @@ def for_injection(effective: dict[str, Any]) -> tuple[dict[str, Any], list[tuple
 
 
 def format_block(usable: dict[str, Any]) -> str:
-    """拼成 prompt 里的一段；无可注入偏好时返回空串（不留空段落）。"""
+    """拼成 prompt 里的一段；无可注入偏好时返回空串（不留空段落）。
+
+    跳过 `inject=False` 的键（目前只有 ttl_overrides）：它是判断标准，
+    不是写作要求，进 prompt 只会让 writer 去猜时效。
+    """
     lines = []
     for key, value in (usable or {}).items():
         spec = KNOWN_KEYS.get(key)
-        if not spec:
+        if not spec or spec.get("inject") is False:
             continue
         lines.append(f"- {spec['label']}：{spec['describe'](value)}")
     if not lines:
@@ -207,6 +257,40 @@ def prefill_for_task(usable: dict[str, Any]) -> dict[str, Any]:
         out["dimensions"] = [str(x) for x in usable["default_dimensions"]]
     if isinstance(usable.get("frequent_competitors"), list):
         out["competitors"] = [str(x) for x in usable["frequent_competitors"]]
+    return out
+
+
+async def load_overrides(pool: Any, user_id: str) -> dict[str, int]:
+    """取用户设置的保鲜期覆盖（`ttl_overrides`）；没配或读失败就是空 dict。
+
+    ★ 两处消费：fact 写入时定档（`semantic.write_task_facts`）、
+      verify 读取时覆盖（`query_handlers.check_freshness`）。
+      读取侧每次都重读，所以**改偏好不需要回填历史数据**，
+      落库的 ttl_days 退化成"当时的默认档位快照"。
+
+    ⚠️ 这里吞掉异常是刻意的：保鲜期只是一档判断标准，偏好表查询失败
+       不该让任务收尾或 verify 整体挂掉 —— 降级到内置档位表继续跑。
+    """
+    if pool is None or not user_id:
+        return {}
+    try:
+        from src.db.dao import PreferenceDAO   # 局部 import：本模块其余部分是纯函数
+
+        effective = await PreferenceDAO(pool).get_effective(user_id)
+    except Exception as exc:  # noqa: BLE001 — 读不到偏好不是致命错误
+        logger.info("保鲜期偏好读取失败，回落内置档位表: %s", exc)
+        return {}
+
+    raw = effective.get("ttl_overrides")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, days in raw.items():
+        name = str(key).strip()
+        # 库里可能有旧版本或手改进去的脏值，这里再挡一次 bool（bool 是 int 子类）
+        if not name or isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+            continue
+        out[name] = days
     return out
 
 

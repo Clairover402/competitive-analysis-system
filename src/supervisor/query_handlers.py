@@ -19,6 +19,9 @@
   ★ 竞品过滤用 jsonb `?|` 而不是 LIKE ← tasks.competitors 是 JSONB 数组，
     LIKE 会把"飞书"匹配进任何含该子串的句子
   ★ 查不到就如实说查不到 ← 空结果编一句"可能是网络问题"最伤可信度
+  ★ verify 的保鲜期**读取时现算**，优先用偏好 `ttl_overrides` ← 若只信落库的
+    ttl_days，用户改完配置会看到"设置没生效"，而库里那列是写入时的快照
+    （理由见 _effective_ttl）
 
 【读法】
   ⚠️ 所有查询都带 user_id，多租户隔离在这一层做，别指望调用方记得加。
@@ -106,13 +109,71 @@ def _time_cn(iso: str | None) -> str:
     return dt.astimezone().strftime("%m-%d %H:%M")
 
 
-def ttl_days_for(text: str | None) -> int:
-    """按关键词给事实挑一个保鲜期档位；认不出来用默认值。"""
-    blob = text or ""
+def _override_hit(
+    blob: str,
+    dimension: str,
+    overrides: dict[str, int] | None,
+) -> tuple[int, str] | None:
+    """在用户配置里找命中的关键词，返回 (天数, 命中的关键词)。
+
+    先按维度、再按正文 ← 维度是结构化锚点，正文是自然语言：
+    「与飞书相比钉钉的价格更轻」不该改变一条「功能」类事实的档位。
+    """
+    if not overrides:
+        return None
+    for key, days in overrides.items():
+        if key and key in dimension:
+            return days, key
+    for key, days in overrides.items():
+        if key and key in blob:
+            return days, key
+    return None
+
+
+def ttl_days_for(
+    text: str | None,
+    dimension: str | None = None,
+    overrides: dict[str, int] | None = None,
+) -> int:
+    """给事实挑一个保鲜期档位：用户配置 → 内置关键词表 → 默认值。
+
+    `overrides` 来自偏好 `ttl_overrides`（见 `preferences.load_overrides`）。
+    不传时行为与改造前完全一致，老调用方无需改。
+    """
+    dim = str(dimension or "")
+    blob = f"{text or ''} {dim}".strip()
+
+    hit = _override_hit(blob, dim, overrides)
+    if hit:
+        return hit[0]
+
     for keywords, days in _TTL_BY_KEYWORD:
         if any(k in blob for k in keywords):
             return days
     return DEFAULT_TTL_DAYS
+
+
+def _effective_ttl(
+    item: dict,
+    overrides: dict[str, int] | None,
+) -> tuple[int, str | None]:
+    """读取侧定档：用户配置 > 落库快照 > 现场按表补算。
+
+    ★ 为什么不直接信落库的 ttl_days：偏好可以在写入之后才改。
+      以落库值优先等于「配置改了、历史数据不认」，而用户看不到这个例外，
+      只会觉得设置没生效。落库值退化成「当时的默认档位」，只做兜底。
+
+    返回 (天数, 命中的偏好关键词)；第二项为 None 表示没走到用户配置。
+    """
+    dim = str(item.get("dimension") or "")
+    blob = f"{item.get('claim') or ''} {dim}"
+
+    hit = _override_hit(blob, dim, overrides)
+    if hit:
+        return hit[0], hit[1]
+    if item.get("ttl_days"):
+        return int(item["ttl_days"]), None
+    return ttl_days_for(blob, dim), None
 
 
 # ── ① lookup：找历史任务 ────────────────────────────────────────────────
@@ -319,9 +380,16 @@ async def check_freshness(
     用户问"这些结论还新不新"，答案在 fact 上：只有它知道哪条已被更晚的观测取代、
     每条该按什么保鲜期算。查不到 fact 就如实说"还没提炼过"，
     不要退回去用证据行的 created_at 假扮事实——那是拿引用时间冒充观测时间。
+
+    【2026-10-28 保鲜期可配】读取侧现读 `ttl_overrides` 偏好并优先采用，
+    所以改一次偏好，历史 fact 立刻按新档位判定，不需要回填脚本。
     """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
     keyword = (keyword or "").strip() or None
+
+    from src.memory.preferences import load_overrides   # 局部 import：避免 supervisor ↔ memory 循环
+
+    overrides = await load_overrides(pool, user_id)
     rows = await pool.fetch(_FACTS_SQL, user_id, competitors, keyword, limit)
 
     items = []
@@ -343,14 +411,20 @@ async def check_freshness(
     if not items:
         return {"items": [], "summary": "没有可核对的事实记录。先跑一次分析，系统会把结论提成带保鲜期的事实。"}
 
-    requested_ttl = ttl_days or ttl_days_for(keyword or " ".join(competitors or []))
+    requested_ttl = ttl_days or ttl_days_for(
+        keyword or " ".join(competitors or []), None, overrides
+    )
     now = datetime.now(timezone.utc)
 
     fresh, stale = [], []
+    applied_keys: list[str] = []      # 被用户配置改过档的关键词，用于给回执
     for item in items:
-        # 写入时已按 claim+维度 定过档；老数据没有该列的，现场按同一张表补算
-        if not item.get("ttl_days"):
-            item["ttl_days"] = ttl_days_for(f"{item['claim']} {item['dimension']}")
+        # 偏好 > 落库快照 > 现场补算（见 _effective_ttl 的说明）
+        ttl, hit_key = _effective_ttl(item, overrides)
+        item["ttl_days"] = ttl
+        item["ttl_from_user"] = bool(hit_key)
+        if hit_key and hit_key not in applied_keys:
+            applied_keys.append(hit_key)
         observed = item["observed_at"]
         age_days = None
         if observed:
@@ -359,7 +433,7 @@ async def check_freshness(
         item["age_days"] = age_days
         item["status"] = (
             "unknown" if age_days is None
-            else ("stale" if age_days >= item["ttl_days"] else "fresh")
+            else ("stale" if age_days >= ttl else "fresh")
         )
         (stale if item["status"] == "stale" else fresh).append(item)
 
@@ -379,5 +453,16 @@ async def check_freshness(
             f"{len(fresh)} 条仍在保鲜期内。最近的是「{_short(head['claim'], 60)}」，"
             f"{head['age_days']} 天前观测的。"
         )
+    if applied_keys:
+        # ★ 改了配置必须看到回执：否则判定从「在保鲜期内」变成「超期」时，
+        #   用户分不清是设置生效了还是数据真的老了。
+        parts.append(
+            f"保鲜期按你自己设置的「{'、'.join(applied_keys)}」计算，不是内置档位。"
+        )
     parts.append("以上只判断了「多久没核对」，不代表事实已变；要核实需重新抓取原文。")
-    return {"items": items, "summary": "\n".join(parts), "requested_ttl_days": requested_ttl}
+    return {
+        "items": items,
+        "summary": "\n".join(parts),
+        "requested_ttl_days": requested_ttl,
+        "ttl_overrides_applied": applied_keys,
+    }

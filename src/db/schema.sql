@@ -419,6 +419,10 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     observed_at     TIMESTAMPTZ,
     ttl_days        INT,
                         -- 保鲜期档位（定价30/功能60/融资90/组织180），NULL = 不判过期
+                        -- ⚠️ 这是**写入时的默认档位**，不是最终判定值：
+                        --    用户在偏好 ttl_overrides 里改过档位后，verify 读取时
+                        --    会重算覆盖（见 query_handlers._effective_ttl）。
+                        --    直接 SELECT 这一列得到的可能是旧档位。
     status          VARCHAR(16) NOT NULL DEFAULT 'active',
                         -- active / superseded（被新观测取代）/ expired（超保鲜期）
     superseded_by   UUID REFERENCES agent_memories(id) ON DELETE SET NULL,

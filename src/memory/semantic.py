@@ -23,6 +23,9 @@
     "支持自动化流程"判成同一条，然后删掉一条真的信息
   · ttl_days 复用 `query_handlers.ttl_days_for()` ← 不新造第二套档位表，
     否则 verify 判"过期"和写入侧记的保鲜期会对不上
+  · 落库的 ttl_days 只是**当时的默认档位**，不是最终判定值 ← 用户改了
+    `ttl_overrides` 偏好之后，verify 读取时会重算覆盖它（见 check_freshness）。
+    这样改配置不需要回填 248 条历史 fact
   · 写失败只记日志 ← 记忆是任务完成后的附加动作，不能把 completed 改成 failed
 
 【读法/注意事项】
@@ -42,6 +45,7 @@ from typing import Any
 from src.config import Settings
 from src.mcp.tools_rag import embed_texts
 from src.memory.long_term import LongTermMemoryEngine, importance_for
+from src.memory.preferences import load_overrides
 from src.supervisor.query_handlers import ttl_days_for
 
 logger = logging.getLogger(__name__)
@@ -184,6 +188,9 @@ async def write_task_facts(
         importance, half_life = importance_for("fact")
         dao = engine.dao
 
+        # 用户在 `ttl_overrides` 里改过的档位，写入时就按它定；读不到偏好不影响写入
+        overrides = await load_overrides(pool, user_id)
+
         # ── 先把要写的都算好，一次批量 embed ──
         # 逐条 embed_query 是 N 次网络往返；20 条证据 = 20 次 × ~100ms，
         # 而 embed_texts 内部按 batch_size=12 打包，20 条只要 2 次往返。
@@ -213,7 +220,7 @@ async def write_task_facts(
                 "dimension": row.get("dimension"),
                 "url": url,
                 "observed_at": row.get("created_at") or report["created_at"],
-                "ttl_days": ttl_days_for(f"{claim} {row.get('dimension') or ''}"),
+                "ttl_days": ttl_days_for(claim, row.get("dimension"), overrides),
             })
 
         if not pending:
