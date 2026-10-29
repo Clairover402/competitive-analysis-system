@@ -508,7 +508,7 @@ def _get_pool(request: Request) -> Pool:
 
 
 # ── LLM 实体提取：从自然语言 query 提取 competitors + dimensions ──────────
-# ★ 2026-10-27（D1）：prompt 与解析器改由 intent_funnel 提供，两个入口共用。
+# ★ 2026-10-27（D1）：prompt 与解析器改由 intent 包提供，两个入口共用。
 #   两份 prompt 必然漂移，同一个 query 在 /api/tasks 与 /api/chat 会抽出不同实体。
 #   /api/tasks 只关心实体，所以只取 competitors/dimensions，忽略 intent/keyword。
 
@@ -521,19 +521,14 @@ async def _extract_entities_from_query(query: str, request: Request) -> dict:
     Returns:
         {"competitors": [str], "dimensions": [str]}；失败时两项皆空。
     """
-    from src.agents import create_llm_client
-    from src.supervisor.intent_funnel import (
-        INTENT_PROMPT,
-        normalize_entities,
-        parse_intent_json,
-    )
+    from src.supervisor.intent import fill_slots
 
     try:
         settings = request.app.state.settings
-        llm = create_llm_client(settings, temperature=0.0)
-        resp = await llm.ainvoke(INTENT_PROMPT % query)
-        data = parse_intent_json((resp.content or "").strip())
-        competitors, dimensions = normalize_entities(data)
+        # ★ 只调槽位段，不再调"判意图 + 抽实体"的整份 prompt。
+        #   这个入口从来只用得上竞品与维度，判出来的 intent 是白付的 token。
+        slots = await fill_slots(query, "analysis", settings=settings)
+        competitors, dimensions = slots.competitors, slots.dimensions
 
         logger.info(
             "LLM 实体提取: query=%r → competitors=%s, dimensions=%s",
@@ -967,7 +962,7 @@ async def chat(
 
     【会话记忆（M1）】
       写：每轮落两行（user + assistant），超过 6 轮后按 3 轮间隔刷新会话摘要；
-      读：最近 6 行原文 + 摘要 → 只喂 L3（见 intent_funnel.l3_llm 注释）。
+      读：最近 6 行原文 + 摘要 → 只喂 L3（见 intent/classifier.l3_llm 注释）。
       写失败只记日志，不让对话 500。
 
     【L5 决策】analysis 直接调用 create_task()，不复制一份建任务逻辑：
@@ -988,12 +983,11 @@ async def chat(
         load_context,
         remember_turn,
     )
-    from src.supervisor.intent_funnel import (
+    from src.supervisor.intent import (
         CLARIFY_CHOICES,
-        FUNNEL_OFF_QUESTION,
-        NO_ANCHOR_CHOICES,
-        NO_ANCHOR_QUESTION,
-        run_funnel,
+        classify,
+        fill_slots,
+        no_anchor_channel,
     )
     from src.supervisor.query_handlers import (
         check_freshness,
@@ -1016,10 +1010,18 @@ async def chat(
     context = await load_context(pool, conversation)
     history_block = format_history_block(context["summary"], context["turns"])
 
-    funnel = await run_funnel(
+    # ── ① 只判 label ──
+    #   ★ 这一步的输出里**没有任何槽位**，结构上不允许它依赖竞品/维度/关键词。
+    #     2026-10-29 拆开之前，L2 判对却因为"缺槽位"被要求整句重判 L3，
+    #     45 条判对只放行 10 条。现在判据回到"这次判得准不准"。
+    decision = await classify(
         query=body.message, settings=settings, history_block=history_block
     )
-    base = {"intent": funnel.intent, "layer": funnel.layer, "confidence": funnel.confidence}
+    base = {
+        "intent": decision.intent,
+        "layer": decision.layer,
+        "confidence": decision.confidence,
+    }
 
     # ── 偏好提案识别（M4，2026-10-27）──
     # 【为什么放在漏斗之后而不是之前】一句话可能同时是命令与规则
@@ -1064,7 +1066,7 @@ async def chat(
         await remember_turn(
             pool, conversation,
             user_message=body.message,
-            intent=funnel.intent,
+            intent=decision.intent,
             reply_text=reply_text,
             ref_task_id=ref_task_id,
             settings=settings,
@@ -1081,8 +1083,8 @@ async def chat(
         )
 
     # ── L4 澄清：不入库、不建任务，只回一句反问 ──
-    if funnel.intent == "unknown":
-        question = funnel.clarify or "能再说具体一点吗？"
+    if decision.intent == "unknown":
+        question = decision.clarify or "能再说具体一点吗？"
         return await finish(200, {
             "type": "clarify",
             **base,
@@ -1091,24 +1093,32 @@ async def chat(
             "echo": body.message,
         }, f"（反问）{question}")
 
+    # ── ② 意图已定，才填槽位 ──
+    #   ★ 放在澄清分支之后：追问轮不需要槽位，别为一句"你是想做什么"再付一次 LLM。
+    #   抽什么由 label 决定（见 intent/slots.py 顶上那张"缺了下游会不会答错"的表）；
+    #   槽位**无权回头改 label** —— 单向依赖，否则耦合又回来了。
+    slots = await fill_slots(
+        body.message,
+        decision.intent,
+        settings=settings,
+        history_block=history_block,
+    )
+
     # ── analysis：复用 /api/tasks 的整条链路 ──
-    if funnel.intent == "analysis":
-        entities = funnel.entities or {}
-        # LLM 可能重复输出同一实体，先归一 —— 否则 _reject_duplicates 会把它当用户输入报 400
-        competitors = _dedupe(list(entities.get("competitors") or []))
-        dimensions = _dedupe(list(entities.get("dimensions") or []))
+    if decision.intent == "analysis":
+        # 竞品可能重复出现，先归一 —— 否则 _reject_duplicates 会把它当用户输入报 400
+        competitors = _dedupe(list(slots.competitors))
+        dimensions = _dedupe(list(slots.dimensions))
 
         # ★ 判出"要分析"但一个锚点都没有：对话里该问一句，不该弹表单式 400。
         #   与上面的 L4 澄清不是一回事 —— 这里知道要什么，只是缺参数，文案与选项都不同。
         if not competitors and not dimensions:
-            question = (
-                FUNNEL_OFF_QUESTION if funnel.layer == "off" else NO_ANCHOR_QUESTION
-            )
+            question, options = no_anchor_channel(decision.layer == "off")
             return await finish(200, {
                 "type": "clarify",
                 **base,
                 "question": question,
-                "options": list(NO_ANCHOR_CHOICES),
+                "options": options,
                 "echo": body.message,
             }, f"（反问）{question}")
 
@@ -1133,10 +1143,11 @@ async def chat(
             "echo": body.message,
         }, f"已开始分析：{'、'.join(competitors) or '（未指定竞品）'}", ref_task_id=task_id)
 
-    # ── lookup / trace / verify：零 LLM 的 SQL 执行器 ──
-    competitors = funnel.entities.get("competitors") or None
+    # ── lookup / trace / verify：意图与槽位都已就位，这里只执行 SQL ──
+    #   槽位已在上面按 label 抽过，这一段不再调模型（也不再改意图）。
+    competitors = slots.competitors or None
 
-    if funnel.intent == "lookup":
+    if decision.intent == "lookup":
         # dimensions 一路传下去：之前这里只给小了 competitors，"定价"这个词
         # 在调用处就丢了，SQL 再准也只剩「钉钉」这一个条件。
         # 序数（上上次 / 前两次 / 全部）由规则抽，不占 LLM —— 封闭词表能穷举，
@@ -1155,14 +1166,14 @@ async def chat(
                 pool,
                 current_user.user_id,
                 competitors,
-                funnel.entities.get("dimensions"),
+                slots.dimensions,
                 limit=ordv.get("limit", 5),
                 skip=ordv.get("skip", 0),
             )
-    elif funnel.intent == "trace":
-        data = await trace_evidence(pool, current_user.user_id, competitors, funnel.keyword)
+    elif decision.intent == "trace":
+        data = await trace_evidence(pool, current_user.user_id, competitors, slots.keyword)
     else:
-        data = await check_freshness(pool, current_user.user_id, competitors, funnel.keyword)
+        data = await check_freshness(pool, current_user.user_id, competitors, slots.keyword)
 
     return await finish(200, {
         "type": "answer",

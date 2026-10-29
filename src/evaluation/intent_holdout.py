@@ -16,7 +16,7 @@
 
 口径
 ────
-- 走完整 run_funnel（含 L1/L2/L3/L4），不是单测 L3
+- 走完整 classify（含 L1/L2/L3/L4），不是单测 L3
 - gold 有争议的句子要在注释里写明争议点，别把"标注争议"算成"系统出错"
 - ⚠️ 这 24 句不许并进 CASES：两批一旦合流，下一轮又变成自己考自己
 """
@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 
 from src.config import Settings
-from src.supervisor.intent_funnel import run_funnel
+from src.supervisor.intent import classify
 
 # (原话, gold, 争议点说明) —— 第三条只在 gold 存疑时写
 HOLDOUT: tuple[tuple[str, str, str], ...] = (
@@ -69,7 +69,7 @@ async def main() -> None:
     ok = 0
     misses: list[tuple[str, str, str, str]] = []
     for text, gold, _ in HOLDOUT:
-        r = await run_funnel(query=text, settings=cfg)
+        r = await classify(query=text, settings=cfg)
         hit = r.intent == gold
         ok += hit
         if not hit:

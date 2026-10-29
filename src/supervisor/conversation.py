@@ -2,7 +2,7 @@
 
 【职责】
   做：resolve 会话（没有就建、有就校验归属）、取上下文、落两行流水、超轮次时刷新摘要。
-  不做：判意图（那是 intent_funnel）、执行意图（那是 query_handlers / create_task）、
+  不做：判意图（那是 intent/classifier）、执行意图（那是 query_handlers / create_task）、
         向量化（会话原话按 seq 顺序取，见 schema.sql §7.5 注释）。
 
 【输入 → 输出】

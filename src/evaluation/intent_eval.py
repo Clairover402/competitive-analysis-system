@@ -41,7 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.evaluation.intent_cases import CASES, Case, stats
-from src.supervisor.intent_funnel import (
+from src.supervisor.intent import (
     INTENTS,
     l1_deterministic,
     l2_semantic,
@@ -56,14 +56,12 @@ _ALL_INTENTS = (*INTENTS, "unknown")
 
 
 async def judge_case(case: Case, settings, *, run_l3: bool) -> dict:
-    """跑一句，返回 {gold, pred, layer, ...}。顺序与 run_funnel 完全一致。
+    """跑一句，返回 {gold, pred, layer, ...}。分支顺序与 classify 完全一致。
 
-    ⚠️ 这里刻意复刻 run_funnel 的分支而不是直接调它：run_funnel 还要 llm/pool
-    一整套依赖，而评估只需要"判定"这一段。复刻的风险是两处漂移 ——
-    所以分支条件（`intent in INTENTS_L2_SAFE`）直接从漏斗 import，不写字面量。
+    ★ 2026-10-29 拆包后可以直接调 classify 了（它不再需要 pool），但这里仍逐层调：
+      `--no-l3` 要在 L2 之后截断，classify 没有这个开关。
+      ⚠️ 代价是两处顺序要人工对齐 —— 改 classify 的分支顺序时同步改这里。
     """
-    from src.supervisor.intent_funnel import INTENTS_L2_SAFE
-
     r1 = l1_deterministic(
         case.text, list(case.competitors), list(case.dimensions)
     )
@@ -75,7 +73,8 @@ async def judge_case(case: Case, settings, *, run_l3: bool) -> dict:
         return _row(case, "unknown", "L1", None, note="无任何可判定输入")
 
     r2 = await l2_semantic(text, settings)
-    if r2 is not None and r2.intent in INTENTS_L2_SAFE:
+    if r2 is not None:
+        # 白名单已删（2026-10-29）：过阈即停，不再看意图类别缺不缺槽位。
         return _row(case, r2.intent, "L2", r2)
 
     if not run_l3:
@@ -287,7 +286,7 @@ async def main() -> None:
     print(render(report))
 
     if args.sweep:
-        from src.supervisor.intent_funnel import calibrate
+        from src.supervisor.intent import calibrate
 
         samples = [(c.text, c.gold) for c in CASES if c.text.strip() and not c.ambiguous]
         rows = await calibrate(samples)
