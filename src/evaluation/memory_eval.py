@@ -80,12 +80,12 @@ class SupersedeCase:
 
 @dataclass(frozen=True)
 class HitCase:
-    """给定一批 fact，按竞品+关键词查，该返回哪些 subject。"""
+    """给定一批 fact，按竞品+维度查，该返回哪些 subject。"""
 
     name: str
     seeds: tuple[Step, ...]
     competitors: tuple[str, ...] | None
-    keyword: str | None
+    dimensions: tuple[str, ...] | None
     expect_subjects: tuple[str, ...]
     why: str
 
@@ -171,9 +171,9 @@ HIT_CASES: tuple[HitCase, ...] = (
         "同竞品不同维度不串",
         (Step("飞书", "定价", "飞书企业版定价 200 元/人/月，年付 9 折"),
          Step("飞书", "功能", "飞书支持多维表格与自动化流程编排")),
-        ("飞书",), "定价",
+        ("飞书",), ("定价",),
         ("飞书|定价",),
-        "关键词过滤要落在 content 上，不能把同竞品的功能事实也带回来",
+        "维度过滤要落在 subject 第 2 段上，不能把同竞品的功能事实也带回来",
     ),
     HitCase(
         "跨竞品不串",
@@ -187,7 +187,7 @@ HIT_CASES: tuple[HitCase, ...] = (
     HitCase(
         "空库如实说没有",
         (),
-        ("飞书",), "定价",
+        ("飞书",), ("定价",),
         (),
         "查不到就返回空 + 明说没有，不编理由",
     ),
@@ -202,7 +202,7 @@ HIT_CASES: tuple[HitCase, ...] = (
         "同 subject 多档位并存",
         (Step("飞书", "定价", "飞书专业版定价 80 元/人/月，面向百人以下团队"),
          Step("飞书", "定价", "飞书企业版定价 200 元/人/月，含高级安全审计")),
-        ("飞书",), "定价",
+        ("飞书",), ("定价",),
         ("飞书|定价", "飞书|定价"),
         "不取代的两条都要在——命中数 2 说明保鲜判定没有把并存的档位吞掉",
     ),
@@ -210,17 +210,17 @@ HIT_CASES: tuple[HitCase, ...] = (
         "被取代的旧观测不再出现",
         (Step("飞书", "定价", "飞书企业版定价为每人每月 200 元，年付享 9 折"),
          Step("飞书", "定价", "飞书企业版定价已调整为每人每月 220 元，年付同享 9 折")),
-        ("飞书",), "定价",
+        ("飞书",), ("定价",),
         ("飞书|定价",),
         "verify 只该看到当前有效的那一条（status='active'）",
     ),
     HitCase(
-        "无关键词取全部",
+        "不指定维度取全部",
         (Step("飞书", "定价", "飞书企业版定价 200 元/人/月，年付 9 折"),
          Step("飞书", "功能", "飞书支持多维表格与自动化流程编排")),
         ("飞书",), None,
         ("飞书|定价", "飞书|功能"),
-        "不指定关键词时返回该竞品全部 fact，顺序按 observed_at 倒序",
+        "不指定维度时返回该竞品全部 fact，顺序按 observed_at 倒序",
     ),
 )
 
@@ -398,7 +398,7 @@ async def _run_hit(
         res = await check_freshness(
             pool, uid,
             competitors=list(case.competitors) if case.competitors else None,
-            keyword=case.keyword,
+            dimensions=list(case.dimensions) if case.dimensions else None,
         )
         got = tuple(f"{i['competitor']}|{i['dimension']}" for i in res["items"])
         out.append({

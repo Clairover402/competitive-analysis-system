@@ -40,7 +40,6 @@ from src.supervisor.intent.slots import (
     fill_slots,
     llm_slots,
     rule_dimensions,
-    rule_keyword,
 )
 
 __all__ = [
@@ -67,5 +66,4 @@ __all__ = [
     "normalize_str_list",
     "parse_json_object",
     "rule_dimensions",
-    "rule_keyword",
 ]

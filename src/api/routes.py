@@ -1268,14 +1268,20 @@ async def chat(
     #   抽什么由 label 决定（见 intent/slots.py 顶上那张"缺了下游会不会答错"的表）；
     #   槽位**无权回头改 label** —— 单向依赖，否则耦合又回来了。
     #
-    #   三条意图都要池子，但用途不同：
+    #   四条意图都要池子，但用途不同：
     #     lookup / trace  池是**匹配基准**（用户说出的名字就是库里真实存在的值）
     #     analysis        池是**改名依据**（LLM 输出的简称归一成池里的正式名，
     #                     池外的新竞品放行 —— 见 slots.normalize_to_pool）
-    #   两条 SELECT DISTINCT，代价可忽略；verify 不需要，所以不查。
+    #     verify          池是**维度枚举依据**（2026-10-29 起）：它用
+    #                     `split_part(subject,'|',2)` 精确筛维度，而维度跟着品类走
+    #                     （游戏任务里的「玩法设计」词表没有），必须靠池子认出来。
+    #                     原来是靠 keyword 去 ILIKE 正文，所以不查池 —— 现已删除。
+    #   两条 SELECT DISTINCT，代价可忽略 —— 但只查用得上的那条：
+    #   verify 不按竞品筛（核全部事实），竞品池查了也没人读。
     pool_comps = pool_dims = None
-    if decision.intent in ("lookup", "trace", "analysis"):
-        pool_comps = await competitor_pool(pool, current_user.user_id)
+    if decision.intent in ("lookup", "trace", "analysis", "verify"):
+        if decision.intent != "verify":
+            pool_comps = await competitor_pool(pool, current_user.user_id)
         pool_dims = await dimension_pool(pool, current_user.user_id)
 
     slots = await fill_slots(
@@ -1384,7 +1390,9 @@ async def chat(
                 pool, current_user.user_id, competitors, slots.dimensions
             )
     else:
-        data = await check_freshness(pool, current_user.user_id, competitors, slots.keyword)
+        data = await check_freshness(
+            pool, current_user.user_id, competitors, slots.dimensions
+        )
 
     # 分页信息与翻页参数：前端据此渲染分页条，翻页时打 GET /api/lookup。
     # 为什么翻页不重发这句话：那会多走一次意图识别（白付一次编码），还会往

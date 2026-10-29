@@ -28,8 +28,14 @@
                **看见**筛的是哪个名字，否则"可见的宽"变成"不可见的窄"
       analysis 只有词表 + LLM + `normalize_to_pool`：**只能改名，不能丢弃**
                —— 用户要分析的新竞品还没进过库，丢了就永远分析不了新对手
-    ⚠️ `keyword` 现在只剩 verify 在用。trace 不再抽它（2026-10-29）：
-      它的值本来就是 `rule_dimensions(text)[0]`，是维度名，却拿去 `claim ILIKE`。
+    ⚠️ `keyword` 槽位已**彻底删除**（2026-10-29，第二次删）。它两次都死在同一个地方：
+      `rule_keyword(text) = rule_dimensions(text)[0]`，值域是 7 个标准维度名，
+      却被拿去 `claim ILIKE` / `content ILIKE` 匹配**正文** —— 拿维度名匹配正文，
+      既漏（用户说法与维度名不同）又误伤（正文提到该词就把它带回来）。
+      trace 先改成 `e.dimension = ANY($3)`；verify 最后一条改成
+      `split_part(subject,'|',2) = ANY($3)`，于是 keyword 再无消费者。
+    ⚠️ 别再"临时加个 keyword 过滤"：要筛维度就用 `dimensions`，
+      值域必须是维度池里的名字，匹配必须落在精确列上。
   ★ 抽取顺序：值池 → 词表 → LLM。analysis **每轮都调**（竞品没有词表，且新竞品
     不在池里）；lookup / trace 只在**竞品**解析不出来时才调（维度空着是可见降级，
     不值得多付一次）。
@@ -89,7 +95,6 @@ class Slots:
 
     competitors: list[str] = field(default_factory=list)
     dimensions: list[str] = field(default_factory=list)
-    keyword: str | None = None
     source: str = "none"        # pool / alias / rule / llm / none
 
     @property
@@ -101,7 +106,6 @@ class Slots:
         return {
             "competitors": self.competitors,
             "dimensions": self.dimensions,
-            "keyword": self.keyword,
             "source": self.source,
         }
 
@@ -127,15 +131,6 @@ def rule_dimensions(text: str) -> list[str]:
         if any(w in (text or "") for w in words):
             found.append(dim)
     return found
-
-
-def rule_keyword(text: str) -> str | None:
-    """trace/verify 的检索短语，规则版：取第一个命中的维度名。
-
-    抽不到返回 None —— 两条 SQL 都接受空 keyword，走"按竞品范围列全部/核全部"。
-    """
-    dims = rule_dimensions(text)
-    return dims[0] if dims else None
 
 
 def _squash(s: str) -> str:
@@ -350,8 +345,7 @@ async def fill_slots(
     text = (text or "").strip()
     cs: list[str] = []
     ds: list[str] = []
-    kw = rule_keyword(text)
-    base_source = "rule" if kw else "none"
+    source = "none"
 
     # lookup：值池 → 词表 → LLM → 闸门。
     #   维度只决定**念哪条事实**（_pick_facts），不参与筛选任务 —— 问「飞书定价」
@@ -369,21 +363,33 @@ async def fill_slots(
         if not cs:
             hit, src = match_values(text, competitor_pool)
             if hit:
-                cs, base_source = hit, src
+                cs, source = hit, src
         if not ds:
             ds = match_values(text, dimension_pool, _DIM_ALIASES)[0]
         if not cs and competitor_pool:
             got = await llm_slots(text, settings, history_block)
             cs = gate_llm(got.competitors, competitor_pool)
             if cs:
-                base_source = "llm"
+                source = "llm"
             if not ds:
                 ds = gate_llm(got.dimensions, dimension_pool)
-        return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
+        return Slots(competitors=cs, dimensions=ds, source=source)
 
-    # verify：缺竞品等于"核全部事实"，正是「数据新不新」想要的，不必抽。
+    # verify：**竞品不抽** —— 核该用户全部事实，正是「数据新不新」要的；
+    #   但**维度要抽**，它决定"核哪一维的 fact"。
+    #   ★ 这件事原来由 keyword 干，现在由 dimensions 干（2026-10-29）：
+    #     keyword 的值域是维度名，却拿去 `content ILIKE`。FACT_TEMPLATE 第 1 行
+    #     就写着 `{competitor}·{dimension}`，所以那个 ILIKE 约等于"筛维度"，
+    #     只是绕了一层 —— 代价是正文提到该词的**跨维度** fact 会被误带回来。
     if intent == "verify":
-        return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
+        if not ds:
+            ds, source = match_values(text, dimension_pool, _DIM_ALIASES)
+        if not ds:
+            # 池子拿不到时退回词表：维度是半封闭词表（不像竞品是开放集合），
+            # 规则认得出就够用。筛窄了只会少几行，不会把别家的事实念出来。
+            ds = rule_dimensions(text)
+            source = "rule" if ds else "none"
+        return Slots(dimensions=ds, source=source)
 
     # analysis：维度先走规则，竞品交给 LLM —— 这条路上**不可能**用值池代替 LLM：
     #   用户要分析的新竞品还没进过库，值池里根本没有它。
@@ -401,15 +407,14 @@ async def fill_slots(
         return Slots(
             competitors=normalize_to_pool(got.competitors, competitor_pool),
             dimensions=ds or got.dimensions,
-            keyword=kw,
-            source=got.source if got.source != "none" else base_source,
+            source=got.source if got.source != "none" else source,
         )
 
     # trace：竞品和维度走同一条管线 —— 值池 → 词表 → LLM → 闸门。
     #
-    #   ★ 不再产 keyword（2026-10-29）。它原本是 `rule_dimensions(text)[0]`，值就是
-    #     维度名，却拿去 `claim ILIKE` —— 同一个东西抽两遍、还用错了匹配方式
-    #     （实测漏 11 条真定价、捞错 8 条）。维度列已经在手，关键词槽位是重复品。
+    #   ★ 没有 keyword（2026-10-29 删，verify 也删完后它整体不存在了）。它原本是
+    #     `rule_dimensions(text)[0]`，值就是维度名，却拿去 `claim ILIKE` ——
+    #     同一个东西抽两遍、还用错了匹配方式（实测漏 11 条真定价、捞错 8 条）。
     #
     #   ★ 只有**竞品**解析不出来才调 LLM。判据回到"缺了下游会不会答错"：
     #     竞品是硬过滤（缺了 `e.competitor = ANY($2)` 失效 → 列出别家证据 → 答错，
@@ -435,7 +440,7 @@ async def fill_slots(
             if not ds:
                 ds = gate_llm(got.dimensions, dimension_pool)
 
-        return Slots(competitors=cs, dimensions=ds, keyword=None,
+        return Slots(competitors=cs, dimensions=ds,
                      source=src if (cs or ds) else "none")
 
     # 其余（unknown / 未识别）：不猜，什么都不抽。

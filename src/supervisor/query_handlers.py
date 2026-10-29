@@ -9,7 +9,7 @@
   lookup_reports(pool, user_id, competitors, dimensions, limit, skip)
       -> {"items": [...], "total": int | None, "summary": str}
   trace_evidence(pool, user_id, competitors, dimensions, limit) -> 同上
-  check_freshness(pool, user_id, competitors, keyword)    -> 同上（附 fresh/stale 判定）
+  check_freshness(pool, user_id, competitors, dimensions)  -> 同上（附 fresh/stale 判定）
 
 【关键决策】
   ★ 三跳全走 SQL，零 LLM ← 用户问的是**确定指代**（"上次""那份"），
@@ -799,7 +799,10 @@ SELECT id::text     AS memory_id,
    -- "与飞书相比，钉钉…"这类对比句会让 LIKE 把竞品 X 的事实串到竞品 Y 上
    AND ($2::text[] IS NULL
         OR subject ~ ('^(' || array_to_string($2::text[], '|') || ')\\|'))
-   AND ($3::text IS NULL OR content ILIKE '%' || $3 || '%')
+   -- 维度过滤走 subject 第 2 段（精确），不用 content ILIKE：
+   -- FACT_TEMPLATE 第 1 行就是「竞品·维度」，拿维度名匹配正文约等于筛维度，
+   -- 但正文提到该词的**跨维度** fact 也会被带回来（"定价"出现在"功能"那条的结论里）。
+   AND ($3::text[] IS NULL OR split_part(subject, '|', 2) = ANY($3))
  ORDER BY observed_at DESC NULLS LAST, created_at DESC
  LIMIT $4
 """
@@ -826,8 +829,7 @@ async def check_freshness(
     pool,
     user_id: str,
     competitors: list[str] | None = None,
-    keyword: str | None = None,
-    ttl_days: int | None = None,
+    dimensions: list[str] | None = None,
     limit: int = 10,
 ) -> dict:
     """按事实的观测时间判 fresh / stale，不做重新采集。
@@ -849,12 +851,12 @@ async def check_freshness(
     所以改一次偏好，历史 fact 立刻按新档位判定，不需要回填脚本。
     """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
-    keyword = (keyword or "").strip() or None
+    dimensions = [d for d in (dimensions or []) if str(d).strip()] or None
 
     from src.memory.preferences import load_overrides   # 局部 import：避免 supervisor ↔ memory 循环
 
     overrides = await load_overrides(pool, user_id)
-    rows = await pool.fetch(_FACTS_SQL, user_id, competitors, keyword, limit)
+    rows = await pool.fetch(_FACTS_SQL, user_id, competitors, dimensions, limit)
 
     items = []
     for row in rows:
@@ -875,9 +877,6 @@ async def check_freshness(
     if not items:
         return {"items": [], "summary": "没有可核对的事实记录。先跑一次分析，系统会把结论提成带保鲜期的事实。"}
 
-    requested_ttl = ttl_days or ttl_days_for(
-        keyword or " ".join(competitors or []), None, overrides
-    )
     now = datetime.now(timezone.utc)
 
     fresh, stale = [], []
@@ -927,6 +926,5 @@ async def check_freshness(
     return {
         "items": items,
         "summary": "\n".join(parts),
-        "requested_ttl_days": requested_ttl,
         "ttl_overrides_applied": applied_keys,
     }

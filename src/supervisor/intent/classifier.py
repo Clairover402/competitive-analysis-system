@@ -252,7 +252,7 @@ async def classify(
     history_block 只在 L3 生效（见 l3_llm 注释），单轮调用方不传即可。
 
     ⚠️ 这里**不返回槽位**。调用方拿到 label 后自行决定要不要 `fill_slots`：
-       analysis 必填、trace/verify 的 keyword 可空、lookup 不需要。
+       analysis 必填竞品/维度、trace 必填竞品、verify 只抽维度、lookup 不强制。
 
     ★ 2026-10-29 删掉 L1（确定性规则层），漏斗从四层变三层。理由不是"没接上线"：
       它想判的「参数齐全 ⇒ analysis」已经被**产品结构**表达掉了 ——

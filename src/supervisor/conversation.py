@@ -82,7 +82,7 @@ def format_history_block(summary: str | None, turns: list[dict]) -> str:
             raw = " ".join((t.get("content") or "").split())
             # 用户原话是指代的锚，留 200 字；助手回复只是背景，压到 80 字。
             # ← 实测：同一段历史、同一个问题，助手回复从 200 字压到 80 字后，
-            #   keyword 从 None 恢复成「结论证据」（意图本身两版都是 trace）。
+            #   维度槽位从抽不出来恢复成「结论证据」（意图本身两版都是 trace）。
             #   助手回复最长、也最像"用户在说报告"，占篇幅会把抽取拉偏。
             cut = 200 if t.get("role") == "user" else 80
             lines.append(f"{role}: {raw[:cut]}")
