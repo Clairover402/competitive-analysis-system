@@ -202,6 +202,31 @@ class TaskDAO:
                 task_id, pipeline_mode,
             )
 
+    async def update_competitors(self, task_id: str, competitors: list[str]) -> None:
+        """回写这次任务**实际分析过**的竞品（2026-10-29）。
+
+        【为什么需要】supervisor 走 ReAct 探索时发现的竞品只活在图的 state 里
+        （`found_competitors`），从来没有落库 → `tasks.competitors` 保持创建时的值
+        （往往是空数组）→ lookup 的 `t.competitors ?| $2` 永远查不到这份报告；
+        而竞品值池正是 `SELECT DISTINCT competitors FROM tasks`，所以新名字也学不到。
+        线上实测：104 个任务里 18 个竞品为空（17%），其中 supervisor 2 个。
+
+        【为什么调用方传并集】用户 seed 了「飞书」、ReAct 又分析了「钉钉」，
+        这份报告里两家都有结论，两个名字都该能查回来 —— 覆盖写会丢掉 seed。
+
+        【为什么不在这里做清洗】单字/粘连名（「飞书和钉钉」）的判据在 API 层
+        （`_MERGED_NAME_RE`），DAO 只负责存。两边各留一份正则迟早会分叉。
+        """
+        if not competitors:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE tasks
+                   SET competitors = $2::jsonb, updated_at = NOW()
+                   WHERE id = $1""",
+                task_id, json.dumps(competitors, ensure_ascii=False),
+            )
+
 
 class ReportDAO:
     """分析报告数据访问。

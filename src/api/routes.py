@@ -139,6 +139,42 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
+def _competitors_from_state(final_state: dict) -> list[str]:
+    """从 supervisor 终态里取「报告里真有结论」的竞品名（2026-10-29）。
+
+    【为什么用 analysis_results 而不是 found_competitors】
+      `analysis_results` 是 `{维度: {竞品: {...}}}`，内层键就是**真的写出了结论**
+      的竞品；`found_competitors` 只是 collector 检索过谁 —— 检索到素材但没进
+      报告的竞品也在里面。lookup 的语义是"问某竞品要能查到分析了它的报告"，
+      所以以报告为准。
+
+    【为什么还要退回 found_competitors】
+      supervisor 可能跳过 analyzer 直接 writer（重写路径），这时
+      `analysis_results` 为空。退回的值也不是纯幻觉：collector 返回 0 chunk/0 page
+      时 `found_competitors` **不会**被更新（`supervisor.py:828`），所以它已经是
+      "真检索到数据"的那批。
+
+    【为什么必须清洗】这个值是 LLM 驱动的 ReAct 产物，会带出 `飞书和钉钉`
+    这类粘连名和单字。它们一旦进 `tasks.competitors` 就同时污染两处：
+    lookup 的字面匹配基准（值池就是从这列 DISTINCT 出来的）和 trace 的竞品过滤。
+    """
+    results = final_state.get("analysis_results") or {}
+    names: list[str] = []
+    if isinstance(results, dict):
+        for per_competitor in results.values():
+            if isinstance(per_competitor, dict):
+                names.extend(str(k) for k in per_competitor)
+    if not names:
+        names = [str(x) for x in (final_state.get("found_competitors") or [])]
+
+    out: list[str] = []
+    for n in _dedupe([str(x).strip() for x in names]):
+        if len(n) < 2 or _MERGED_NAME_RE.search(n):
+            continue
+        out.append(n)
+    return out
+
+
 def _reject_duplicates(
     competitors: list[str] | None,
     dimensions: list[str] | None,
@@ -744,6 +780,38 @@ async def _execute_task(
             "route": route_type,
             "elapsed_ms": int(elapsed * 1000),
         })
+
+        # ── 4.5 回写实际分析过的竞品（只对 supervisor，2026-10-29）──
+        # ★ 为什么只对 supervisor：pipeline 的竞品就是创建时写进去的那批，
+        #   没有"探索发现"这回事；而 supervisor 的发现只活在图的 state 里，
+        #   不落库就等于没发生 —— 实测 104 个任务里 18 个竞品为空（17%），
+        #   那些报告按竞品**永远查不回来**（lookup 走 `t.competitors ?| $2`），
+        #   值池（`SELECT DISTINCT competitors FROM tasks`）也学不到新名字。
+        # ★ 为什么并集不是覆盖：用户 seed 了「飞书」、ReAct 又分析了「钉钉」，
+        #   两家在这份报告里都有结论，覆盖写会让「飞书」查不到自己的报告。
+        # ★ 为什么吞异常：和记忆提取同理 —— 这是完成后的附加动作，写失败最多
+        #   是"这份报告查不回来"，不能把已跑完的任务改成 failed。
+        if route_type == "supervisor":
+            discovered = _competitors_from_state(final_state)
+            if discovered:
+                merged = _dedupe(
+                    [str(c).strip() for c in enriched_task["competitors"] if str(c).strip()]
+                    + discovered
+                )
+                try:
+                    await task_dao.update_competitors(task_id_str, merged)
+                    request.app.state.log.bind(
+                        task_id=task_id_str[:8]
+                    ).info("竞品已回写", extra={
+                        "seed": len(enriched_task["competitors"]),
+                        "discovered": len(discovered),
+                        "total": len(merged),
+                    })
+                except Exception:  # noqa: BLE001 — 附加动作失败不该改任务状态
+                    logger.warning(
+                        "回写竞品失败（不影响任务结果） task=%s",
+                        task_id_str[:8], exc_info=True,
+                    )
 
         # ── 4.6 从证据链提事实（M3，2026-10-27）──
         # 【为什么放在 completed 之后】记忆是任务完成后的附加动作：写失败只影响

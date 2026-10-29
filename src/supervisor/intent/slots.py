@@ -24,12 +24,14 @@
       闸门把它关掉 —— LLM 只能当同义词翻译器，不能引进新值。
     ⚠️ `keyword` 现在只剩 verify 在用。trace 不再抽它（2026-10-29）：
       它的值本来就是 `rule_dimensions(text)[0]`，是维度名，却拿去 `claim ILIKE`。
-  ★ 抽取顺序：显式参数 → 值池 → 词表 → LLM。只有 analysis/trace 会走到 LLM，
+  ★ 抽取顺序：值池 → 词表 → LLM。只有 analysis/trace 会走到 LLM，
     且 trace 只在**竞品**解析不出来时才调（维度空着是可见降级，不值得多付一次）。
+    ⚠️ analysis **每轮都调**：竞品没有词表可查，只能问模型。别再写"参数齐全就省一次"
+    —— 那个短路随显式参数一起删了，因为生产路径上从来没人传过显式参数。
   ⚠️ 成本账（别再说"拆分不增加调用"）：判意图与抽竞品从一个调用变成两个，
      总调用上升约三成。换来的是 L2 判出即可停（32.1% 不进 LLM）。
 【读法】
-  排查"为什么没抽到竞品"先看 `Slots.source`（explicit/pool/alias/llm/none）。
+  排查"为什么没抽到竞品"先看 `Slots.source`（pool/alias/rule/llm/none）。
 """
 
 from __future__ import annotations
@@ -79,7 +81,7 @@ class Slots:
     competitors: list[str] = field(default_factory=list)
     dimensions: list[str] = field(default_factory=list)
     keyword: str | None = None
-    source: str = "none"        # explicit / rule / llm / none
+    source: str = "none"        # pool / alias / rule / llm / none
 
     @property
     def has_anchor(self) -> bool:
@@ -254,8 +256,6 @@ async def fill_slots(
     text: str,
     intent: str,
     *,
-    explicit_competitors: list[str] | None = None,
-    explicit_dimensions: list[str] | None = None,
     settings: Settings | None = None,
     history_block: str = "",
     competitor_pool: list[str] | None = None,
@@ -263,8 +263,12 @@ async def fill_slots(
 ) -> Slots:
     """按 label 决定抽什么，返回槽位。
 
-    explicit_* 是调用方从请求体直接拿到的结构化参数（表单路径），
-    一定优先于任何推断 —— 用户亲手填的比模型猜的可靠。
+    ⚠️ **没有 explicit 参数了**（2026-10-29 删）。它原本是"调用方从请求体拿到的
+    结构化参数，优先于任何推断"，但生产路径上从来没有调用方传它：
+    `/api/chat` 的 `ChatRequest` 只有 message/conversation_id/page/page_size，
+    根本没有竞品字段；`/api/tasks` 的表单参数走 `TaskRequest` → `_create_task_impl`，
+    压根不经过本函数。它只活在测试里，却让 analysis 的"参数齐全就不调模型"
+    短路分支永远进不去（`cs` 恒空）——挂着一个假兜底比没有更危险。
 
     competitor_pool / dimension_pool 是该用户自己的两个值池：
       · 竞品池 = `tasks.competitors` 的 DISTINCT（实测 2~32 个）
@@ -274,10 +278,10 @@ async def fill_slots(
     可用"，此时只能靠显式参数或 LLM。
     """
     text = (text or "").strip()
-    cs = _dedupe(normalize_str_list(explicit_competitors))
-    ds = _dedupe(normalize_str_list(explicit_dimensions))
+    cs: list[str] = []
+    ds: list[str] = []
     kw = rule_keyword(text)
-    base_source = "explicit" if (cs or ds) else ("rule" if kw else "none")
+    base_source = "rule" if kw else "none"
 
     # lookup：竞品走值池字面匹配（零 LLM），序数由 parse_ordinal 在调用处抽。
     #   维度也走值池（词表翻译后回池校验），但它只决定**念哪条事实**（_pick_facts），
@@ -296,14 +300,15 @@ async def fill_slots(
     if intent == "verify":
         return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
 
-    # analysis：两边都齐才不调 LLM；缺一边就交给 LLM（竞品没有词表可查）。
+    # analysis：维度先走规则，竞品只能靠 LLM（没有词表可查）。
+    #   ⚠️ 这里**曾经**有个"两边都齐就不调 LLM"的短路，删显式参数时一并去掉了：
+    #     那个短路判的是 `cs and ds`，而 `cs` 在生产路径上恒为空 —— 永远进不去。
+    #     留着它会让下一个人以为"参数填满就能省一次调用"，从而把死代码当优化依据。
     if intent == "analysis":
         ds = ds or rule_dimensions(text)
-        if cs and ds:
-            return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
         got = await llm_slots(text, settings, history_block)
         return Slots(
-            competitors=cs or got.competitors,
+            competitors=got.competitors,
             dimensions=ds or got.dimensions,
             keyword=kw,
             source=got.source if got.source != "none" else base_source,
@@ -322,7 +327,7 @@ async def fill_slots(
     if intent == "trace":
         # 竞品是主槽位，`Slots.source` 只记它的来源；维度来源不混进来（否则
         # 排查"为什么没抽到竞品"时会被维度命中的 pool/alias 误导）。
-        src = "explicit" if (cs or ds) else "none"
+        src = "none"
 
         if not cs:
             hit, s = match_values(text, competitor_pool)
