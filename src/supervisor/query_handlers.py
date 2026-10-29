@@ -447,29 +447,47 @@ def _pick_facts(
     return picked
 
 
-def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None) -> str:
+def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None,
+                   page=None, page_size=None) -> str:
     """把一次 lookup 的结果说成人话。纯函数：不查库、不读时钟、不看全局状态。
 
     【为什么要单独一个函数】SQL 变了而文案忘了改，产出的是比"答不上"更糟的东西：
     跳过了几条还说"最近一次"、库里有 20 次却说"另有 4 条"。抽成函数是为了让
     「改 SQL」和「改说法」落在同一个视线里，也让文案能被直接断言而不必造池子。
 
+    【page/page_size 为什么影响文案】分页模式下有三句话必须改口，否则会自相矛盾：
+      · "最近 N 次里最新的是" → 第 2 页里根本没有"最近"这回事
+      · "另有 N 条更早的记录" → 翻页由分页控件承担，再说一句就重复了
+      · 空结果的"没有找到" → 翻到末页之后库里有数据，只是这一页没内容
+
     ⚠️ 输入契约：items 是 `lookup_reports` 建好的那种形态 —— created_at 已由
        `_iso()` 转成字符串、facts 已挑过。直接喂 asyncpg 的原始记录会崩（`_time_cn`
        只吃字符串），所以这函数不是"给任何 row 都能用"的通用格式化器。
     """
+    paged = bool(page and page_size)
+    scope = "、".join(competitors) if competitors else ""
+
     if not items:
         # ★ 空结果有两种，别混成一句：库里真没有，和"有，但跳过这么多条就没了"。
         #   后者回"没有找到匹配的历史任务"是谎报 —— 库里有，只是不在这个位置。
+        if paged:
+            if total:
+                return (f"「{scope}」相关分析一共 {total} 份，没有第 {page} 页 —— "
+                        f"最多翻到第 {-(-total // page_size)} 页。")
+            return f"没有「{scope}」相关的分析记录。" if scope else "还没有任何分析记录。"
         if skip and total:
             return f"你一共只有 {total} 次分析记录，没有倒数第{_ordinal_cn(skip + 1)}次。"
         return "没有找到匹配的历史任务。" + ("（按竞品筛选后为空）" if competitors else "")
 
     head = items[0]
-    # 称呼必须跟着 skip 和条数走：
+    # 称呼必须跟着 skip / page / 条数走：
     #   · 跳过了两条还说"最近一次是…" → 用户以为拿到的是最新的那份
     #   · 返回了两条却只说"最近一次是…" → 用户以为只要到一条
-    if skip:
+    if paged:
+        # 分页只列清单，不逐条念结论（列表已经把它们画出来了）。
+        lead = f"「{scope}」相关分析共 {total} 份，第 {page} 页最新的是" if scope \
+            else f"相关分析共 {total} 份，第 {page} 页最新的是"
+    elif skip:
         lead = f"倒数第{_ordinal_cn(skip + 1)}次是"
     elif len(items) > 1:
         # 数量用阿拉伯数字：「两次」对、「二次」不对，而 _ordinal_cn 给的是后者。
@@ -540,7 +558,8 @@ def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None) ->
     #    这两个错在 C3（没有 skip）里都看不见，加了 OFFSET 才会露出来 ——
     #    也正是"改 SQL 和改文案必须在一处"的理由。
     rest = (total - skip - len(items)) if total else (len(items) - 1)
-    if rest > 0:
+    # 分页模式下这句话由分页控件承担，再说一遍就是同一件事讲两次。
+    if rest > 0 and not paged:
         # 恰好取满且没有更多时，别念"另有 0 条"
         summary += (
             f"\n另有 {rest} 条更早的记录"
@@ -556,6 +575,8 @@ async def lookup_reports(
     dimensions: list[str] | None = None,
     limit: int = 5,
     skip: int = 0,
+    page: int | None = None,
+    page_size: int | None = None,
 ) -> dict:
     """按用户（可选再按竞品、维度）取最近的任务与报告，并把结论一并念出来。
 
@@ -567,17 +588,27 @@ async def lookup_reports(
     【skip 从哪来】由 `parse_ordinal` 在 routes 层按规则抽好，这里只收数字。
     刻意不在这里解析自然语言 —— 本模块的性质是"只依赖 pool.fetch 的 SQL 执行器"，
     一旦开始 import re 读用户原话，"给个假池就能测"就没了。
+
+    【page/page_size 与 skip 是两套语义，不叠加】page_size 给出时按分页算：
+    `skip = (page-1) * page_size`，传进来的 skip 被丢弃。叠加会让"第 2 页的
+    上上次"有定义 —— 这个位置不存在，只是把两种偏移硬加在一起。
     """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
     dims = [d for d in (dimensions or []) if str(d).strip()] or None
+    if page_size:
+        page = max(1, int(page or 1))
+        limit, skip = page_size, (page - 1) * page_size
+    else:
+        page = None
+
     rows = await pool.fetch(_LOOKUP_SQL, user_id, competitors, limit, skip)
     # 库里的真实总数（窗口函数给的），用来把"另有 N 条"说准。
     # 空结果时无从得知，留 None 让 describe_tasks 退回窗口内计数。
     total = rows[0].get("total") if rows else None
-    if not rows and skip:
+    if not rows:
         # ⚠️ OFFSET 越界时一行都不返回，窗口函数算好的 total 也就拿不到 ——
         #    窗口函数是"每行带上总数"，没有行就没有总数。这里补问一次。
-        #    只在越界路径上多花这一条查询，常规路径仍然只有一条 SQL。
+        #    分页把这个路径从"罕见"变成了"翻到末页就会走"，所以必须准。
         counted = await pool.fetch(_COUNT_TASKS_SQL, user_id, competitors)
         total = counted[0]["n"] if counted else None
 
@@ -620,11 +651,26 @@ async def lookup_reports(
             fact.setdefault("source_task_id", head["task_id"])
             fact.setdefault("source_title", head["title"])
 
+    pagination = None
+    if page and page_size:
+        # total 为 None 只会出现在"补 count 也失败"，按 0 页处理而不是崩
+        pages = max(1, -(-(total or 0) // page_size))
+        pagination = {
+            "page": page,
+            "page_size": page_size,
+            "total": total or 0,
+            "total_pages": pages,
+            "has_prev": page > 1,
+            "has_next": page < pages,
+        }
+
     return {
         "items": items,
         "total": total,
+        "pagination": pagination,
         "summary": describe_tasks(items, total=total, skip=skip, dims=dims,
-                                  competitors=competitors),
+                                  competitors=competitors,
+                                  page=page, page_size=page_size),
     }
 
 

@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import generate_latest
@@ -274,6 +274,8 @@ class ChatRequest(BaseModel):
         None,
         description="多轮会话标识；为空则服务端新建一个并在响应的 conversation_id 里回传",
     )
+    page: int = Field(1, ge=1, le=200, description="lookup 结果页码（只在 lookup 生效，序数问法不受它影响）")
+    page_size: int = Field(10, ge=1, le=50, description="lookup 每页条数")
 
 
 class TaskResponse(BaseModel):
@@ -941,6 +943,31 @@ def _title_from_message(message: str, limit: int = 60) -> str:
     return text[:limit] or "竞品分析"
 
 
+# 该用户分析过的竞品名（值池）。`jsonb_array_elements_text` 在 FROM 里展开成行，
+# 才能写 DISTINCT + ORDER BY —— 放在 select list 里展开时 DISTINCT 语义会很绕。
+_COMPETITOR_POOL_SQL = """
+SELECT DISTINCT c
+  FROM tasks t, jsonb_array_elements_text(t.competitors) AS c
+ WHERE t.user_id = $1 AND c <> ''
+ ORDER BY c
+"""
+
+
+async def competitor_pool(pool, user_id: str) -> list[str]:
+    """该用户分析过的全部竞品名，供 lookup 做字面匹配。
+
+    【为什么是"该用户的"而不是全库】用户问「飞书那份报告」时，他心里的候选
+    只有自己跑过的那些。拿全库值池会让别人分析过的竞品也参与匹配 —— 命中一个
+    他没跑过的名字，返回空，看起来像"没有记录"，其实是串了。
+
+    【为什么这个池子让字面匹配成立】它是**封闭集合**（`SELECT DISTINCT`，
+    实测 5 个用户分别是 2/2/5/7/29 个），而用户说出的名字本身就是集合里的元素。
+    所以这是查值，不是猜语义 —— 和"世界上所有竞品"是开放集合是两回事。
+    """
+    rows = await pool.fetch(_COMPETITOR_POOL_SQL, user_id)
+    return [r["c"] for r in rows if r["c"]]
+
+
 @app.post("/api/chat")
 async def chat(
     body: ChatRequest,
@@ -1097,11 +1124,19 @@ async def chat(
     #   ★ 放在澄清分支之后：追问轮不需要槽位，别为一句"你是想做什么"再付一次 LLM。
     #   抽什么由 label 决定（见 intent/slots.py 顶上那张"缺了下游会不会答错"的表）；
     #   槽位**无权回头改 label** —— 单向依赖，否则耦合又回来了。
+    #
+    #   lookup 的竞品不做推断，直接去用户的值池里查字符串 —— 用户说出的名字
+    #   就是库里的键。其余意图不需要这个池子，所以只在这一支查（一条 SELECT DISTINCT）。
+    pool_comps = None
+    if decision.intent == "lookup":
+        pool_comps = await competitor_pool(pool, current_user.user_id)
+
     slots = await fill_slots(
         body.message,
         decision.intent,
         settings=settings,
         history_block=history_block,
+        competitor_pool=pool_comps,
     )
 
     # ── analysis：复用 /api/tasks 的整条链路 ──
@@ -1158,30 +1193,102 @@ async def chat(
             data = {
                 "items": [],
                 "total": None,
+                "pagination": None,
                 "summary": f"「{ordv['unsupported']}」这个方向暂时查不了 —— "
                            f"现在只能从最近一次往前数（上上次、前两次、倒数第三次）。",
             }
         else:
+            # ★ 序数问法和分页是两套语义，不能叠加：
+            #   「上上次」要的是第 2 条（limit=1, skip=1），如果同时按 page_size
+            #   分页，skip 会被重算成 (page-1)*page_size，序数就失效了。
+            #   判据是"这次问法里有没有序数"，有就关掉分页，只回那一条。
+            #   ⚠️ limit 也要跟着切换：序数模式下沿用 page_size 会返回 10 条
+            #   从第 2 条开始的记录，用户问"上上次"却拿到一串。
+            ordinal = bool(ordv.get("limit") or ordv.get("skip"))
             data = await lookup_reports(
                 pool,
                 current_user.user_id,
                 competitors,
                 slots.dimensions,
-                limit=ordv.get("limit", 5),
+                limit=ordv.get("limit", 1) if ordinal else body.page_size,
                 skip=ordv.get("skip", 0),
+                page=None if ordinal else body.page,
+                page_size=None if ordinal else body.page_size,
             )
     elif decision.intent == "trace":
         data = await trace_evidence(pool, current_user.user_id, competitors, slots.keyword)
     else:
         data = await check_freshness(pool, current_user.user_id, competitors, slots.keyword)
 
+    # 分页信息与翻页参数：前端据此渲染分页条，翻页时打 GET /api/lookup。
+    # 为什么翻页不重发这句话：那会多走一次意图识别（白付一次编码），还会往
+    # conversations 流水里塞一行"第 2 页"，把真实对话淹掉。
     return await finish(200, {
         "type": "answer",
         **base,
         "summary": data["summary"],
         "items": data["items"],
+        "pagination": data.get("pagination"),
+        "lookup_params": ({
+            "competitors": list(competitors or []),
+            "dimensions": list(slots.dimensions or []),
+            "page_size": body.page_size,
+        } if decision.intent == "lookup" else None),
         "echo": body.message,
     }, data["summary"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 路由 — GET /api/lookup（历史报告翻页，2026-10-29）
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/lookup")
+async def lookup_page(
+    request: Request,
+    competitors: str = Query("", description="逗号分隔的竞品名；空=不限定（列该用户全部）"),
+    dimensions: str = Query("", description="逗号分隔的维度；空=不限定"),
+    page: int = Query(1, ge=1, le=200, description="页码，从 1 开始"),
+    page_size: int = Query(10, ge=1, le=50, description="每页条数"),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> JSONResponse:
+    """lookup 结果的翻页接口 —— 只执行 SQL，不判意图、不落会话流水。
+
+    【为什么单独开一个端点，而不是让前端重发那句话】翻页是纯展示动作：
+      · 重发要再走一次 L2（白付一次编码）并重新抽槽位
+      · 会往 `conversation_turns` 里写一行"第 2 页"，把真实对话淹掉
+      · 还依赖"同一句话第二次也被判成 lookup"这个前提，凭空多一个会变的环节
+
+    【参数从哪来】`/api/chat` 的 lookup 响应里带 `lookup_params`，前端原样带回。
+    抽槽结果由后端给 —— 前端不复制任何判定逻辑，这条和对话入口是同一个纪律。
+
+    【越权】过滤条件始终带 `t.user_id = 当前用户`（见 `_TASKS_FILTER`）；
+    competitors/dimensions 只能收窄范围，不能用来读别人的任务。
+    """
+    from src.supervisor.query_handlers import lookup_reports
+
+    def _names(raw: str) -> list[str] | None:
+        # 中文逗号也认：`lookup_params` 回传的是后端拼的，但接口是公开的，
+        # 手输或用别的客户端时不该因为一个全角逗号就查出空结果。
+        parts = (raw or "").replace("，", ",").split(",")
+        return [p.strip() for p in parts if p.strip()] or None
+
+    comps, dims = _names(competitors), _names(dimensions)
+    data = await lookup_reports(
+        _get_pool(request), current_user.user_id, comps, dims,
+        page=page, page_size=page_size,
+    )
+    return JSONResponse(status_code=200, content={
+        "type": "answer",
+        "intent": "lookup",
+        "summary": data["summary"],
+        "items": data["items"],
+        "pagination": data["pagination"],
+        "lookup_params": {
+            "competitors": comps or [],
+            "dimensions": dims or [],
+            "page_size": page_size,
+        },
+    })
 
 
 # ═════════════════════════════════════════════════════════════════════════════

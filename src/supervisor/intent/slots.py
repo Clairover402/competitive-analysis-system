@@ -10,6 +10,11 @@
       trace    缺竞品       → `t.competitors ?| $2` 失效，会列出别的竞品的证据 → 必抽
       verify   缺竞品       → 核该用户全部事实，**正是「数据新不新」要的** → 不抽
       lookup   缺序数       → 退回最近一次，是合理默认              → 不抽
+  ★ lookup 的竞品走**值池字面匹配**（`match_competitors`），零 LLM：
+      用户问「飞书那份报告」时，竞品名就是库里的键，不需要"猜出"它。
+      匹配不到就不限定竞品 —— 这个降级是**用户看得见的**（列表末尾有
+      「另有 N 条更早的记录」），所以宁可漏也不要为了覆盖简称去调 LLM：
+      LLM 抽出用户没说过的竞品会变成"答窄"，用户看不出漏了谁。
     「keyword」在三条路径上全部**可空**（两条 SQL 都有 `$3 IS NULL` 分支），
     所以它一律走规则，抽不到就留空 —— 代价是"答得薄"，不是"答得错"。
   ★ 抽取顺序：显式参数 → 规则（维度词表） → LLM。只有 analysis/trace 会走到 LLM。
@@ -22,6 +27,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from src.agents import create_llm_client
@@ -113,6 +119,43 @@ def rule_keyword(text: str) -> str | None:
     return dims[0] if dims else None
 
 
+def _squash(s: str) -> str:
+    """去空白 + 小写。`GitHub Copilot` / `github  copilot` / `GitHubCopilot` 归一。
+
+    ⚠️ 只是归一化，不是模糊匹配 —— 不做拼音、不做编辑距离。规则层一旦开始
+       「差不多就算」，静默误判的面会盖过它多认出来的那几条。
+    """
+    return re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def match_competitors(text: str, pool: list[str] | None) -> list[str]:
+    """在**这个用户自己的**竞品值池里做字面匹配，返回命中的竞品名。
+
+    【为什么 lookup 不用 LLM】用户问「飞书那份报告」时，他说出的就是竞品名，
+    而这个名字本身已经是 `tasks.competitors` 里的一个值 —— 对齐对象是封闭集合
+    （该用户分析过的 N 个竞品），不是"世界上所有竞品"。所以这是**查值**，
+    不是**猜语义**。实测 36 句真实 query：18 句命中且零误命中，未命中的
+    18 句全部本来就不带竞品（「我以前跑过的报告在哪」这类）。
+
+    ★ 三条判据：
+      1. 长名优先。值池里 `飞书` ⊂ `飞书文档`，说「飞书文档的定价」时两个都会
+         命中；去掉被包含的短名，否则顺带把「飞书」的任务也捞进来。
+      2. 空白归一（见 `_squash`）。
+      3. 命中为空返回空，由调用方走"不限定竞品"。**不要在这里兜底调 LLM**：
+         那会引入 lookup 原本没有的失败模式 —— 抽出用户没说过的竞品 → 只查
+         那一个 → 返回 0 条，而用户以为筛过了、看不出漏了谁。
+    """
+    nq = _squash(text)
+    if not nq or not pool:
+        return []
+    hits = [c for c in pool if _squash(c) and _squash(c) in nq]
+    if len(hits) > 1:
+        # 只留"不包含于任何其他命中项"的那些
+        hits = [h for h in hits
+                if not any(h != o and _squash(h) in _squash(o) for o in hits)]
+    return _dedupe(hits)
+
+
 async def llm_slots(
     text: str, settings: Settings | None = None, history_block: str = ""
 ) -> Slots:
@@ -144,11 +187,16 @@ async def fill_slots(
     explicit_dimensions: list[str] | None = None,
     settings: Settings | None = None,
     history_block: str = "",
+    competitor_pool: list[str] | None = None,
 ) -> Slots:
     """按 label 决定抽什么，返回槽位。
 
     explicit_* 是调用方从请求体直接拿到的结构化参数（表单路径），
     一定优先于任何推断 —— 用户亲手填的比模型猜的可靠。
+
+    competitor_pool 是该用户 `tasks.competitors` 的 `DISTINCT` 值池，只有
+    lookup 用它做字面匹配。由调用方查好传进来（本模块不碰 pool，保持纯函数
+    可测）；传 None 等于"没有值池可用"，lookup 就退回不限定竞品。
     """
     text = (text or "").strip()
     cs = _dedupe(normalize_str_list(explicit_competitors))
@@ -156,8 +204,12 @@ async def fill_slots(
     kw = rule_keyword(text)
     base_source = "explicit" if (cs or ds) else ("rule" if kw else "none")
 
-    # lookup：序数由 parse_ordinal 在调用处规则抽，这里不占 LLM。
+    # lookup：竞品走值池字面匹配（零 LLM），序数由 parse_ordinal 在调用处抽。
     if intent == "lookup":
+        if not cs:
+            hit = match_competitors(text, competitor_pool)
+            if hit:
+                cs, base_source = hit, "pool"
         return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
 
     # verify：缺竞品等于"核全部事实"，正是「数据新不新」想要的，不必抽。

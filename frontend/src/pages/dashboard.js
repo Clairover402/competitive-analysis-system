@@ -524,7 +524,31 @@ export function mount() {
     return '<div class="pixel-chat-items">' + items.map(fn).join('') + '</div>';
   }
 
-  function renderChatMessage(m) {
+  /* 历史报告分页条（lookup）。
+   *
+   * ⚠️ 按钮上的 data-pager 是**消息在 chatMessages 里的下标**，不是任务 id。
+   *    点"下一页"要改的是这一条消息自己的 items，不是跳转 —— 所以它必须走
+   *    单独的委托分支，不能落到下面 `[data-task]` 那条（那会跳去任务详情页）。
+   *
+   * 只在 total_pages > 1 时出现：一页装得下就没有"翻"这件事，
+   * 画两个永远灰着的按钮只会让人以为坏了。
+   */
+  function renderPager(m, idx) {
+    var p = m.pagination;
+    if (!p || !p.total_pages || p.total_pages <= 1) return '';
+    return '<div class="pixel-chat-pager">' +
+      '<button type="button" class="pixel-btn pixel-btn-secondary pixel-btn-compact"' +
+        ' data-pager="' + idx + '" data-page="' + (p.page - 1) + '"' +
+        (p.has_prev ? '' : ' disabled') + '>上一页</button>' +
+      '<span class="pixel-chat-pager-info">第 ' + p.page + ' / ' + p.total_pages +
+        ' 页 · 共 ' + p.total + ' 份</span>' +
+      '<button type="button" class="pixel-btn pixel-btn-secondary pixel-btn-compact"' +
+        ' data-pager="' + idx + '" data-page="' + (p.page + 1) + '"' +
+        (p.has_next ? '' : ' disabled') + '>下一页</button>' +
+      '</div>';
+  }
+
+  function renderChatMessage(m, idx) {
     if (m.role === 'user') {
       return '<div class="pixel-chat-row user">' +
         '<div class="pixel-chat-bubble user">' + esc(m.text) + '</div></div>';
@@ -621,14 +645,19 @@ export function mount() {
     var hit = m.layer ? (' · ' + m.layer) : '';
     var conf = (typeof m.confidence === 'number' && m.confidence > 0)
       ? (' ' + m.confidence.toFixed(2)) : '';
-    return '<div class="pixel-chat-row"><div class="pixel-chat-bubble bot">' +
+    // data-msg 供翻页后"回到这一条顶部"用（见 scrollToMessage）。
+    // 分页条放在列表**上方**：聊天区是固定高度的滚动容器，放底部会随列表变长
+    // 沉到看不见的地方 —— 用户翻完页还得先滚到底才能点下一次，来回折腾。
+    return '<div class="pixel-chat-row" data-msg="' + idx + '">' +
+      '<div class="pixel-chat-bubble bot">' +
       '<div class="pixel-chat-meta">' + esc(label) + esc(hit) + esc(conf) + '</div>' +
       '<div>' + esc(m.summary || '没有结果。') + '</div>' +
+      renderPager(m, idx) +
       renderItems(m.intent, m.items) +
       '</div></div>';
   }
 
-  function renderChatLog() {
+  function renderChatLog(keepScroll) {
     if (!chatLog) return;
     if (!chatMessages.length) {
       chatLog.innerHTML = '<div class="pixel-chat-empty">' +
@@ -640,8 +669,12 @@ export function mount() {
         '</div>';
       return;
     }
-    chatLog.innerHTML = chatMessages.map(renderChatMessage).join('');
-    chatLog.scrollTop = chatLog.scrollHeight;
+    // ⚠️ 翻页时不能滚到底：用户点"下一页"是想看这一页的**第一行**，
+    //    滚到最底会直接跳过整页内容。其他地方（新消息、错误）仍然滚到底。
+    var top = chatLog.scrollTop;
+    chatLog.innerHTML = chatMessages
+      .map(function(m, i) { return renderChatMessage(m, i); }).join('');
+    chatLog.scrollTop = keepScroll ? top : chatLog.scrollHeight;
   }
 
   function botMessageFrom(d) {
@@ -658,7 +691,72 @@ export function mount() {
       role: 'bot', kind: 'answer',
       intent: d.intent, layer: d.layer, confidence: d.confidence,
       summary: d.summary, items: d.items || [],
+      /* 历史报告分页（2026-10-29）。两个字段分工：
+         · pagination 决定要不要画分页条、画第几页
+         · lookup_params 是翻页时要原样带回去的查询条件（后端抽的槽，前端不复刻）
+         其它意图两者都是 null，renderChatMessage 里自然不画。 */
+      pagination: d.pagination || null,
+      lookup_params: d.lookup_params || null,
     };
+  }
+
+  /* 把聊天区滚到某条消息的顶部。
+   *
+   * ⚠️ 不能用 scrollIntoView：那会连整个页面一起滚，把输入框顶出屏幕外。
+   *    这里只动 chatLog 自己的 scrollTop。
+   * 为什么需要它：renderChatLog 默认滚到底（新消息该在底部），但翻页时
+   *    用户要的是"这一页的第一条"。停在底部 = 直接跳过整页内容。
+   */
+  function scrollToMessage(idx) {
+    if (!chatLog) return;
+    var el = chatLog.querySelector('[data-msg="' + idx + '"]');
+    if (!el) return;
+    // ⚠️ 用 rect 差值而不是 offsetTop：offsetTop 相对的是 offsetParent，
+    //    chatLog 不一定是它（取决于哪层设了 position），offsetTop 会少算一截。
+    var delta = el.getBoundingClientRect().top - chatLog.getBoundingClientRect().top;
+    chatLog.scrollTop += delta - 8;
+  }
+
+  /* 翻一页历史报告。
+   *
+   * 走 GET /api/lookup 而不是重发那句话，三个理由：
+   *   1. 重发要再走一次 L2 意图识别（白付一次编码），还要重新抽一遍槽位
+   *   2. 会往会话流水里写一行"第 2 页"，把真实对话淹掉
+   *   3. 同一句话第二次未必还判成 lookup —— 凭空多一个会变的环节
+   *
+   * 只改这一条消息自己的 items/pagination，**不新增气泡**：翻页不是新的一轮
+   * 对话，用户要的是"同一份清单的另一屏"。
+   *
+   * ⚠️ 下标定位：`data-pager` 存的是消息在 chatMessages 里的位置。中途若有人
+   *    删消息（比如 resolvePreference 里 filter 掉已处理的偏好卡），下标会错位。
+   *    所以进来先校验 kind/intent —— 宁可什么都不做，也不要把别的消息改成清单。
+   */
+  async function loadLookupPage(idx, page) {
+    var m = chatMessages[idx];
+    if (!m || m.kind !== 'answer' || m.intent !== 'lookup' || !m.lookup_params) return;
+    var lp = m.lookup_params;
+    var qs = '?page=' + page +
+      '&page_size=' + encodeURIComponent(lp.page_size || 10) +
+      '&competitors=' + encodeURIComponent((lp.competitors || []).join(',')) +
+      '&dimensions=' + encodeURIComponent((lp.dimensions || []).join(','));
+    try {
+      var d = await API.get('/api/lookup' + qs);
+      m.items = d.items || [];
+      m.pagination = d.pagination;
+      m.summary = d.summary;
+      // 后端会回显规范化后的参数（全角逗号被拆开之类），以它为准
+      m.lookup_params = d.lookup_params || lp;
+      SFX.blip();
+      renderChatLog(true);
+      scrollToMessage(idx);   // 滚到这条消息顶部，让用户看到这一页的第一行
+    } catch (e) {
+      chatMessages.push({
+        role: 'bot', kind: 'error',
+        text: '翻页失败: ' + (e.message || '请求失败'),
+      });
+      SFX.error();
+      renderChatLog();
+    }
   }
 
   async function resolvePreference(key, act) {
@@ -902,6 +1000,19 @@ export function mount() {
 
       // 来源链接要能直接打开，别被下面的"点条目跳任务"抢先拦截
       if (t.closest('a')) return;
+
+      // 分页：改的是这条消息自己的清单，不是跳转，也不是新一轮对话。
+      // 放在 `[data-task]` 之前 —— 那个分支会改 location.hash，抢到就翻不了页。
+      var pager = t.closest('[data-pager]');
+      if (pager) {
+        if (pager.disabled) return;
+        SFX.click();
+        loadLookupPage(
+          parseInt(pager.getAttribute('data-pager'), 10),
+          parseInt(pager.getAttribute('data-page'), 10)
+        );
+        return;
+      }
 
       var opt = t.closest('.pixel-chat-opt');
       if (opt) {

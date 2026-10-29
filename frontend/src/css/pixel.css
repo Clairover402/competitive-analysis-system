@@ -154,6 +154,11 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-chat-item-head { color: var(--pixel-white); }
 .pixel-chat-item-sub { color: var(--pixel-light); font-size: 13px; margin-top: 4px; }
 .pixel-chat-item-action { color: var(--pixel-green); font-size: 13px; margin-top: 6px; }
+/* 历史报告分页条（lookup，2026-10-29）：两枚按钮夹着页码，位置在列表**上方**。
+   翻页只换这条消息的清单，不新增气泡 —— 所以它的视觉要有"这是同一条消息的
+   控件"的归属感：下边框分隔、按钮用次级样式，别抢了列表项的主次。 */
+.pixel-chat-pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; padding-bottom: 10px; border-bottom: 2px solid var(--pixel-mid); }
+.pixel-chat-pager-info { font-family: var(--pixel-font); font-size: 11px; letter-spacing: 1px; color: var(--pixel-light); text-align: center; flex: 1; }
 .pixel-chat-src { display: block; color: var(--pixel-cyan); font-size: 13px; margin-top: 4px; word-break: break-all; }
 .pixel-chat-src:hover { color: var(--pixel-white); text-decoration: underline; }
 .pixel-chat-opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
