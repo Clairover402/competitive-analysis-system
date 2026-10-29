@@ -1,21 +1,27 @@
-"""意图评估器 — 用 150 句带 gold 的说法，算出各层到底准不准。
+"""意图评估器 — 用 149 句带 gold 的说法，算出各层到底准不准。
 
 【为什么要有它】
 `top1=0.832 gap=0.109` 这种日志只能说明某一次判对了；它回答不了
-「L2 在 150 句里错几类、错在哪两类上、floor 定 0.55 合不合适」。
+「L2 在 149 句里错几类、错在哪两类上、floor 定 0.55 合不合适」。
 这份评估器把"我觉得挺准"换成三个可引用的数字：
 **层接管率 / 各层准确率 / 混淆矩阵**。
 
 【四个口径，别混着看】
-  · **接管率**：L1 收走多少、L2 收走多少、多少落到 L3、多少被判"该追问"。
+  · **接管率**：L2 收走多少、多少落到 L3、多少被判"该追问"。
     这个数字决定成本 —— 每多下沉一条就是多一次 LLM。
-  · **各层准确率**：L1 接走的那批里对了多少（L1 只在参数齐全时出手，
-    正常应该是 100%；掉下来说明规则漏了）。L2 同理。
+  · **各层准确率**：L2 接走的那批里对了多少。掉下来说明阈值或范例有问题。
   · **端到端准确率**：用户实际感受到的那个数。它一定 ≤ 各层准确率的加权，
     因为错在早层的不会被后面纠正 —— 漏斗只往下走，不回头。
   · **按意图 × 层**：回答"这堆 L3 调用里哪一半是该省的"。同一个下沉率，
     analysis/trace 是**顺路**（必抽竞品，判完还得调 LLM），lookup/verify 是**白花**
     （不抽槽位，L2 判对就是零调用）。只看总占比会得出"再降点门槛"的错误结论。
+
+【2026-10-29 删了 L1，这份报告少了一格】
+  原来 L1 那 1 条来自评估集里唯一一句带结构化参数的用例（text 为空 + 竞品维度），
+  而那句测的是**标准模式**，被编进了对话模式的评估集 —— 0.7% 是口径混了路径，
+  线上对话路径真实值是 0。删掉 L1 后这句用例也从 CASES 里删了（150 → 149）。
+  ⚠️ 所以 2026-10-29 之前的快照不要拿来跟现在比"层接管率"，
+     分母和层数都变了，只能分段看 `created_at`。
 
 【主指标只算非边界样本】
 `ambiguous=True` 的句子两种判法都说得通（"飞书多少钱" 是问当前值还是
@@ -24,12 +30,12 @@
 它们单独统计，只用来观察"模型的倾向"。
 
 【跑一次要多久 / 花多少】
-L1 零成本；L2 每句一次本地 embedding；L3 只跑下沉样本，一次 LLM 调用
-（deepseek，几分钱）。150 句默认并发 4，约 1~2 分钟。
+L2 每句一次 embedding；L3 只跑下沉样本，一次 LLM 调用（deepseek，几分钱）。
+149 句 `--concurrency 6` 实测约 13 分钟（并发 4 更慢，旧的"1~2 分钟"早不准了）。
 
 用法:
     python -m src.evaluation.intent_eval
-    python -m src.evaluation.intent_eval --no-l3     # 只看 L1/L2 接管与下沉量
+    python -m src.evaluation.intent_eval --no-l3     # 只看 L2 接管与下沉量
     python -m src.evaluation.intent_eval --sweep     # 顺带扫 floor × margin
 """
 
@@ -46,7 +52,6 @@ from pathlib import Path
 from src.evaluation.intent_cases import CASES, Case, stats
 from src.supervisor.intent import (
     INTENTS,
-    l1_deterministic,
     l2_semantic,
     l3_llm,
     l4_clarify,
@@ -61,7 +66,9 @@ _ALL_INTENTS = (*INTENTS, "unknown")
 #   另外两个不抽槽位，L2 判对就是零 LLM 调用，走到 L3 属于"白花"。
 #   依据是 slots.py 的沟槽判据「缺了下游会不会答错」，不是"这个意图有什么槽"。
 _SLOT_INTENTS = ("analysis", "trace")
-_LAYERS = ("L1", "L2", "L3", "L4")
+_LAYERS = ("L2", "L3", "L4")
+# "none" = 空输入，不属于任何一层；"skipped" / "error" / "off" 是旁路状态，
+# 都单独计入 layers 计数，但不参与"各层准确率"。
 
 
 async def judge_case(case: Case, settings, *, run_l3: bool) -> dict:
@@ -70,16 +77,12 @@ async def judge_case(case: Case, settings, *, run_l3: bool) -> dict:
     ★ 2026-10-29 拆包后可以直接调 classify 了（它不再需要 pool），但这里仍逐层调：
       `--no-l3` 要在 L2 之后截断，classify 没有这个开关。
       ⚠️ 代价是两处顺序要人工对齐 —— 改 classify 的分支顺序时同步改这里。
+    ⚠️ 2026-10-29 起没有 L1：那句"带结构化参数、text 为空"的用例已从 CASES 删除，
+      它测的是标准模式，不该混进对话路径的分层统计。
     """
-    r1 = l1_deterministic(
-        case.text, list(case.competitors), list(case.dimensions)
-    )
-    if r1 is not None:
-        return _row(case, r1.intent, "L1", r1)
-
     text = case.text.strip()
     if not text:
-        return _row(case, "unknown", "L1", None, note="无任何可判定输入")
+        return _row(case, "unknown", "none", None, note="无任何可判定输入")
 
     r2 = await l2_semantic(text, settings)
     if r2 is not None:
@@ -134,7 +137,7 @@ def summarize(rows: list[dict]) -> dict:
     #   几道本来就没有唯一答案的题。
     by_layer = {
         layer: _acc([r for r in main if r["layer"] == layer])
-        for layer in ("L1", "L2", "L3", "L4")
+        for layer in _LAYERS
     }
     by_layer = {k: v for k, v in by_layer.items() if v["n"]}
 
@@ -236,8 +239,7 @@ def render(report: dict) -> str:
 
     L.append("层接管")
     L.append(f"  {'层':<6}{'条数':>6}{'占比':>9}{'该层准确率':>14}")
-    for layer, name in (("L1", "L1 规则"), ("L2", "L2 语义"),
-                        ("L3", "L3 LLM"), ("L4", "L4 追问")):
+    for layer, name in (("L2", "L2 语义"), ("L3", "L3 LLM"), ("L4", "L4 追问")):
         n = report["layers"].get(layer, 0)
         if not n:
             continue
@@ -267,7 +269,7 @@ def render(report: dict) -> str:
     dist_map = report.get("layer_by_intent") or {}
     if dist_map:
         L.append("按意图 × 层（非边界；L3占比＝该意图里走 L3 的份额）")
-        L.append(f"  {'意图':<7}{'L1':>4}{'L2':>5}{'L3':>5}{'L4':>5}"
+        L.append(f"  {'意图':<7}{'L2':>4}{'L3':>5}{'L4':>5}"
                  f"{'合计':>4}{'L3占比':>7}  这笔钱")
         detour = waste = 0
         for intent in _ALL_INTENTS:
@@ -287,8 +289,8 @@ def render(report: dict) -> str:
                 waste += n3
                 tag = "白花·不抽槽位"
             share = _pct(n3 / tot) if tot else "—"
-            L.append(f"  {intent:<9}{dist.get('L1', 0):>4}{dist.get('L2', 0):>5}"
-                     f"{n3:>5}{dist.get('L4', 0):>5}{tot:>6}{share:>8}  {tag}")
+            L.append(f"  {intent:<9}{dist.get('L2', 0):>4}{n3:>5}"
+                     f"{dist.get('L4', 0):>5}{tot:>6}{share:>8}  {tag}")
         L.append(f"  顺路 {detour} 条 / 白花 {waste} 条 —— 顺路改不掉（抽槽位本来就要再调一次 LLM），"
                  f"白花才是补范例的目标")
         L.append("")

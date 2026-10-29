@@ -30,7 +30,7 @@
 3. **response 置 null 不置空串。** 空串会被当成"判了个空意图"，null 才能识别成"这轮没跑"。
 
 【读法】
-    golden/intent_golden_v1.jsonl   数据集本体（150 行）
+    golden/intent_golden_v1.jsonl   数据集本体（149 行；2026-10-29 删 L1 时去掉 1 条）
     golden/trend.json               每轮 run 的指标序列（时间升序）
     python -m src.evaluation.intent_golden                  # 刷数据集 + 打趋势
     python -m src.evaluation.intent_golden --ragas          # 额外用 ragas 跑一遍
@@ -79,8 +79,6 @@ def golden_records() -> list[dict]:
                 "group": case.group,
                 "ambiguous": bool(case.ambiguous),
                 "note": case.note,
-                "competitors": list(case.competitors),
-                "dimensions": list(case.dimensions),
             },
         })
     return out
@@ -239,7 +237,7 @@ def export(
     """写 golden jsonl（+ 指定 run 的 response 版）。
 
     records 为空时用全量。留这个口子是为了导出子集（比如只导 core 组、
-    或只导刚改过的那一类），也让测试能造小数据集而不是每次写 150 行。
+    或只导刚改过的那一类），也让测试能造小数据集而不是每次写上百行。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     recs = records if records is not None else golden_records()
@@ -276,7 +274,7 @@ def relative(path: Path) -> str:
 async def _run_ragas(run_path: Path | None) -> None:
     """用 ragas 真的跑一遍 intent_match，验证数据集能被标准工具消费。
 
-    ⚠️ 这里的均值与 `intent_eval` 的主指标**不是一个口径**：ragas 默认把 150 条全算，
+    ⚠️ 这里的均值与 `intent_eval` 的主指标**不是一个口径**：ragas 默认把全部 149 条都算，
     而主指标剔除 10 条边界句。同一轮 run 会出现 93.3% vs 97.9% 两个数，
     不是谁算错了 —— 报数时必须带口径，否则看起来像打架。
     """

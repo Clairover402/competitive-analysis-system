@@ -1,10 +1,15 @@
 """意图分类 —— 一句话进，一个 label 出。
 
 【职责】
-  L1 规则 → L2 向量 → L3 LLM → L4 追问，返回 `Decision`。
+  L2 向量 → L3 LLM → L4 追问，返回 `Decision`。
 【不做】
   抽竞品/维度/keyword（slots.py）、执行查询（query_handlers）、组织追问文案（clarify.py）。
 【关键决策】
+  ★ **没有 L1**（2026-10-29 删）。原来那层"结构化入参齐全就判 analysis"零流量：
+    `/api/chat` 拿不到 competitors/dimensions，`/api/tasks` 又不调 `classify()`——
+    它用 `intent_is_clear = bool(competitors and dimensions)` 一个布尔值就做完了。
+    **判据：一层的存在价值 = 它在生产路径上有没有输入。没有输入就不叫规则层，
+    叫死代码。** 留着它的唯一后果是报告里多一个需要解释的 0。
   ★ `Decision` 里**没有槽位字段**，这是刻意的结构约束。加回 entities/keyword
     就等于把"意图与槽位耦合"重新放回来，而这正是 2026-10-29 拆掉的东西。
   ★ L2 过阈即停，不再按意图类别看白名单。旧白名单只有 lookup 能停，理由是
@@ -14,6 +19,7 @@
     就追问。第三道防线从"意图层按类别拦"移到了"槽位层必填校验"。
 【读法】
   日志里 L2 的 top1/gap 说明这层在不在干活；阈值该定多少问 `calibrate()`。
+  `layer="none"` 表示空输入连层都没进；`layer="off"` 是灰度开关关掉漏斗。
 """
 
 from __future__ import annotations
@@ -54,44 +60,6 @@ class Decision:
             "clarify": self.clarify,
             "reason": self.reason,
         }
-
-
-# ── L1 确定性：零成本，只收"参数已经摆明"的流量 ────────────────────────────
-
-def l1_deterministic(
-    query: str | None,
-    competitors: list[str] | None,
-    dimensions: list[str] | None,
-) -> Decision | None:
-    """结构化入参齐全就直接判定，零 LLM 零 embedding。
-
-    规则一多就变成维护灾难，且容易把 analysis 误判成 lookup。
-    L1 只收"用户把参数填进表单"这一种确定情形。
-
-    ⚠️ `/api/chat` 走不到这里：`ChatRequest` 只有 message + conversation_id，
-       没有 competitors/dimensions，触发条件永远不成立。L1 实际是
-       `/api/tasks` 表单路径的参数校验器，不在对话漏斗上。
-    """
-    cs = [c for c in (competitors or []) if str(c).strip()]
-    ds = [d for d in (dimensions or []) if str(d).strip()]
-
-    if cs and ds:
-        return Decision(
-            intent="analysis",
-            layer="L1",
-            confidence=1.0,
-            reason="结构化入参齐全（competitors + dimensions）",
-        )
-
-    if not (query or "").strip() and (cs or ds):
-        return Decision(
-            intent="analysis",
-            layer="L1",
-            confidence=0.9,
-            reason="无自然语言输入，参数不全 → 交给执行侧判 pipeline/supervisor",
-        )
-
-    return None
 
 
 # ── L2 语义：一次 embedding，比 LLM 便宜一个数量级 ────────────────────────
@@ -275,18 +243,22 @@ def l4_clarify(text: str) -> Decision:
 async def classify(
     *,
     query: str | None = None,
-    competitors: list[str] | None = None,
-    dimensions: list[str] | None = None,
     settings: Settings | None = None,
     history_block: str = "",
 ) -> Decision:
     """按成本从低到高跑完分类，返回第一个可接受的 label。
 
-    顺序即策略：L1 零成本 → L2 一次 embedding → L3 一次 LLM → L4 问用户。
+    顺序即策略：L2 一次 embedding → L3 一次 LLM → L4 问用户。
     history_block 只在 L3 生效（见 l3_llm 注释），单轮调用方不传即可。
 
     ⚠️ 这里**不返回槽位**。调用方拿到 label 后自行决定要不要 `fill_slots`：
        analysis 必填、trace/verify 的 keyword 可空、lookup 不需要。
+
+    ★ 2026-10-29 删掉 L1（确定性规则层），漏斗从四层变三层。理由不是"没接上线"：
+      它想判的「参数齐全 ⇒ analysis」已经被**产品结构**表达掉了 ——
+      标准模式在 `_create_task_impl` 里用 `intent_is_clear = bool(competitors
+      and dimensions)` 一个布尔值就完成了；对话模式压根拿不到结构化参数。
+      所以本函数的 `competitors`/`dimensions` 参数也一并删了：没有分支读它们。
     """
     cfg = settings or Settings()
 
@@ -300,16 +272,13 @@ async def classify(
             reason="intent_funnel_enabled=false，不判多意图（槽位照抽）",
         )
 
-    result = l1_deterministic(query, competitors, dimensions)
-    if result is not None:
-        return result
-
     text = (query or "").strip()
     if not text:
-        # 既无结构化参数又无自然语言 → 交给 API 层的参数校验去 400
+        # 空输入连层都进不去 → layer="none"，不冒充某一层的结论。
+        # API 层本会用 Pydantic 400 拦住，这里只防内部调用方漏传。
         return Decision(
             intent=UNKNOWN,
-            layer="L1",
+            layer="none",
             reason="无任何可判定输入",
         )
 

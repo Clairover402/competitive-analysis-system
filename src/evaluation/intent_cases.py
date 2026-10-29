@@ -1,4 +1,4 @@
-"""意图评估集 — 150 句带 gold 的说法，用来回答「L1/L2/L3 各准不准」。
+"""意图评估集 — 149 句带 gold 的说法，用来回答「L2/L3 各准不准」。
 
 【为什么需要这份东西】
 此前所有关于"意图识别好不好"的判断都来自零散实测：`top1=0.832 gap=0.109`
@@ -18,8 +18,8 @@
 主指标只在 `ambiguous=False` 的样本上算。
 
 【怎么用】
-  python -m src.evaluation.intent_eval             # L1/L2 全量 + L3 只跑下沉样本
-  python -m src.evaluation.intent_eval --no-l3      # 只看 L1/L2 接管率与下沉量
+  python -m src.evaluation.intent_eval             # L2 全量 + L3 只跑下沉样本
+  python -m src.evaluation.intent_eval --no-l3      # 只看 L2 接管率与下沉量
   python -m src.evaluation.intent_eval --sweep      # 顺带扫 floor × margin
 """
 
@@ -36,9 +36,6 @@ class Case:
 
     text: str
     gold: str
-    # 结构化入参：只有"标准模式"表单提交才会带，用来验证 L1 直通
-    competitors: tuple[str, ...] = ()
-    dimensions: tuple[str, ...] = ()
     # 两种判法都说得通。单独统计，不进主指标。
     ambiguous: bool = False
     group: str = "core"          # core = 主体样本；adversarial = 对抗/边界
@@ -83,8 +80,6 @@ _ANALYSIS: list[Case] = [
     Case("分析飞书近一年的产品变化", "analysis"),
     Case("帮忙看看飞书和钉钉这两家", "analysis"),
     Case("对比分析：飞书 vs 钉钉 vs 企业微信", "analysis"),
-    # 标准模式：两个槽位都填了，L1 应当直接放行
-    Case("", "analysis", competitors=("飞书", "钉钉"), dimensions=("功能", "定价")),
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
