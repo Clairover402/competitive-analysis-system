@@ -40,3 +40,6 @@ phase_report/
 
 # 评估 run 归档（ragas_core 每次跑自动落 run.json/summary.md/TREND.md，不入库）
 evaluation_runs/
+
+# golden 的 run 版是派生产物（每次评估都会重写），数据集本体与 trend.json 才入库
+src/evaluation/golden/intent_run_*.jsonl
