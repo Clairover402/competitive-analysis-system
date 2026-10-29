@@ -6,13 +6,16 @@
 这份评估器把"我觉得挺准"换成三个可引用的数字：
 **层接管率 / 各层准确率 / 混淆矩阵**。
 
-【三层口径，别混着看】
+【四个口径，别混着看】
   · **接管率**：L1 收走多少、L2 收走多少、多少落到 L3、多少被判"该追问"。
     这个数字决定成本 —— 每多下沉一条就是多一次 LLM。
   · **各层准确率**：L1 接走的那批里对了多少（L1 只在参数齐全时出手，
     正常应该是 100%；掉下来说明规则漏了）。L2 同理。
   · **端到端准确率**：用户实际感受到的那个数。它一定 ≤ 各层准确率的加权，
     因为错在早层的不会被后面纠正 —— 漏斗只往下走，不回头。
+  · **按意图 × 层**：回答"这堆 L3 调用里哪一半是该省的"。同一个下沉率，
+    analysis/trace 是**顺路**（必抽竞品，判完还得调 LLM），lookup/verify 是**白花**
+    （不抽槽位，L2 判对就是零调用）。只看总占比会得出"再降点门槛"的错误结论。
 
 【主指标只算非边界样本】
 `ambiguous=True` 的句子两种判法都说得通（"飞书多少钱" 是问当前值还是
@@ -53,6 +56,12 @@ logger = logging.getLogger(__name__)
 
 _OUT_DIR = Path(__file__).parent / "evaluation_runs"
 _ALL_INTENTS = (*INTENTS, "unknown")
+
+# ★ 这两个意图必须抽竞品，所以走到 L3 是"顺路"（判完还得再调一次 LLM 抽槽位）；
+#   另外两个不抽槽位，L2 判对就是零 LLM 调用，走到 L3 属于"白花"。
+#   依据是 slots.py 的沟槽判据「缺了下游会不会答错」，不是"这个意图有什么槽"。
+_SLOT_INTENTS = ("analysis", "trace")
+_LAYERS = ("L1", "L2", "L3", "L4")
 
 
 async def judge_case(case: Case, settings, *, run_l3: bool) -> dict:
@@ -142,6 +151,18 @@ def summarize(rows: list[dict]) -> dict:
         confusion.setdefault(r["gold"], {}).setdefault(r["pred"], 0)
         confusion[r["gold"]][r["pred"]] += 1
 
+    # ★ 按意图 × 层：回答"L3 那堆调用里，哪一半是该省的"。
+    #   光看总占比没有决策价值 —— analysis / trace 必须抽竞品（见 intent/slots.py
+    #   的"缺了下游会不会答错"判据），判完照样要再调一次 LLM 抽槽位，
+    #   它们走不走 L3 都得花这笔钱（顺路）；lookup / verify 不抽槽位，
+    #   走到 L3 只为了一句 label，那才是白花。**同一个占比，两种含义。**
+    layer_by_intent: dict[str, dict[str, int]] = {}
+    for r in rows:
+        if r["ambiguous"] or r["pred"] is None:
+            continue
+        bucket = layer_by_intent.setdefault(r["gold"], {})
+        bucket[r["layer"]] = bucket.get(r["layer"], 0) + 1
+
     errors = [
         r for r in main if r["pred"] is not None and r["pred"] != r["gold"]
     ]
@@ -156,6 +177,7 @@ def summarize(rows: list[dict]) -> dict:
         ]},
         "by_layer": by_layer,
         "per_intent": per_intent,
+        "layer_by_intent": layer_by_intent,
         "confusion": confusion,
         "errors": errors,
     }
@@ -241,6 +263,35 @@ def render(report: dict) -> str:
     for intent, s in report["per_intent"].items():
         L.append(f"  {intent:<9}{s['correct']:>4}/{s['n']:<4}{_pct(s['accuracy']):>8}")
     L.append("")
+
+    dist_map = report.get("layer_by_intent") or {}
+    if dist_map:
+        L.append("按意图 × 层（非边界；L3占比＝该意图里走 L3 的份额）")
+        L.append(f"  {'意图':<7}{'L1':>4}{'L2':>5}{'L3':>5}{'L4':>5}"
+                 f"{'合计':>4}{'L3占比':>7}  这笔钱")
+        detour = waste = 0
+        for intent in _ALL_INTENTS:
+            dist = dist_map.get(intent)
+            if not dist:
+                continue
+            tot = sum(dist.values())
+            n3 = dist.get("L3", 0)
+            if intent == "unknown":
+                # 拒绝类没有"省的收益"可言，理应在 L2 就被按住或落到 L4；
+                # 出现 L3 说明外句被硬塞了，标出来而不是混进"白花"里。
+                tag = "拒绝类·理应 0 条"
+            elif intent in _SLOT_INTENTS:
+                detour += n3
+                tag = "顺路·必抽槽位"
+            else:
+                waste += n3
+                tag = "白花·不抽槽位"
+            share = _pct(n3 / tot) if tot else "—"
+            L.append(f"  {intent:<9}{dist.get('L1', 0):>4}{dist.get('L2', 0):>5}"
+                     f"{n3:>5}{dist.get('L4', 0):>5}{tot:>6}{share:>8}  {tag}")
+        L.append(f"  顺路 {detour} 条 / 白花 {waste} 条 —— 顺路改不掉（抽槽位本来就要再调一次 LLM），"
+                 f"白花才是补范例的目标")
+        L.append("")
 
     L.append("混淆矩阵（行 = gold，列 = 预测；边界样本已排除）")
     cols = [i for i in _ALL_INTENTS]
