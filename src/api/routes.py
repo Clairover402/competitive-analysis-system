@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -81,6 +82,30 @@ def _split_i18n_commas(items: list[str]) -> list[str]:
             if cleaned:
                 result.append(cleaned)
     return result
+
+
+# 竞品名里"两个名字粘在一起"的形态 —— 这类值一旦进值池会污染后续所有匹配。
+# 实测出现过两条：`飞书和钉钉`（任务标题被当竞品）和 `Microsoft 365/Teams`。
+# 「飞书和钉钉」的害处很具体：`match_competitors` 的长名优先会把它当成最长的那个，
+# 用户说「飞书和钉钉对比」只命中它 → 下推到 SQL → 查不到任何证据。
+_MERGED_NAME_RE = re.compile(r"[^\s][和与及＋+、/][^\s]")
+
+
+def _reject_merged_names(names: list[str] | None, field: str) -> None:
+    """拒绝「一个字段里塞了多个名字」的输入。
+
+    ⚠️ 刻意**不自动拆分**：`Microsoft 365/Teams` 拆出来是 `Microsoft 365` + `Teams`，
+      而正确值应该是 `Microsoft Teams` —— 自动拆会造出一个不存在的竞品名。
+      「和」也可能是公司名的一部分（和硕、和舰）。猜错的代价比让用户重填大。
+    ⚠️ 正则要求分隔符两侧都非空白，所以「Sun 和 Moon」这种带空格的不会被拦 ——
+      宁可漏拦，也不误伤正常名字。
+    """
+    bad = [n for n in (names or []) if _MERGED_NAME_RE.search(n)]
+    if bad:
+        raise ValueError(
+            f"{field}里的「{bad[0]}」看起来是多个名称写在一起，请分开填写"
+            f"（「飞书和钉钉」应写成「飞书」「钉钉」两个）"
+        )
 
 
 def _find_duplicates(items: list[str] | None) -> list[str]:
@@ -247,6 +272,10 @@ class TaskRequest(BaseModel):
             self.competitors = _split_i18n_commas(self.competitors)
         if self.dimensions:
             self.dimensions = _split_i18n_commas(self.dimensions)
+
+        # 拆完再验"有没有名字粘在一起"：`飞书和钉钉` 这种会污染值池（见 _reject_merged_names）
+        _reject_merged_names(self.competitors, "竞品")
+        _reject_merged_names(self.dimensions, "维度")
 
         # 【2026-10-27 M4 放宽：不再要求 competitors 与 dimensions 同时给】
         #   原来判"两个都非 None"才放行，理由是缺一个就跑不起来。有了偏好之后
@@ -953,6 +982,34 @@ SELECT DISTINCT c
 """
 
 
+# 该用户真实出现过的维度值（值池）。和竞品池一样按用户限定 ——
+# 全局池会把别人分析游戏时用的「玩法设计」也放进来，命中后查不到任何证据。
+_DIMENSION_POOL_SQL = """
+SELECT DISTINCT e.dimension AS d
+  FROM evidence_map e
+  JOIN reports r ON r.id = e.report_id
+  JOIN tasks   t ON t.id = r.task_id
+ WHERE t.user_id = $1 AND e.dimension IS NOT NULL AND e.dimension <> ''
+ ORDER BY 1
+"""
+
+
+async def dimension_pool(pool, user_id: str) -> list[str]:
+    """该用户证据里出现过的全部维度值，供竞品/维度的值池匹配。
+
+    【为什么不直接用 `_DIM_ALIASES` 那 7 个标准维度】实测线上维度是 8 个，
+    而词表只覆盖 5 个（185/259 条 = 71.4%）。漏掉的「用户」「玩法设计」「美术风格」
+    「电竞生态」全来自游戏类任务 —— **维度跟着产品品类走，不是固定的 7 个**。
+    所以真正的枚举必须以数据为准，词表只当"口语→标准名"的翻译层。
+
+    【为什么从 evidence_map 取而不是 tasks.dimensions】tasks 上那列是"这次分析
+    用了哪些维度"，evidence_map 上是"每条证据属于哪个维度"。后者才是 trace 要过滤的
+    那一列，两者取值一致但前者可能为空（早期任务）。
+    """
+    rows = await pool.fetch(_DIMENSION_POOL_SQL, user_id)
+    return [r["d"] for r in rows if r["d"]]
+
+
 async def competitor_pool(pool, user_id: str) -> list[str]:
     """该用户分析过的全部竞品名，供 lookup 做字面匹配。
 
@@ -1125,11 +1182,13 @@ async def chat(
     #   抽什么由 label 决定（见 intent/slots.py 顶上那张"缺了下游会不会答错"的表）；
     #   槽位**无权回头改 label** —— 单向依赖，否则耦合又回来了。
     #
-    #   lookup 的竞品不做推断，直接去用户的值池里查字符串 —— 用户说出的名字
-    #   就是库里的键。其余意图不需要这个池子，所以只在这一支查（一条 SELECT DISTINCT）。
-    pool_comps = None
-    if decision.intent == "lookup":
+    #   lookup / trace 的竞品和维度都不做推断，直接去用户的两个值池里查字符串 ——
+    #   用户说出的名字/维度就是库里真实存在的值。其余意图不需要池子，
+    #   所以只在这两支查（两条 SELECT DISTINCT）。
+    pool_comps = pool_dims = None
+    if decision.intent in ("lookup", "trace"):
         pool_comps = await competitor_pool(pool, current_user.user_id)
+        pool_dims = await dimension_pool(pool, current_user.user_id)
 
     slots = await fill_slots(
         body.message,
@@ -1137,6 +1196,7 @@ async def chat(
         settings=settings,
         history_block=history_block,
         competitor_pool=pool_comps,
+        dimension_pool=pool_dims,
     )
 
     # ── analysis：复用 /api/tasks 的整条链路 ──
@@ -1216,7 +1276,25 @@ async def chat(
                 page_size=None if ordinal else body.page_size,
             )
     elif decision.intent == "trace":
-        data = await trace_evidence(pool, current_user.user_id, competitors, slots.keyword)
+        # 竞品和维度都是多值下推：问「飞书和钉钉的功能和定价」四个值一次带下去。
+        # 不再有 keyword —— 它本来就是维度名，改走 `e.dimension = ANY($3)`。
+        if not competitors and not slots.dimensions:
+            # ★ 一个锚点都没有时**不能**退回"列全部证据"：259 条里挑最近 10 条，
+            #   用户看到的是混着各家各维度的一堆结论，既不是他要的、又看不出被降级了。
+            #   这里明说没听出来，比静默列全更有用（也覆盖 LLM 挂了返回空槽的情形）。
+            known = "、".join((pool_comps or [])[:8])
+            data = {
+                "items": [], "total": 0,
+                "summary": (
+                    "没听出你要查哪个竞品或维度。可以说「飞书的定价证据」这样的说法。"
+                    + (f"（你分析过：{known}{' 等' if len(pool_comps or []) > 8 else ''}）"
+                       if known else "")
+                ),
+            }
+        else:
+            data = await trace_evidence(
+                pool, current_user.user_id, competitors, slots.dimensions
+            )
     else:
         data = await check_freshness(pool, current_user.user_id, competitors, slots.keyword)
 

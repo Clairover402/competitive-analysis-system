@@ -174,7 +174,7 @@ def _extract_evidences(
         analysis_results: Analyzer 返回的 {dimension: {competitor: 值}}
 
     Returns:
-        [{claim, source_url, source_text, dimension}, ...]，可直接喂 EvidenceDAO.batch_insert
+        [{claim, source_url, source_text, dimension, competitor}, ...]，可直接喂 EvidenceDAO.batch_insert
     """
     evidences: list[dict] = []
     for dim, comp_data in analysis_results.items():
@@ -216,6 +216,9 @@ def _extract_evidences(
                 "source_url": url,
                 "source_text": None,  # chunk 原文在 chunk_embeddings，这里暂不冗余存储
                 "dimension": dim[:50],
+                # 归属竞品：`comp` 一直在外层循环手里（analysis_results 是 {维度: {竞品: 值}}），
+                # 落库时带上，trace 才能按"这一条属于谁"过滤，而不是退回整份报告。
+                "competitor": str(comp)[:100],
             })
     return evidences
 

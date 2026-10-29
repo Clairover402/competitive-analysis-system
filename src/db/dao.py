@@ -307,8 +307,8 @@ class EvidenceDAO:
         async with self._pool.acquire() as conn:
             await conn.executemany(
                 """INSERT INTO evidence_map (report_id, claim, source_url,
-                                             source_text, dimension)
-                   VALUES ($1, $2, $3, $4, $5)""",
+                                             source_text, dimension, competitor)
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
                 [
                     (
                         report_id,
@@ -316,6 +316,7 @@ class EvidenceDAO:
                         e["source_url"],
                         e.get("source_text"),
                         e.get("dimension"),
+                        e.get("competitor"),
                     )
                     for e in evidences
                 ],

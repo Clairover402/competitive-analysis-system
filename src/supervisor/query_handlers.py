@@ -8,7 +8,7 @@
   parse_ordinal(text) -> {"skip": n, "limit": m} | {"unsupported": "最早"} | None
   lookup_reports(pool, user_id, competitors, dimensions, limit, skip)
       -> {"items": [...], "total": int | None, "summary": str}
-  trace_evidence(pool, user_id, competitors, keyword)     -> 同上
+  trace_evidence(pool, user_id, competitors, dimensions, limit) -> 同上
   check_freshness(pool, user_id, competitors, keyword)    -> 同上（附 fresh/stale 判定）
 
 【关键决策】
@@ -28,8 +28,15 @@
   ★ verify 的数据源是 `agent_memories` 的 fact（带 observed_at / ttl_days），
     不是 evidence_map ← M3 之后两者分工明确：证据答"引用过什么"，
     事实答"当前有效观测是哪条"，只有后者能判"多久没核对"
-  ★ 竞品过滤用 jsonb `?|` 而不是 LIKE ← tasks.competitors 是 JSONB 数组，
-    LIKE 会把"飞书"匹配进任何含该子串的句子
+  ★ trace 按 `evidence_map.competitor` 过滤，**不能**退回 `tasks.competitors ?|` ←
+    一条证据只讲一家的事，一份报告却是 4 家合一的。按任务过滤会把别家证据一起捞
+    （实测问「飞书」返回 10 条里 5 条是钉钉/企微），而且用户看不出来。
+    归属不明的历史证据（约 11%）留 NULL，`= ANY($2)` 自然排除 —— 不该算在某家头上
+  ★ trace 的维度走 `e.dimension = ANY($3)`，**不用** `claim ILIKE` ← dimension 是
+    精确值且有索引；ILIKE 打在结论文字上，实测漏 11 条真定价（claim 写"付费""9800元/年"）、
+    捞错 8 条（维度根本不是定价）。同一个字段，精确列比模糊匹配全对
+  ★ lookup 的竞品过滤仍用 jsonb `?|` ← 它答的是"哪份报告"，报告本来就是多竞品的，
+    按任务过滤是正确的粒度；这和 trace 的差别就是**答案粒度**不同
   ★ 查不到就如实说查不到 ← 空结果编一句"可能是网络问题"最伤可信度
   ★ verify 的保鲜期**读取时现算**，优先用偏好 `ttl_overrides` ← 若只信落库的
     ttl_days，用户改完配置会看到"设置没生效"，而库里那列是写入时的快照
@@ -681,18 +688,22 @@ SELECT e.claim        AS claim,
        e.source_url   AS source_url,
        e.source_text  AS source_text,
        e.dimension    AS dimension,
+       e.competitor   AS competitor,
        e.created_at   AS created_at,
        r.id::text     AS report_id,
        r.version      AS version,
        t.id::text     AS task_id,
        t.title        AS title,
-       t.competitors  AS competitors
+       t.competitors  AS competitors,
+       COUNT(*) OVER () AS total
   FROM evidence_map e
   JOIN reports r ON r.id = e.report_id
   JOIN tasks   t ON t.id = r.task_id
  WHERE t.user_id = $1
-   AND ($2::text[] IS NULL OR t.competitors ?| $2::text[])
-   AND ($3::text   IS NULL OR e.claim ILIKE '%' || $3 || '%')
+   -- 竞品过滤在**证据行**上：一条证据只讲一家，任务却是多家的
+   AND ($2::text[] IS NULL OR e.competitor = ANY($2::text[]))
+   -- 维度用精确列：claim ILIKE 会漏掉"付费/9800元/年"这些没写"定价"二字的定价证据
+   AND ($3::text[] IS NULL OR e.dimension = ANY($3::text[]))
  ORDER BY t.created_at DESC, e.created_at DESC
  LIMIT $4
 """
@@ -702,19 +713,24 @@ async def trace_evidence(
     pool,
     user_id: str,
     competitors: list[str] | None = None,
-    keyword: str | None = None,
+    dimensions: list[str] | None = None,
     limit: int = 10,
 ) -> dict:
-    """按竞品 / 关键词取证据行（claim + 来源 URL + 原文片段）。"""
+    """按竞品 / 维度取证据行（claim + 来源 URL + 原文片段）。
+
+    两个条件都是**多值**（`= ANY`）：问「飞书和钉钉的功能和定价」时四个值一起下推，
+    不需要为每种组合写分支。为空表示不限定该条件。
+    """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
-    keyword = (keyword or "").strip() or None
-    rows = await pool.fetch(_TRACE_SQL, user_id, competitors, keyword, limit)
+    dimensions = [d for d in (dimensions or []) if str(d).strip()] or None
+    rows = await pool.fetch(_TRACE_SQL, user_id, competitors, dimensions, limit)
 
     items = [{
         "claim": row["claim"],
         "source_url": row["source_url"],
         "source_text": row["source_text"],
         "dimension": row["dimension"],
+        "competitor": row["competitor"],
         "observed_at": _iso(row["created_at"]),
         "report_id": row["report_id"],
         "task_id": row["task_id"],
@@ -722,21 +738,34 @@ async def trace_evidence(
         "competitors": _as_list(row["competitors"]),
     } for row in rows]
 
+    # 窗口函数在 LIMIT 之前算，所以 total 是"符合条件的一共几条"，不是本次返回几条
+    total = rows[0]["total"] if rows else 0
+
     if not items:
-        summary = "没有找到匹配的证据记录。"
-        if keyword:
-            summary += f"（结论里没有出现「{keyword}」）"
+        # 空结果要说明是哪个条件没命中 —— 只说"没有找到"，用户不知道该改什么去重试
+        if competitors and dimensions:
+            summary = (f"没找到「{'、'.join(competitors)}」在"
+                       f"「{'、'.join(dimensions)}」维度上的证据。")
+        elif competitors:
+            summary = f"没找到「{'、'.join(competitors)}」的证据。"
+        elif dimensions:
+            summary = f"没找到「{'、'.join(dimensions)}」维度的证据。"
+        else:
+            summary = "没有找到匹配的证据记录。"
     else:
         head = items[0]
+        tag = " · ".join(x for x in (head.get("competitor"), head.get("dimension")) if x)
         summary = (
-            f"「{_short(head['claim'])}」\n"
+            (f"【{tag}】\n" if tag else "")
+            + f"「{_short(head['claim'])}」\n"
             f"来源：{head['source_url']}\n"
             f"原文：{_short(head['source_text'], 120)}\n"
             f"抓取于 {_time_cn(head['observed_at'])}（报告「{head['title']}」）"
         )
-        if len(items) > 1:
-            summary += f"\n另有 {len(items) - 1} 条相关证据。"
-    return {"items": items, "summary": summary}
+        if total > len(items):
+            # 别再说"另有 N-1 条"：那是本次窗口内的条数，不是总数，用户会以为只有这么多
+            summary += f"\n共 {total} 条匹配证据，这里显示最近的 {len(items)} 条。"
+    return {"items": items, "total": total, "summary": summary}
 
 
 # ── ③ verify：核对事实是否过期 ──────────────────────────────────────────

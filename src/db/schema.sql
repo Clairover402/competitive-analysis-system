@@ -150,11 +150,21 @@ CREATE TABLE IF NOT EXISTS evidence_map (
     source_url  TEXT NOT NULL,              -- 来源 URL（可点击验证）
     source_text TEXT,                        -- 引用的原文片段
     dimension   VARCHAR(50),                -- 所属维度（功能/定价/市场）
+    competitor  VARCHAR(100),               -- 这条证据讲的是哪一家（见下方说明）
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 【2026-10-29 补 competitor：证据的归属粒度】
+--   一条 claim 天然只讲一家的事（"钉钉采用免费+分层付费"），但报告是 4 家合一的。
+--   没有这一列时，按竞品查证据只能退到 `tasks.competitors ?| $2` ——
+--   问「飞书的证据」会把同一份报告里钉钉/企微的 42 条一起捞回来（实测 10 条里 5 条是别家）。
+--   ⚠️ 允许 NULL：历史证据里约 11% 的 claim 不含任何竞品名，无法判定归属。
+--      查询用 `e.competitor = ANY($2)`，NULL 行自然被排除 —— 归属不明的不该算在某家头上。
+ALTER TABLE evidence_map ADD COLUMN IF NOT EXISTS competitor VARCHAR(100);
+
 CREATE INDEX IF NOT EXISTS idx_evidence_report_id ON evidence_map (report_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_dimension ON evidence_map (dimension);
+CREATE INDEX IF NOT EXISTS idx_evidence_competitor ON evidence_map (report_id, competitor);
 
 
 -- ============================================================
