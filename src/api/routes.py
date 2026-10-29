@@ -579,11 +579,17 @@ def _get_pool(request: Request) -> Pool:
 #   两份 prompt 必然漂移，同一个 query 在 /api/tasks 与 /api/chat 会抽出不同实体。
 #   /api/tasks 只关心实体，所以只取 competitors/dimensions，忽略 intent/keyword。
 
-async def _extract_entities_from_query(query: str, request: Request) -> dict:
+async def _extract_entities_from_query(
+    query: str, request: Request, user_id: str | None = None
+) -> dict:
     """用 LLM 从自然语言 query 中提取竞品名和维度。
 
     2026-07-29 修复：这里原先只有"交给 IntentRouter 的 LLM 实体提取"的注释、
     没有实现，导致纯 query 请求抽出空实体、被路由进 supervisor 空转。
+
+    【为什么要传值池】这条路的产物同样会写进 `tasks.competitors`，而那一列正是
+      lookup / trace 的匹配基准。没有池子，LLM 把「copilot」原样写进去，值池就
+      分裂成 copilot / GitHub Copilot 两个键。归一（而非丢弃）保证新竞品仍能进来。
 
     Returns:
         {"competitors": [str], "dimensions": [str]}；失败时两项皆空。
@@ -594,7 +600,17 @@ async def _extract_entities_from_query(query: str, request: Request) -> dict:
         settings = request.app.state.settings
         # ★ 只调槽位段，不再调"判意图 + 抽实体"的整份 prompt。
         #   这个入口从来只用得上竞品与维度，判出来的 intent 是白付的 token。
-        slots = await fill_slots(query, "analysis", settings=settings)
+        comps = dims = None
+        pool = getattr(request.app.state, "pool", None)
+        if pool is not None and user_id:
+            comps = await competitor_pool(pool, user_id)
+            dims = await dimension_pool(pool, user_id)
+        slots = await fill_slots(
+            query, "analysis",
+            settings=settings,
+            competitor_pool=comps,
+            dimension_pool=dims,
+        )
         competitors, dimensions = slots.competitors, slots.dimensions
 
         logger.info(
@@ -943,7 +959,9 @@ async def _create_task_impl(
     # 【2026-07-29 BUG修复】这段原先的注释写"交给 IntentRouter 的 LLM 实体提取"，
     # 但代码从没实现，导致 "对比王者荣耀和英雄联盟…" → 实体全空 → supervisor 空转。
     elif body.query and (not llm_parsed["competitors"] or not llm_parsed["dimensions"]):
-        extracted = await _extract_entities_from_query(body.query, request)
+        extracted = await _extract_entities_from_query(
+            body.query, request, current_user.user_id
+        )
         # 去重：LLM 抽取可能重复输出同一实体，静默归一，不让用户背锅
         if extracted["competitors"]:
             llm_parsed["competitors"] = _dedupe(extracted["competitors"])
@@ -1250,11 +1268,13 @@ async def chat(
     #   抽什么由 label 决定（见 intent/slots.py 顶上那张"缺了下游会不会答错"的表）；
     #   槽位**无权回头改 label** —— 单向依赖，否则耦合又回来了。
     #
-    #   lookup / trace 的竞品和维度都不做推断，直接去用户的两个值池里查字符串 ——
-    #   用户说出的名字/维度就是库里真实存在的值。其余意图不需要池子，
-    #   所以只在这两支查（两条 SELECT DISTINCT）。
+    #   三条意图都要池子，但用途不同：
+    #     lookup / trace  池是**匹配基准**（用户说出的名字就是库里真实存在的值）
+    #     analysis        池是**改名依据**（LLM 输出的简称归一成池里的正式名，
+    #                     池外的新竞品放行 —— 见 slots.normalize_to_pool）
+    #   两条 SELECT DISTINCT，代价可忽略；verify 不需要，所以不查。
     pool_comps = pool_dims = None
-    if decision.intent in ("lookup", "trace"):
+    if decision.intent in ("lookup", "trace", "analysis"):
         pool_comps = await competitor_pool(pool, current_user.user_id)
         pool_dims = await dimension_pool(pool, current_user.user_id)
 

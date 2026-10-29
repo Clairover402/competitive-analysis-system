@@ -484,7 +484,15 @@ def describe_tasks(items, *, total=None, skip=0, dims=None, competitors=None,
             return f"没有「{scope}」相关的分析记录。" if scope else "还没有任何分析记录。"
         if skip and total:
             return f"你一共只有 {total} 次分析记录，没有倒数第{_ordinal_cn(skip + 1)}次。"
-        return "没有找到匹配的历史任务。" + ("（按竞品筛选后为空）" if competitors else "")
+        # ★ 空结果必须念出**筛的是哪个名字**。2026-10-29 lookup 加了 LLM 兜底后，
+        #   这里从"可选提示"变成安全阀：LLM 可能把「copilot」译成「GitHub Copilot」，
+        #   如果用户其实没指它，返回 0 条却只说"没找到"，用户不知道系统拿什么筛的，
+        #   就会以为"我确实没跑过" —— 旧文案「（按竞品筛选后为空）」正是这个毛病，
+        #   它承认筛过，但不说是哪个。
+        #   念出名字后，即使筛错了用户也能一眼看出来（这是 lookup 允许引入 LLM 的前提）。
+        if scope:
+            return f"没找到「{scope}」相关的分析记录。"
+        return "没有找到匹配的历史任务。"
 
     head = items[0]
     # 称呼必须跟着 skip / page / 条数走：

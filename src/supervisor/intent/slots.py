@@ -22,14 +22,23 @@
     ★ 为什么 LLM 后置且要过闸门：LLM 会输出池里没有的名字（copilot→Microsoft Copilot），
       直接下推就是查 0 条，而用户以为筛过了。这是 lookup 当初拒绝 LLM 的原因，
       闸门把它关掉 —— LLM 只能当同义词翻译器，不能引进新值。
+  ★ **三条路的差别不在"抽什么"，在"最后那档怎么处理"**：
+      trace    四道全走，对不上就丢（查已有的东西，池外无意义）
+      lookup   四道全走（2026-10-29 补的 LLM 兜底），对不上就丢 —— 但必须让用户
+               **看见**筛的是哪个名字，否则"可见的宽"变成"不可见的窄"
+      analysis 只有词表 + LLM + `normalize_to_pool`：**只能改名，不能丢弃**
+               —— 用户要分析的新竞品还没进过库，丢了就永远分析不了新对手
     ⚠️ `keyword` 现在只剩 verify 在用。trace 不再抽它（2026-10-29）：
       它的值本来就是 `rule_dimensions(text)[0]`，是维度名，却拿去 `claim ILIKE`。
-  ★ 抽取顺序：值池 → 词表 → LLM。只有 analysis/trace 会走到 LLM，
-    且 trace 只在**竞品**解析不出来时才调（维度空着是可见降级，不值得多付一次）。
-    ⚠️ analysis **每轮都调**：竞品没有词表可查，只能问模型。别再写"参数齐全就省一次"
-    —— 那个短路随显式参数一起删了，因为生产路径上从来没人传过显式参数。
+  ★ 抽取顺序：值池 → 词表 → LLM。analysis **每轮都调**（竞品没有词表，且新竞品
+    不在池里）；lookup / trace 只在**竞品**解析不出来时才调（维度空着是可见降级，
+    不值得多付一次）。
+    ⚠️ analysis **每轮都调**：别再写"参数齐全就省一次"——那个短路随显式参数一起删了，
+    因为生产路径上从来没人传过显式参数。
   ⚠️ 成本账（别再说"拆分不增加调用"）：判意图与抽竞品从一个调用变成两个，
      总调用上升约三成。换来的是 L2 判出即可停（32.1% 不进 LLM）。
+     2026-10-29 之后 lookup 也可能调一次 —— 但只在**值池兜不住**时（实测 26 句
+     真实问法里 8 句值池直接命中，那 8 句零调用）。
 【读法】
   排查"为什么没抽到竞品"先看 `Slots.source`（pool/alias/rule/llm/none）。
 """
@@ -229,6 +238,67 @@ def gate_llm(values: list[str] | None, pool: list[str] | None) -> list[str]:
     return _dedupe(out)
 
 
+# 「一个字段里塞了多个名字」的形态。与 `routes._MERGED_NAME_RE` 同源，但这里
+# **不拒收**：analysis 的语义是"用户想分析这几家"，拆开正是他想要的；拒收会让他
+# 把已经说对的话再打一遍。⚠️ 两侧必须是非空白字符，否则「Sun 和 Moon」会被误拆。
+_SPLIT_HINT = re.compile(r"[^\s][和与及＋+、/][^\s]")
+
+
+def normalize_to_pool(values: list[str] | None, pool: list[str] | None) -> list[str]:
+    """analysis 的轻闸门：池里有同义项就**改名**，没有就**原样放行**。
+
+    ★ 与 `gate_llm` 只差最后一档，但这一档是两条路的根本分野：
+        trace / lookup   只能在池内（查已有的东西）→ 对不上就丢弃
+        analysis         必须能引进新竞品（否则永远分析不了新对手）→ 对不上就放行
+      实测动机：LLM 把「copilot」原样返回小写，而值池里是「GitHub Copilot」。
+      这个简称一旦写进 `tasks.competitors`，值池就分裂成两个键 —— 而值池正是
+      lookup / trace 的匹配基准，用户刚跑完的报告换个说法就查不到了。
+      这是**写入侧**在制造读取侧的病，只在读取侧翻译是治不好的。
+
+    ★ 三档判定（v = LLM 输出的一个值）：
+        精确同名            → 用池里的写法（大小写/空格差异）
+        池内同义项**恰好 1 个** → 归一到它（copilot → GitHub Copilot）
+        0 个                → 原文放行（Zapier 就是新竞品，合法）
+        ≥2 个               → 看有没有连接词（见下）
+
+    ★ 为什么「≥2 个同义项」要分情况：`WPS` 同时命中 `WPS 365` / `WPS Office`，
+      挑哪个都是猜；而 `飞书和钉钉` 也命中 2 个，但它是**真的两家**，拆开才是对的。
+      判据是原话里有没有连接词 —— 有就说明用户自己把两家写在一起了，拆；
+      没有就说明是同一个词的歧义（`文档` 会同时命中 `石墨文档`/`腾讯文档`/`飞书文档`），
+      此时归一到任何一个都是错的，宁可保留原文交给下游校验。
+
+    ⚠️ 保留原文有一种坏情况：`文档` 会被当成新竞品落库。但这比"把文档协作工具
+      全归一成腾讯文档"轻得多 —— 前者是脏值（有 `_MERGED_NAME_RE` 和长度校验兜底），
+      后者是**悄悄分析错对象**，用户看不出来。
+    """
+    if not values:
+        return []
+    raw = _dedupe([str(v).strip() for v in values if str(v).strip()])
+    if not pool:
+        # 没有值池 = 没有改名依据（该用户还没跑过任何分析）。放行是唯一正确选择，
+        # 此时"归一到池里"等价于把新竞品的名字全丢掉。
+        return raw
+
+    squashed = [(c, _squash(c)) for c in pool if _squash(c)]
+    out: list[str] = []
+    for v in raw:
+        nv = _squash(v)
+        if len(nv) < 2:
+            continue
+        exact = [c for c, nc in squashed if nc == nv]
+        if exact:
+            out.extend(exact)
+            continue
+        near = _dedupe([c for c, nc in squashed if nv in nc or nc in nv])
+        if len(near) == 1:
+            out.append(near[0])
+        elif len(near) > 1 and _SPLIT_HINT.search(v):
+            out.extend(near)
+        else:
+            out.append(v)
+    return _dedupe(out)
+
+
 async def llm_slots(
     text: str, settings: Settings | None = None, history_block: str = ""
 ) -> Slots:
@@ -283,10 +353,18 @@ async def fill_slots(
     kw = rule_keyword(text)
     base_source = "rule" if kw else "none"
 
-    # lookup：竞品走值池字面匹配（零 LLM），序数由 parse_ordinal 在调用处抽。
-    #   维度也走值池（词表翻译后回池校验），但它只决定**念哪条事实**（_pick_facts），
-    #   不参与筛选任务 —— 问「飞书定价」要的是飞书那些报告里的定价那句话，
-    #   而不是"只做过定价分析的任务"。
+    # lookup：值池 → 词表 → LLM → 闸门。
+    #   维度只决定**念哪条事实**（_pick_facts），不参与筛选任务 —— 问「飞书定价」
+    #   要的是飞书那些报告里的定价那句话，而不是"只做过定价分析的任务"。
+    #
+    #   ★ 2026-10-29 加了 LLM 兜底（原来只到值池）。原因是简称：用户说「copilot
+    #     那份报告」，池里是「GitHub Copilot」，字面匹配命不中 → 退回不限定竞品。
+    #   ⚠️ 兜底必须同时满足两个条件，否则不如不加：
+    #     ① pool 非空 —— 池空时 `gate_llm` 会原样放行，等于把幻觉写进筛选条件；
+    #     ② 过闸门 —— 输出必须能对回池里的名字，不能引进池外新值。
+    #   成本：值池命中的句子仍是零调用（实测 26 句真实问法里 8 句命中），
+    #   只有兜不住的那批多付一次。换来的是"简称也能查到"，代价是必须让用户
+    #   **看见**筛的是哪个名字 —— 否则就从"可见的宽"变成"不可见的窄"。
     if intent == "lookup":
         if not cs:
             hit, src = match_values(text, competitor_pool)
@@ -294,21 +372,34 @@ async def fill_slots(
                 cs, base_source = hit, src
         if not ds:
             ds = match_values(text, dimension_pool, _DIM_ALIASES)[0]
+        if not cs and competitor_pool:
+            got = await llm_slots(text, settings, history_block)
+            cs = gate_llm(got.competitors, competitor_pool)
+            if cs:
+                base_source = "llm"
+            if not ds:
+                ds = gate_llm(got.dimensions, dimension_pool)
         return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
 
     # verify：缺竞品等于"核全部事实"，正是「数据新不新」想要的，不必抽。
     if intent == "verify":
         return Slots(competitors=cs, dimensions=ds, keyword=kw, source=base_source)
 
-    # analysis：维度先走规则，竞品只能靠 LLM（没有词表可查）。
+    # analysis：维度先走规则，竞品交给 LLM —— 这条路上**不可能**用值池代替 LLM：
+    #   用户要分析的新竞品还没进过库，值池里根本没有它。
     #   ⚠️ 这里**曾经**有个"两边都齐就不调 LLM"的短路，删显式参数时一并去掉了：
     #     那个短路判的是 `cs and ds`，而 `cs` 在生产路径上恒为空 —— 永远进不去。
     #     留着它会让下一个人以为"参数填满就能省一次调用"，从而把死代码当优化依据。
+    #
+    #   ★ 2026-10-29 加 `normalize_to_pool`：只改名、不丢弃。这是唯一**写**值池的
+    #     路径（`tasks.competitors` 就是 lookup/trace 的匹配基准），LLM 把「copilot」
+    #     原样写进去，值池就分裂成 copilot / GitHub Copilot 两个键，用户换个说法
+    #     就查不到。写入侧制造的病，只在读取侧翻译是治不好的。
     if intent == "analysis":
         ds = ds or rule_dimensions(text)
         got = await llm_slots(text, settings, history_block)
         return Slots(
-            competitors=got.competitors,
+            competitors=normalize_to_pool(got.competitors, competitor_pool),
             dimensions=ds or got.dimensions,
             keyword=kw,
             source=got.source if got.source != "none" else base_source,
