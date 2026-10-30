@@ -46,12 +46,15 @@ from pathlib import Path
 from src.config import Settings
 from src.db.connection import create_pool
 from src.db.dao import AgentMemoryDAO, PreferenceDAO
+from src.evaluation.common.paths import REPORTS_ROOT, relative
+from src.evaluation.common.report import table
 from src.mcp.tools_rag import embed_texts
 from src.memory.long_term import importance_for
 from src.memory.semantic import build_fact_content, build_subject
 from src.supervisor.query_handlers import ttl_days_for
 
-_OUT_DIR = Path(__file__).parent / "evaluation_runs"
+_OUT_DIR = REPORTS_ROOT / "memory" / "runs"
+SUMMARY_MD = "SUMMARY.md"
 _USER_PREFIX = "mem-eval"
 
 
@@ -391,20 +394,110 @@ async def run(threshold: float, sweep: bool, keep: bool) -> int:
     text = render(report, threshold, sweep_rows or None)
     print(text)
 
-    _OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = _OUT_DIR / f"memory_eval_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    out.write_text(
-        json.dumps(
-            {"threshold": threshold, "user_prefix": base,
-             **report, "sweep": sweep_rows},
-            ensure_ascii=False, indent=2, default=str,
-        ),
-        encoding="utf-8",
+    # 一个 run 一个目录，形状与其他两类一致：run.json（机器）+ summary.md（人读）。
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = _OUT_DIR / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"threshold": threshold, "user_prefix": base, **report, "sweep": sweep_rows}
+    (run_dir / "run.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
-    print(f"\n明细：{out}")
+    (run_dir / "summary.md").write_text(
+        _run_summary(payload, ts, text), encoding="utf-8", newline="\n"
+    )
+    write_overview()
+    print(f"\n本轮已存 {relative(run_dir)}（run.json + summary.md）")
     if keep:
         print(f"⚠️ --keep：测试数据保留在 {base}% 下，自行清理")
     return 0 if report["pass"] else 1
+
+
+def _run_summary(payload: dict, run_id: str, body: str) -> str:
+    """每轮 summary.md = 元信息头 + 终端报告（包进代码块，保等宽对齐）。"""
+    rec, prec = payload["supersede_recall"], payload["supersede_precision"]
+    head = [
+        f"# 长期记忆评估 {run_id}",
+        "",
+        f"- 取代阈值：`{payload['threshold']:.2f}`",
+        f"- 用例：{payload['total_cases']} 条（全部是「取代组」）",
+        f"- 该取代的：{rec['correct']}/{rec['n']}"
+        f"　不该取代的：{prec['correct']}/{prec['n']}",
+        f"- 结论：{'通过' if payload['pass'] else '未通过'}",
+        "",
+        "> 口径：8 条小样本，只报百分比会让人以为是千级样本 —— 分母必须带上。",
+        "> 误合并（把两条不同的观测判成同一条）比漏取代更严重：那是丢真信息。",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(head) + "```text\n" + body + "\n```\n"
+
+
+def build_overview() -> str:
+    """常驻总览：最近几轮的取代召回 / 精确率 / 误合并。
+
+    与 intent 的 SUMMARY.md 同一定位：回答「现在什么水平」，不回答「这轮错在哪」。
+    """
+    runs = sorted(_OUT_DIR.glob("*/run.json"))
+    lines = [
+        "# 长期记忆评估总览",
+        "",
+        "> 常驻总览，每次跑完自动重建；事实源是本目录 `runs/*/run.json`。",
+        "> ⚠️ 本目录全部产物**不入库**（见 .gitignore）。",
+        "",
+    ]
+    if not runs:
+        lines += ["（还没有评估记录）", ""]
+        return "\n".join(lines)
+
+    rows = []
+    for path in runs:
+        try:
+            r = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rec, prec = r["supersede_recall"], r["supersede_precision"]
+        rows.append([
+            path.parent.name,
+            f"{r['threshold']:.2f}",
+            f"{rec['correct']}/{rec['n']}",
+            f"{prec['correct']}/{prec['n']}",
+            prec["n"] - prec["correct"],
+            "通过" if r.get("pass") else "未通过",
+        ])
+
+    last = rows[-1]
+    lines += [
+        "## 最新一轮",
+        "",
+        f"- 轮次：`{last[0]}`　阈值：`{last[1]}`",
+        f"- 该取代的：{last[2]}　不该取代的：{last[3]}　误合并：{last[4]} 条",
+        f"- 结论：**{last[5]}**",
+        "",
+        "## 口径",
+        "",
+        "1. **误合并优先于漏取代**：把两条不同观测判成一条，丢掉的是真信息；"
+        "反之只是多留一条旧的。判据是「不该取代」先全对。",
+        "2. **8 条小样本**：一个用例翻转就是 12.5 个百分点，不比绝对值，只比「哪几条翻了」。",
+        "3. 本评估**不再回答**「按竞品查事实会不会串」—— verify 下线后那个读取口不存在了。",
+        "",
+        "## 历史",
+        "",
+        table(
+            ["轮次", "阈值", "该取代", "不该取代", "误合并", "结论"],
+            rows,
+        ),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_overview() -> Path:
+    """重建常驻总览 SUMMARY.md。"""
+    path = _OUT_DIR.parent / SUMMARY_MD
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(build_overview(), encoding="utf-8", newline="\n")
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:

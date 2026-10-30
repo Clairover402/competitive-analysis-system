@@ -24,7 +24,7 @@ src.db 是系统的"数据底座"——所有 Agent 通过 DAO 读写数据，
             UserDAO / RetrievalSnapshotDAO
 
 ⚠️ 评估结果**不落这张库**：ragas_core 只把 run 落 `evaluation_runs/` 文件归档
-   （见 src/evaluation/run_archive.py）。原 EvalResultDAO + eval_results /
+   （见 src/evaluation/ragas/archive.py）。原 EvalResultDAO + eval_results /
    eval_metric_scores 两表因「从未真正投入使用」已于 2026-10-19 删除。
 """
 

@@ -29,10 +29,12 @@
    （0.4.3 的 `aevaluate` 已标 deprecation，官方推 `@experiment`）。
 3. **response 置 null 不置空串。** 空串会被当成"判了个空意图"，null 才能识别成"这轮没跑"。
 
-【读法】
-    data/golden_v1.jsonl  数据集本体（149 行；2026-10-29 删 L1 时去掉 1 条）
-    data/trend.json       每轮 run 的指标序列（时间升序）
-    data/runs/            intent_eval_*.json 每轮明细 + intent_run_*.jsonl 带 response 的快照
+【读法】（产物全在 evaluation_reports/intent/，不入库）
+    golden_v1.jsonl       数据集本体（149 行；2026-10-29 删 L1 时去掉 1 条）
+    trend.json            每轮 run 的指标序列（时间升序，机器读）
+    SUMMARY.md            常驻总览（人读，见 overview.py）
+    runs/<ts>/run.json    每轮明细
+    runs/<ts>/responses.jsonl  带 response 的快照（只有指定 --run 时才生成）
     python -m src.evaluation.intent.golden                  # 刷数据集 + 打趋势
     python -m src.evaluation.intent.golden --ragas          # 额外用 ragas 跑一遍
 """
@@ -45,6 +47,7 @@ from pathlib import Path
 
 from ragas.metrics.base import SingleTurnMetric
 
+from src.evaluation.common.paths import REPORTS_ROOT, relative
 from src.evaluation.intent.cases import CASES
 
 # gold → 期望的处理路径。判对意图却走错 handler，用户看到的仍是错答案，
@@ -59,7 +62,7 @@ EXPECTED_ROUTE: dict[str, str] = {
 # 「前两层」= 完全不调 LLM。这个比例才是漏斗的成本价值。
 EARLY_LAYERS: tuple[str, ...] = ("L1", "L2")
 
-GOLDEN_DIR = Path(__file__).parent / "data"
+GOLDEN_DIR = REPORTS_ROOT / "intent"
 RUN_DIR = GOLDEN_DIR / "runs"
 
 
@@ -205,7 +208,7 @@ def run_metrics(run: dict) -> dict:
 
 def collect_trend(paths: list[Path] | None = None) -> list[dict]:
     """扫全部 run，按 ts 升序返回。不按文件名排序 —— 文件名给人看，ts 给机器用。"""
-    ps = paths if paths is not None else sorted(RUN_DIR.glob("intent_eval_*.json"))
+    ps = paths if paths is not None else sorted(RUN_DIR.glob("*/run.json"))
     rows = [run_metrics(load_run(p)) for p in ps]
     return sorted((r for r in rows if r.get("ts")), key=lambda r: r["ts"])
 
@@ -251,28 +254,16 @@ def export(
 
     if run_path is not None:
         run = load_run(run_path)
-        stamp = (run.get("ts") or "")[:19].replace(":", "").replace("T", "-")
-        runs = out_dir / "runs"
-        runs.mkdir(parents=True, exist_ok=True)
-        target = runs / f"intent_run_{stamp or 'latest'}.jsonl"
+        # 快照跟着那一轮走，不再另起文件名：同一轮的 run.json / summary.md /
+        # responses.jsonl 全在一个目录里，看某一轮只翻一个地方。
+        target = Path(run_path).parent / "responses.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("w", encoding="utf-8", newline="\n") as f:
             for rec in attach_run(recs, run):
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         written["run"] = str(relative(target))
 
     return written
-
-
-def relative(path: Path) -> str:
-    """打印用相对路径，别把 D:\\AAAagent\\... 甩到终端。
-
-    ⚠️ 层数是跟着本文件位置走的：`src/evaluation/intent/golden.py` 往上数
-    3 层才到项目根（0=intent / 1=evaluation / 2=src / 3=根）。挪目录要同步改。
-    """
-    try:
-        return str(path.relative_to(Path(__file__).resolve().parents[3]))
-    except ValueError:
-        return str(path)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -316,7 +307,7 @@ def main() -> None:
     ap.add_argument("--no-export", action="store_true", help="只打趋势不写文件")
     args = ap.parse_args()
 
-    runs = sorted(RUN_DIR.glob("intent_eval_*.json"))
+    runs = sorted(RUN_DIR.glob("*/run.json"))
     run_path = Path(args.run) if args.run else (runs[-1] if runs else None)
 
     if not args.no_export:

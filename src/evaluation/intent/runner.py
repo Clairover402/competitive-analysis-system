@@ -49,6 +49,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+from src.evaluation.common.paths import REPORTS_ROOT, relative
 from src.evaluation.intent.cases import CASES, Case, stats
 from src.supervisor.intent import (
     INTENTS,
@@ -59,7 +60,7 @@ from src.supervisor.intent import (
 
 logger = logging.getLogger(__name__)
 
-_OUT_DIR = Path(__file__).parent / "data" / "runs"
+_OUT_DIR = REPORTS_ROOT / "intent" / "runs"
 _ALL_INTENTS = (*INTENTS, "unknown")
 
 # ★ 这两个意图必须抽竞品，所以走到 L3 是"顺路"（判完还得再调一次 LLM 抽槽位）；
@@ -319,11 +320,80 @@ def render(report: dict) -> str:
 
 
 def save(report: dict) -> Path:
-    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    """落一轮：`runs/<ts>/run.json`（机器读）+ `summary.md`（人读）。
+
+    一个 run 一个目录，三类评估同形（ragas / memory / intent 都是
+    `run.json` + `summary.md`），翻某一轮只进一个目录。
+    """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = _OUT_DIR / f"intent_eval_{ts}.json"
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    run_dir = _OUT_DIR / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (run_dir / "summary.md").write_text(
+        _run_summary(report, ts), encoding="utf-8", newline="\n"
+    )
+    return run_dir
+
+
+def _run_summary(report: dict, run_id: str) -> str:
+    """每轮 summary.md = 元信息头 + 已有的终端报告。
+
+    为什么不另写一套渲染：`render()` 就是为「人读这一轮」写的，重复一遍必然漂移。
+    这里只补终端里没有的三样：轮次名、口径（L3 开关 / 计入条数）、噪声提醒。
+    """
+    head = [
+        f"# 意图评估 {run_id}",
+        "",
+        f"- 时间：`{report.get('ts') or run_id}`　L3：{'开' if report.get('l3_enabled') else '关'}",
+        f"- 规模：共 {report.get('total')} 条，主指标计入 {report.get('main', {}).get('n', '—')} 条",
+        f"- 主指标：**{report.get('main', {}).get('accuracy', 0):.1%}**",
+        "",
+        f"> 口径：差异 < 3 点不作数（±2 条跑动噪声）；L3 关闭的轮次不可与全量轮次横比。",
+        "",
+        "---",
+        "",
+    ]
+    # ⚠️ 报告正文包进代码块：`render()` 是按等宽字体对齐的（列宽、缩进都有意义），
+    #   直接塞进 markdown 会被渲染器压成一坨，混淆矩阵彻底不可读。
+    return "\n".join(head) + "```text\n" + render(report) + "\n```\n"
+
+
+def _warn_if_noisy(run_dir: Path) -> None:
+    """跑完立刻按噪声带判一次：差 <3 点就别报「提升」。
+
+    这条提示存在的唯一理由：2026-10-29 实测同批 139 条连跑两次会净翻 2 条
+    （L3 的 temperature 已是 0，服务端推理仍非确定）。没有这句提示，
+    下一轮改动只要碰巧 +2 条，就会被当成收益写进结论。
+    """
+    # ⚠️ 按 ts 取上一轮，不按目录名：两种命名格式并存时（`-` < 数字）会取错。
+    others = [p for p in _OUT_DIR.glob("*/run.json") if p.parent != run_dir]
+    if not others:
+        return
+    payloads = []
+    for p in others:
+        try:
+            payloads.append(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    payloads = [p for p in payloads if p.get("ts")]
+    if not payloads:
+        return
+    prev = max(payloads, key=lambda p: p["ts"])
+    try:
+        cur = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    a = (cur.get("main") or {}).get("accuracy")
+    b = (prev.get("main") or {}).get("accuracy")
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return
+    diff = (a - b) * 100
+    if abs(diff) < 3:
+        print(f"⚠️ 与上一轮差 {diff:+.1f} 点，落在 3 点噪声带内 —— 不能当收益/退步。")
+    else:
+        print(f"与上一轮差 {diff:+.1f} 点（超噪声带），但仍要看是哪几条翻的。")
 
 
 async def main() -> None:
@@ -349,8 +419,14 @@ async def main() -> None:
             print(f"  {r['floor']:>6.2f}{r['margin']:>8.2f}"
                   f"{r['coverage'] * 100:>8.1f}%{r['precision'] * 100:>13.1f}%")
 
-    path = save(report)
-    print(f"\n明细已存 {path}")
+    run_dir = save(report)
+    print(f"\n本轮已存 {relative(run_dir)}（run.json + summary.md）")
+
+    from src.evaluation.intent.overview import write_overview
+
+    print(f"总览已刷新 {relative(write_overview())}")
+
+    await _warn_if_noisy(run_dir)
 
 
 if __name__ == "__main__":

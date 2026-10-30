@@ -1854,7 +1854,7 @@ Golden Dataset + RAGAS 评估 + LLM-as-Judge 离轨评估 + 回归测试 + E2E �
 - Phase 9 已完成
 
 ### 交付物
-1. `src/evaluation/golden_dataset.py`
+1. `src/evaluation/ragas/dataset.py`
 2. `src/evaluation/ragas_eval.py`
 3. `src/evaluation/judge_eval.py`
 4. `tests/test_e2e.py` — 端到端测试
@@ -1869,7 +1869,7 @@ Golden Dataset + RAGAS 评估 + LLM-as-Judge 离轨评估 + 回归测试 + E2E �
 
 ### 你的任务
 
-#### 1. src/evaluation/golden_dataset.py
+#### 1. src/evaluation/ragas/dataset.py
 
 构建 10 个竞品的 Golden Dataset（easy/medium/hard 各 3-4 个）：
 

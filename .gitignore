@@ -38,12 +38,11 @@ logs/
 # 里程碑 baseline 想留档可 git add -f 单独提交）
 phase_report/
 
-# 评估 run 归档（ragas_core 每次跑自动落 run.json/summary.md/TREND.md，不入库）
-evaluation_runs/
-
-# intent 评估的每轮明细是派生产物（每次评估都会重写），data/ 下的
-# golden_v1.jsonl（数据集本体）与 trend.json（指标序列）才入库
-src/evaluation/intent/data/runs/
+# 评估产物（四类评估共用，位置由 src/evaluation/common/paths.py 决定）。
+# 全部是派生产物：SUMMARY.md / runs/ / trend.json / golden_v1.jsonl 都能从
+# 代码与题库（cases.py / dataset.py）重建，所以整目录不入库。
+# ⚠️ 别在这里放「只此一份」的东西 —— clone 下来 evaluation_reports/ 是空的。
+evaluation_reports/
 
 # 手绘图导出产物（源 HTML 与 PNG 都是派生物，随时可重画）
 generated-images/

@@ -6,21 +6,24 @@
   不做 跑指标、调 LLM、替人下结论——纯读 JSON，不依赖 ragas / DB。
 
 【用法】
-  python -m src.evaluation.run_archive compare <A> <B>    # A/B 可为 run_id 或 baseline
-  python -m src.evaluation.run_archive trend [--write] [--since YYYY-MM-DD]
-  python -m src.evaluation.run_archive baseline [--set <run_id>]
+  python -m src.evaluation.ragas.archive compare <A> <B>    # A/B 可为 run_id 或 baseline
+  python -m src.evaluation.ragas.archive trend [--write] [--since YYYY-MM-DD]
+  python -m src.evaluation.ragas.archive baseline [--set <run_id>]
 
   跑分时自动归档（默认开）：ragas_core 在跑分路径上调
     handle = begin_run("golden", note="top_k 15→20")
     finish_run(handle, entries)
 
-【产物：一个 run 恒定两个文件，形状不随内容变】（根目录 = 本文件同级 evaluation_runs/）
-  src/evaluation/evaluation_runs/
-    TREND.md       全版本趋势（派生视图，trend --write 可整体重建）
+【产物：一个 run 恒定两个文件，形状不随内容变】（根目录由 common/paths.py 决定）
+  evaluation_reports/ragas/
+    SUMMARY.md     常驻总览（最新一轮 + 全版本趋势，trend --write 整体重建）
     baseline.txt   当前基线 run_id（唯一允许覆盖写的对象）
-    <run_id>/
+    runs/<run_id>/
       run.json     manifest（跑了什么）+ cases（每格分数 + 每轮原始分）
       summary.md   人读分数表
+
+  ⚠️ 整个 `evaluation_reports/` 不入库。路径只在 `common/paths.py` 里算，
+    别在本文件或调用方手写 `Path(__file__).parents[N]`（层数一错，历史就分裂）。
 
 【三条设计原则（都是踩过的坑）】
   1. 长在唯一入口上 ← 旧 golden_run.py 有完整的 baseline/diff 机制，却从没有过一次
@@ -51,13 +54,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from src.evaluation.common.paths import REPORTS_ROOT, REPO_ROOT, relative
+
 # 归档格式版本：写进每个 run 的 manifest。当前只写不读——留作日后加字段时
 # 让对比逻辑能识别「老档缺字段」，而不是靠猜测补 0。
 ARCHIVE_SCHEMA = 1
 
 # 归档目录与文件名的唯一出处（改这里就够，别在函数里散落字面量）。
-ARCHIVE_DIRNAME = "evaluation_runs"
-TREND_FILENAME = "TREND.md"
+# ⚠️ 常驻总览叫 SUMMARY.md、每轮明细叫 summary.md —— 只差大小写，但**不在同一层**
+#   （前者在 <类>/ 下，后者在 <类>/runs/<run_id>/ 下），大小写不敏感的文件系统也不会撞。
+OVERVIEW_FILENAME = "SUMMARY.md"
 BASELINE_FILENAME = "baseline.txt"
 RUN_JSON = "run.json"
 SUMMARY_MD = "summary.md"
@@ -81,14 +87,16 @@ METRIC_SHORT = {
 # 护栏指标：只呈现，不参与「变好 / 变坏」判定（铁律③）。
 GUARDRAIL = {"faithfulness"}
 
-# 取 project root（src/evaluation/run_archive.py → 上三级）。仅给 git 命令当 cwd 用。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 仅给 git 命令当 cwd 用。层级写死在 common/paths.py，这里只取结果。
+PROJECT_ROOT = REPO_ROOT
 
-# 归档根目录：跟随**模块所在目录**（src/evaluation/evaluation_runs），不跟项目根、也不跟 cwd。
-# ⚠️ 曾一度改成 PROJECT_ROOT/evaluation_runs —— 结果是 10-17 的历史留在本目录、
-# 10-20 之后写到了项目根，两个根各自只能看到自己的 run，趋势表直接断代。
-# 归档位置必须只由本文件位置决定：模块搬到哪都带着历史走。
-ARCHIVE_ROOT = Path(__file__).resolve().parent / ARCHIVE_DIRNAME
+# 归档根 = `<类>/runs/`，每轮目录的父级。
+# ⚠️ 历史教训：曾经把根改成 PROJECT_ROOT/evaluation_runs，结果旧历史留在原目录、
+#   新 run 写到项目根，两个根各自只看得到自己 → 趋势表断代。所以位置**只由
+#   common/paths.py 一处决定**，迁移历史时必须连目录一起搬，不能只改常量。
+RUNS_DIRNAME = "runs"
+CLASS_DIR = REPORTS_ROOT / "ragas"
+ARCHIVE_ROOT = CLASS_DIR / RUNS_DIRNAME
 
 
 # ── 基础工具 ────────────────────────────────────────────────────────────────────
@@ -135,7 +143,7 @@ def golden_fingerprint() -> str:
     只看 git commit 会把「数据集变了」误判成「代码改进了」。
     sort_keys 保证键序不影响指纹（否则纯格式变动就假报「数据集已变」）。
     """
-    from src.evaluation.golden_dataset import GOLDEN_DATASET
+    from src.evaluation.ragas.dataset import GOLDEN_DATASET
 
     payload = json.dumps(
         GOLDEN_DATASET, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -187,9 +195,18 @@ def _settings_dump(settings=None) -> dict:
     return out
 
 
+def class_dir(root: Path | None = None) -> Path:
+    """`root` 的语义统一为「类目录」（`evaluation_reports/ragas/`）。
+
+    测试传一个临时目录进来，就该整个类目录一起换地方，而不是只换 runs/
+    把 SUMMARY.md 写到 tmp 的父级去（那会让两个测试互相踩）。
+    """
+    return Path(root) if root else CLASS_DIR
+
+
 def archive_root(root: Path | None = None) -> Path:
-    """归档根目录（不存在则创建）。默认 ARCHIVE_ROOT，即 src/evaluation/evaluation_runs。"""
-    path = Path(root) if root else ARCHIVE_ROOT
+    """每轮 run 目录的父级（`<类>/runs/`），不存在则创建。"""
+    path = class_dir(root) / RUNS_DIRNAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -417,10 +434,10 @@ def finish_run(
     *,
     settings=None,
     cases_requested: int | None = None,
-    write_trend_file: bool = True,
+    refresh_overview: bool = True,
     root: Path | None = None,
 ) -> Path:
-    """收尾：写 run.json + summary.md，并把本 run 并入 TREND.md。
+    """收尾：写 run.json + summary.md，并重建常驻总览 SUMMARY.md。
 
     ⚠️ **不修改入参 entries**（有守卫测试）：归档是「抄一份」，不是「接手改」。
     调用方在跑完后还要用 entries 打印分数表，若这里就地写字段会污染输出。
@@ -429,7 +446,9 @@ def finish_run(
       {golden_id, task_id, route, rows, aggregates, n_contexts, skipped,
        repeat, repeat_spread, scores_by_repeat, error}
     """
-    root = archive_root(root)
+    # ⚠️ cdir 是类目录（SUMMARY.md / baseline 的落点），runs 是它下面的 runs/。
+    #    两个混用会出现「写到 runs/SUMMARY.md 去」这种错位。
+    cdir = class_dir(root)
     finished = datetime.now()
     duration = int((finished - handle.started_at).total_seconds())
 
@@ -494,8 +513,8 @@ def finish_run(
     if pending.exists():
         pending.unlink()
 
-    if write_trend_file:
-        write_trend(root)
+    if refresh_overview:
+        write_overview(cdir)
     return handle.dir
 
 
@@ -550,7 +569,7 @@ def resolve_run_id(token: str, root: Path | None = None) -> str:
 
 def read_baseline(root: Path | None = None) -> str | None:
     """读 baseline.txt（一行文本；不存在 → None）。"""
-    path = archive_root(root) / BASELINE_FILENAME
+    path = class_dir(root) / BASELINE_FILENAME
     if not path.exists():
         return None
     text = path.read_text(encoding="utf-8").strip()
@@ -559,10 +578,11 @@ def read_baseline(root: Path | None = None) -> str | None:
 
 def set_baseline(run_id: str, root: Path | None = None) -> str:
     """覆盖写 baseline.txt（唯一允许的「覆盖写」：它是指针不是数据）。"""
-    root = archive_root(root)
-    if not (root / run_id).exists():
-        raise SystemExit(f"run 不存在：{root / run_id}")
-    (root / BASELINE_FILENAME).write_text(run_id + "\n", encoding="utf-8")
+    cdir = class_dir(root)
+    run_dir = archive_root(cdir) / run_id
+    if not run_dir.exists():
+        raise SystemExit(f"run 不存在：{run_dir}")
+    (cdir / BASELINE_FILENAME).write_text(run_id + "\n", encoding="utf-8")
     return run_id
 
 
@@ -585,7 +605,7 @@ def list_runs(root: Path | None = None, kind: str | None = "golden") -> list[dic
     return runs
 
 
-# ── 趋势表 TREND.md（派生视图，可整体重建） ────────────────────────────────────────────────
+# ── 常驻总览 SUMMARY.md（派生视图，可整体重建） ─────────────────────────────────────────────
 
 
 def _trend_rows(runs: list[dict]) -> list[dict]:
@@ -620,20 +640,45 @@ def _trend_rows(runs: list[dict]) -> list[dict]:
     return rows
 
 
-def build_trend(runs: list[dict]) -> str:
-    """渲染 TREND.md（全版本趋势表）。
+def build_overview(runs: list[dict]) -> str:
+    """渲染常驻总览 SUMMARY.md（最新一轮摘要 + 全版本趋势表）。
 
     为什么「重建」而不是「追加一行」：重建是幂等的——
     手改坏了、删了某个 run 目录导致对不上，跑一次 `trend --write` 就自动对齐。
     追加需要判断「这行在不在」，反而更容易漂移。
+
+    「最新一轮」放在趋势表之前，是因为绝大多数时候人只想看两件事：
+    现在什么水平、比上次动了多少。趋势表是复查用的，不该当首页。
     """
     rows = _trend_rows(runs)
     lines = [
-        "# 全量评估趋势（四指标）",
+        "# RAGAS 四指标评估总览",
         "",
-        "> 派生视图，事实源是各 run 的 `run.json`。对不上就跑：",
-        "> `python -m src.evaluation.run_archive trend --write`",
-        ">",
+        "> 常驻总览，`trend --write` 整体重建；事实源是本目录 `runs/*/run.json`。",
+        "> ⚠️ 本目录全部产物**不入库**（见 .gitignore），clone 下来是空的。",
+        "",
+    ]
+    if rows:
+        last = rows[-1]
+        lines += [
+            "## 最新一轮",
+            "",
+            f"- run：`{last['run_id']}`　{last['date']}　备注：{last['note']}",
+            f"- commit：`{last['commit'] or '—'}`　数据集指纹：`{last['golden']}`",
+            f"- 口径：repeat={_fmt(last['repeat'], 0)} / top_k={_fmt(last['top_k'], 0)}",
+            "- 指标：" + "　".join(
+                f"{METRIC_SHORT[n]} {_fmt(last['values'][n])}" for n in METRICS
+            ),
+            "- 与上一轮：" + "　".join(
+                f"Δ{METRIC_SHORT[n]} {_delta(last['delta'][n])}" for n in METRICS
+            ),
+            "",
+            "> 绝对值不可跨 case 引用（材料量差几倍）；Δ 只给方向，不给等级。",
+            "",
+        ]
+    lines += [
+        "## 全版本趋势",
+        "",
         "> 读法：口径列（commit / golden / repeat / top_k）必须一起看——"
         "把「换了参数的一行」读成「系统变好了」是这张表唯一的谎言方式。",
         "> Δ 只给方向，不给等级；跨 case 汇总禁止引用绝对值。faithfulness 是护栏，不判好坏。",
@@ -662,11 +707,17 @@ def build_trend(runs: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def write_trend(root: Path | None = None) -> Path:
-    """从全部 run.json 重建 TREND.md 并落盘。"""
-    root = archive_root(root)
-    path = root / TREND_FILENAME
-    path.write_text(build_trend(list_runs(root, kind="golden")), encoding="utf-8")
+def write_overview(root: Path | None = None) -> Path:
+    """从全部 run.json 重建常驻总览 SUMMARY.md 并落盘。
+
+    ⚠️ `root` 是**类目录**（含 runs/ 的那一层），不是 runs/ 本身。
+       list_runs 内部会再拼一次 RUNS_DIRNAME，所以这里传下去之前不能先 archive_root
+       （早先写成 `class_dir(archive_root(root))` → 落到 runs/SUMMARY.md，多一层）。
+    """
+    cdir = class_dir(root)
+    archive_root(cdir)  # 保证 runs/ 存在（首次跑时不然 iterdir 会抛）
+    path = cdir / OVERVIEW_FILENAME
+    path.write_text(build_overview(list_runs(cdir, kind="golden")), encoding="utf-8")
     return path
 
 
@@ -899,12 +950,12 @@ def main(argv: list[str] | None = None) -> None:
     """子命令入口。
 
     用法：
-      python -m src.evaluation.run_archive compare <A> <B>     # A/B 可为 run_id 或 "baseline"
-      python -m src.evaluation.run_archive trend               # 打印趋势表
-      python -m src.evaluation.run_archive trend --write       # 重建 TREND.md
-      python -m src.evaluation.run_archive trend --since 2026-10-01   # 只看该日期之后
-      python -m src.evaluation.run_archive baseline            # 打印当前基线
-      python -m src.evaluation.run_archive baseline --set <run_id>
+      python -m src.evaluation.ragas.archive compare <A> <B>     # A/B 可为 run_id 或 "baseline"
+      python -m src.evaluation.ragas.archive trend               # 打印趋势表
+      python -m src.evaluation.ragas.archive trend --write       # 重建 SUMMARY.md
+      python -m src.evaluation.ragas.archive trend --since 2026-10-01   # 只看该日期之后
+      python -m src.evaluation.ragas.archive baseline            # 打印当前基线
+      python -m src.evaluation.ragas.archive baseline --set <run_id>
     """
     parser = argparse.ArgumentParser(
         description="全量评估留痕：对比两个 run、查看趋势、管理基线（纯读 JSON，零 LLM 成本）"
@@ -915,8 +966,8 @@ def main(argv: list[str] | None = None) -> None:
     p_cmp.add_argument("a", help="基准 run_id 或 baseline")
     p_cmp.add_argument("b", help="对照 run_id 或 baseline")
 
-    p_trend = sub.add_parser("trend", help="趋势表（打印或重建 TREND.md）")
-    p_trend.add_argument("--write", action="store_true", help="重建并覆盖 TREND.md")
+    p_trend = sub.add_parser("trend", help="趋势表（打印或重建 SUMMARY.md）")
+    p_trend.add_argument("--write", action="store_true", help="重建并覆盖 SUMMARY.md")
     p_trend.add_argument("--since", help="只显示该日期（YYYY-MM-DD）之后的 run")
 
     p_base = sub.add_parser("baseline", help="查看/设置当前基线")
@@ -934,8 +985,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cmd == "trend":
         if args.write:
-            path = write_trend()
-            print(f"已重建：{path}")
+            path = write_overview()
+            print(f"已重建：{relative(path)}")
             return
         runs = list_runs()
         if args.since:
@@ -944,7 +995,7 @@ def main(argv: list[str] | None = None) -> None:
                 for r in runs
                 if (r["manifest"].get("started_at") or "")[:10] >= args.since
             ]
-        print(build_trend(runs))
+        print(build_overview(runs))
         return
 
     if args.cmd == "baseline":

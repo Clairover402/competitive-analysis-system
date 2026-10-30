@@ -860,7 +860,7 @@ async def _execute_task(
         # 运行时的一环——真实用户任务没有标准答案，对它打分既无法判定本次交付
         # 好坏、也不指导用户决策，只是给每个生产任务平白加一笔 LLM 裁判开销，
         # 还会把两种口径的分数混进同一条 Grafana 趋势曲线。
-        # 评估改由发版前显式触发（`python -m src.evaluation.ragas_core --golden`），
+        # 评估改由发版前显式触发（`python -m src.evaluation.ragas.core --golden`），
         # 生产链路零评估开销。
 
     except Exception as e:

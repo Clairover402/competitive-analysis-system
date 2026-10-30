@@ -11,9 +11,9 @@
   输出：stdout 的 Markdown 报告（--json 则输出结构化 dict）
         + 可选：trajectory_metrics 的指标行（--persist）
   用法：
-      python -m src.evaluation.trajectory --task <task_id>
-      python -m src.evaluation.trajectory --since 7d --limit 50
-      python -m src.evaluation.trajectory --since 2h --persist   # 定时落库
+      python -m src.evaluation.trajectory.runner --task <task_id>
+      python -m src.evaluation.trajectory.runner --since 7d --limit 50
+      python -m src.evaluation.trajectory.runner --since 2h --persist   # 定时落库
 
 【关键决策】
   ① 只评 Supervisor，不评 Pipeline：Pipeline 四个节点三条固定边，路径编译期确定，

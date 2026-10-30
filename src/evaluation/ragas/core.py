@@ -11,7 +11,7 @@
   retrieval_snapshot ─build_samples()
   → [SampleRow] ─evaluate_four()
   → FourMetricResult─render_markdown()/to_dict()
-  → 分数表（人读 / JSON）·─run_archive→ run.json + summary.md
+  → 分数表（人读 / JSON）·─archive→ runs/<run_id>/run.json + summary.md
 
 【四指标的输入契约】★ cp 与 cr 的 required_columns 完全相同，故能一行同评
   指标                     需要字段                              本模块的数据来源
@@ -73,7 +73,7 @@ from ragas.metrics._faithfulness import faithfulness  # noqa: E402
 
 # 本模块对外部能力的全部依赖都在这里：judge / embeddings / RunConfig / reference 解析。
 # 口径只此一处定义，不与其他链路各写一份。
-from src.evaluation.llm_factory import (  # noqa: E402
+from src.evaluation.ragas.llm import (  # noqa: E402
     JUDGE_MODEL,
     build_embeddings,
     build_judge_llm,
@@ -81,9 +81,10 @@ from src.evaluation.llm_factory import (  # noqa: E402
     load_json_list,
     resolve_reference,
 )
-# 留痕：默认开，--no-archive 才关。依赖方向单向——run_archive 不 import 本模块，
+# 留痕：默认开，--no-archive 才关。依赖方向单向——archive 不 import 本模块，
 # 因为本模块 import 期会拉起 ragas，而对比/趋势必须在无 ragas 环境也能跑。
-from src.evaluation.run_archive import begin_run, finish_run  # noqa: E402
+from src.evaluation.ragas.archive import begin_run, finish_run  # noqa: E402
+from src.evaluation.common.paths import relative  # noqa: E402
 
 if TYPE_CHECKING:
     # 仅类型标注用，运行时不导入，避免与 src.db 形成循环依赖。
@@ -613,7 +614,7 @@ async def run_golden(
     """
     from src.db.connection import close_pool, create_pool
     from src.db.dao import RetrievalSnapshotDAO, TaskDAO
-    from src.evaluation.golden_dataset import (
+    from src.evaluation.ragas.dataset import (
         GOLDEN_DATASET,
         get_reference_by_cell,
         get_reference_by_dimension,
@@ -757,7 +758,7 @@ async def _cmd_task(
         else:
             print(render_markdown(result))
         if run_dir:
-            print(f"\n已归档：{run_dir}")
+            print(f"\n已归档：{relative(run_dir)}")
     finally:
         await close_pool()
 
@@ -770,7 +771,7 @@ async def _cmd_golden(
     archive: bool = True,
 ) -> None:
     """CLI 子命令：跑 Golden 数据集四指标评分（并默认留痕）。"""
-    from src.evaluation.golden_dataset import GOLDEN_DATASET
+    from src.evaluation.ragas.dataset import GOLDEN_DATASET
 
     requested = len(case_ids) if case_ids else len(GOLDEN_DATASET)
     # begin_run 放在跑之前：先占住 run_id 并写下 .pending，
@@ -802,23 +803,23 @@ async def _cmd_golden(
             print(render_markdown(result))
             print("")
     if run_dir:
-        print(f"已归档：{run_dir}")
-        print("看结果：summary.md（本次明细）/ TREND.md（历史趋势）")
+        print(f"已归档：{relative(run_dir)}")
+        print("看结果：runs/<run_id>/summary.md（本次明细）/ SUMMARY.md（常驻总览）")
 
 
 def main() -> None:
     """CLI 入口。
 
     用法：
-      python -m src.evaluation.ragas_core --task <uuid>            # 评真实任务
-      python -m src.evaluation.ragas_core --golden                # 跑全部 Golden
-      python -m src.evaluation.ragas_core --golden --case golden_003  # 只跑一条
-      python -m src.evaluation.ragas_core --golden --json         # JSON 输出
-      python -m src.evaluation.ragas_core --golden --case golden_001 --repeat 3
+      python -m src.evaluation.ragas.core --task <uuid>            # 评真实任务
+      python -m src.evaluation.ragas.core --golden                # 跑全部 Golden
+      python -m src.evaluation.ragas.core --golden --case golden_003  # 只跑一条
+      python -m src.evaluation.ragas.core --golden --json         # JSON 输出
+      python -m src.evaluation.ragas.core --golden --case golden_001 --repeat 3
                                                                   # 重复 3 轮取均值压方差
-      python -m src.evaluation.ragas_core --golden --repeat 3 --note "top_k 15→20"
+      python -m src.evaluation.ragas.core --golden --repeat 3 --note "top_k 15→20"
                                                                   # 跑并留痕，备注进 manifest
-      python -m src.evaluation.ragas_core --golden --no-archive    # 本次不留痕（调试用）
+      python -m src.evaluation.ragas.core --golden --no-archive    # 本次不留痕（调试用）
     """
     _setup_logging()
 
@@ -844,7 +845,7 @@ def main() -> None:
     parser.add_argument(
         "--no-archive",
         action="store_true",
-        help="本次不落 evaluation_runs/（仅调试用；全量跑不要加）",
+        help="本次不落 evaluation_reports/（仅调试用；全量跑不要加）",
     )
     parser.add_argument(
         "--note",
