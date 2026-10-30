@@ -198,28 +198,40 @@ def match_values(
 
 
 def gate_llm(values: list[str] | None, pool: list[str] | None) -> list[str]:
-    """LLM 输出的闸门：把输出逐条对回池里的值，对不上的一律丢弃。
+    """把 LLM 输出对回池里的写法：能对上的**改名**，对不上的**原样保留**。
 
-    ★ 整条管线里最关键的一步。LLM 会把「copilot」抽成「GitHub Copilot」，
-      也会抽成「Microsoft Copilot」—— 后者池里没有，直接下推就是查 0 条，
-      而用户以为筛过了。过闸门后它只能**翻译成池里已有的名字**，不能引进新名字。
+    ★ 定位：LLM 在读取侧只当同义词翻译器。它会把「copilot」抽成
+      「GitHub Copilot」（池里有），也会抽成「Microsoft Copilot」（池里没有）。
+      前者必须改成池里的写法，否则绝对查不到。
+
+    ★ 2026-10-30 反转：池外值**不再丢弃**。老版本丢，理由是"不能引进池外新值"，
+      但它漏看了下游是什么：
+        · 两条 SQL 都是 OR 匹配（`competitors ?| $2` / `e.competitor = ANY($2)`）；
+        · 池是 `SELECT DISTINCT` 该用户全部竞品，**无 LIMIT**。
+      所以池外值必然命中 0 行 —— 留着只会"查空"，不会"查错"。而丢弃会让
+      `$2` 变成 NULL，SQL 把 NULL 读成**不限竞品**，直接返回最近 N 条无关任务
+      （实测：问「以前分析过 Notion 吗」，答出一串飞书/钉钉/企业微信，
+      过滤整个失效，且响应里看不出来）。
+      ★ 判据一句话：**读取侧的空槽不是"不知道"，是"不限"** —— 两者在 SQL 里
+      是同一个分支，所以任何"交空槽、让调用方去明说没找到"的设计都不成立。
+
     ★ 实测（该用户真实的 32 个竞品值池，temperature=0）：
-        copilot → ['copilot']      闸门 → GitHub Copilot
-        teams   → ['teams']        闸门 → Microsoft Teams
-        Zapier  → ['Zapier']       闸门 → []（池外，正确丢弃）
-      对照：把池子塞进提示词后 copilot 直接返回 [] —— 模型放弃了就没有补救通道，
-      这正是选"先自由输出再过闸门"而不是"池子进提示词"的原因。
+        copilot → GitHub Copilot
+        teams   → Microsoft Teams
+        Zapier  → Zapier（池外保留 → 查空 → 回「没有记录」）
 
     ⚠️ 不能直接复用 `match_competitors`：它判的是「**池值**出现在用户原话里」，
       方向是"话 ⊇ 值"。LLM 输出的是简称（copilot ⊂ GitHub Copilot），方向必须反过来。
       所以这里做双向包含，且**精确匹配优先** —— 否则「飞书」会把「飞书文档」一起带上。
+
+    ⚠️ 与 `normalize_to_pool` 现在只差一处：池内同义项 ≥2 个时这里全放行
+      （`WPS` → WPS 365 + WPS Office，OR 匹配下更宽但仍正确），那边要看连接词。
     """
     if not values:
         return []
     if not pool:
         # 没有值池 = 没有校验依据（没查 / 查失败 / 该用户还没有数据）。
-        # 此时退回 LLM 直出：丢弃一切会让 trace 永远查不到东西，而放行的最坏结果
-        # 只是"查少了几条"—— 查询范围本来就被 user_id 限制住了，串不到别人的数据。
+        # 原样放行：此时唯一能做的就是把用户说的名字拿去查。
         return list(values)
     squashed = [(c, _squash(c)) for c in pool if _squash(c)]
     out: list[str] = []
@@ -231,7 +243,8 @@ def gate_llm(values: list[str] | None, pool: list[str] | None) -> list[str]:
         if exact:
             out.extend(exact)
             continue
-        out.extend(c for c, nc in squashed if nv in nc or nc in nv)
+        # 池内对不上就保留原文 —— 可能是从没分析过的新竞品，那正是要查的对象
+        out.extend([c for c, nc in squashed if nv in nc or nc in nv] or [v])
     return _dedupe(out)
 
 
@@ -357,7 +370,9 @@ async def fill_slots(
     #     那份报告」，池里是「GitHub Copilot」，字面匹配命不中 → 退回不限定竞品。
     #   ⚠️ 兜底必须同时满足两个条件，否则不如不加：
     #     ① pool 非空 —— 池空时 `gate_llm` 会原样放行，等于把幻觉写进筛选条件；
-    #     ② 过闸门 —— 输出必须能对回池里的名字，不能引进池外新值。
+    #     ② 过闸门 —— 闸门只**改名**、不丢弃（copilot → GitHub Copilot），
+    #        池外值原样下推。原因见 `gate_llm` docstring：空槽在 SQL 里
+    #        就是"不限竞品"，会把一堆无关任务当成答案端出去。
     #   成本：值池命中的句子仍是零调用（实测 26 句真实问法里 8 句命中），
     #   只有兜不住的那批多付一次。换来的是"简称也能查到"，代价是必须让用户
     #   **看见**筛的是哪个名字 —— 否则就从"可见的宽"变成"不可见的窄"。
@@ -368,11 +383,22 @@ async def fill_slots(
                 cs, source = hit, src
         if not ds:
             ds = match_values(text, dimension_pool, _DIM_ALIASES)[0]
-        if not cs and competitor_pool:
+        # ★ 值池只接住一个、原话却像提了多家（有「和/与/、」）→ 补一次 LLM。
+        #   连接词是用户自己给的"这里有多个对象"信号；池里只命中一个，说明其余
+        #   在池外（= 没分析过），而"其余那些有没有记录"正是要查的。
+        #   ⚠️ 不补的话「Notion 和飞书都分析过吗」只筛飞书，2 份结果端上去，
+        #   用户以为两家都查过了 —— 静默漏答，比多付一次调用贵得多。
+        partial = len(cs) == 1 and bool(_SPLIT_HINT.search(text))
+        if (not cs or partial) and competitor_pool:
             got = await llm_slots(text, settings, history_block)
-            cs = gate_llm(got.competitors, competitor_pool)
-            if cs:
-                source = "llm"
+            gated = gate_llm(got.competitors, competitor_pool)
+            if gated and set(gated) != set(got.competitors):
+                # 归一（copilot → GitHub Copilot）与池外保留都在这里显形：
+                # 池外值查空时，"用户问的名字"和"实际筛的名字"必须能对上账。
+                logger.info("槽位 竞品归一 %s → %s", got.competitors, gated)
+            merged = _dedupe(cs + gated)
+            if merged:
+                cs, source = merged, "llm"
             if not ds:
                 ds = gate_llm(got.dimensions, dimension_pool)
         return Slots(competitors=cs, dimensions=ds, source=source)
@@ -418,11 +444,19 @@ async def fill_slots(
         if not ds:
             ds = match_values(text, dimension_pool, _DIM_ALIASES)[0]
 
-        if not cs:
+        # 同 lookup：池只接住一个、原话却像提了多家 → 补一次 LLM，
+        # 否则「Notion 和飞书」只筛飞书，把别家证据当全部端出去。
+        partial = len(cs) == 1 and bool(_SPLIT_HINT.search(text))
+        if not cs or partial:
             got = await llm_slots(text, settings, history_block)
-            cs = gate_llm(got.competitors, competitor_pool)
-            if cs:
-                src = "llm"
+            gated = gate_llm(got.competitors, competitor_pool)
+            if gated and set(gated) != set(got.competitors):
+                logger.info("槽位 trace 竞品归一 %s → %s", got.competitors, gated)
+            merged = _dedupe(cs + gated)
+            if merged:
+                cs, src = merged, "llm"
+            if not ds:
+                ds = gate_llm(got.dimensions, dimension_pool)
             if not ds:
                 ds = gate_llm(got.dimensions, dimension_pool)
 

@@ -614,10 +614,13 @@ async def lookup_reports(
         #    分页把这个路径从"罕见"变成了"翻到末页就会走"，所以必须准。
         counted = await pool.fetch(_COUNT_TASKS_SQL, user_id, competitors)
         total = counted[0]["n"] if counted else None
-        # 「翻过头了」和「本来就没有」在响应里长得一模一样，只有这条日志能分开。
+        # 「翻过头了」和「条件筛空了」在响应里长得一模一样，只有这条日志能分开：
+        # skip>0 才是真越界；skip=0 说明筛选条件本身没匹配到任何任务。
         logger.info(
-            "lookup OFFSET 越界（skip=%s 无返回行），补 count 得 total=%s",
-            skip, total,
+            "lookup 无返回行（skip=%s，%s），补 count 得 total=%s",
+            skip,
+            "OFFSET 越界" if skip else "条件无匹配，不是翻页问题",
+            total,
         )
 
     items = []
