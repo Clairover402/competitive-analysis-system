@@ -169,10 +169,12 @@ class Settings(BaseSettings):
     #   golden_001 最终只有 12 URL / 32 chunk，远低于设计注释的 40 URL / 80~120 chunk
     #   → 说明「采满」并非普遍情况，**是否扩容应由采集漏斗日志决定**（Collector 新增
     #   了「采集漏斗」与「最终落库规模」两条日志）。默认保持 8，不擅自抬高成本。
-    chunks_per_url: int = 1
+    chunks_per_url: int = 2
     # ↑ 每个 URL 最多保留几条 chunk 进入候选池。原实现硬编码为 1（URL 去重时丢弃其余），
     #   导致每页约 2/3 内容被丢弃、且「留哪一条」由检索返回顺序决定（不可复现）。
-    #   默认仍为 1 以保持既有行为与 token 预算；调到 2~3 可显著增加候选多样性。
+    #   【2026-10-30】1 → 2：实测每 URL 平均产出 2.7 个 chunk，只留 1 条丢掉约 2/3 页面
+    #   内容，是 cp=0.464 短板的主要嫌疑。基线（2026-10-20 run）同口径 repeat=1 可比，
+    #   Δ 以 RAGAS golden 轮实测为准；若候选池膨胀导致精排超时或 token 涨价再回调。
 
     # ---- Web Fetch: Jina Reader 兜底（免费无 key，抓 SPA 正文）----
     # 【2026-09-26】实测 r.jina.ai 在当前网络不可达（ConnectTimeout，境外线路），
