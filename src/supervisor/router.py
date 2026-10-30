@@ -204,6 +204,10 @@ class IntentRouter:
         """
         mcp_server = create_mcp_server(self.settings)
         pool = await create_pool(self.settings)
+        # 幂等存储：collector 的 web_search / web_fetch 带 idem_key，
+        # 中断续跑同 key 回放首次结果，不重复副作用（2026-10-30）。
+        from src.db.dao import ToolCallResultDAO
+        mcp_server.attach_idempotency(ToolCallResultDAO(pool))
 
         # ─── 创建 A2ARouter + 注入 HarnessGuard ───
         # Phase 8: 注入 HarnessGuard（白名单+参数校验+频控+PII+审计）

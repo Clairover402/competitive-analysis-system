@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from typing import Any
 
 import asyncpg
 
@@ -1112,6 +1113,67 @@ class AgentLogDAO:
                 task_id,
             )
             return [dict(r) for r in rows]
+
+
+class ToolCallResultDAO:
+    """工具调用结果日志 —— MCP 工具级幂等的存储层。
+
+    【2026-10-30】配合 MCPServer.invoke 的 idem_key 参数：
+    中断续跑 / 超时重试时，同一逻辑调用算出同一个 tool_call_id，
+    命中即回放首次结果，不再重复执行副作用（Tavily 配额、重复抓取）。
+
+    【为什么 get 返回 Any 而不是行 dict】调用方（MCPServer）要的是
+    「当时工具返回的那个原生结果」，行元数据（tool_name/created_at）
+    是排障用的，审计里已有，不必再暴露一层拆包。
+    """
+
+    # 超过此大小的结果不缓存：embed_texts 一批几十条 1024 维向量可到 MB 级，
+    # 存进去让 JSONB 行膨胀、读取时反序列化也比重新算慢，幂等只保副作用工具。
+    MAX_RESULT_BYTES = 1_000_000
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def get(self, tool_call_id: str) -> Any | None:
+        """按幂等键取首次结果。无记录返回 None（= 需要真正执行）。"""
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT result FROM tool_call_results WHERE tool_call_id = $1",
+                tool_call_id,
+            )
+        return json.loads(raw) if raw else None
+
+    async def save(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        task_id: str | None,
+        args_digest: dict | None,
+        result: Any,
+    ) -> bool:
+        """落一条成功结果。返回是否真正写入（超限/重复写返回 False）。
+
+        ON CONFLICT DO NOTHING：并发同 key 时首写者胜，后写的不覆盖 ——
+        「返回首次结果」要求结果不可变，覆盖会破坏这个语义。
+        """
+        payload = json.dumps(result, ensure_ascii=False, default=str)
+        if len(payload.encode("utf-8")) > self.MAX_RESULT_BYTES:
+            logger.warning(
+                "工具结果超 %d 字节不缓存 tool=%r tc_id=%s…%s",
+                self.MAX_RESULT_BYTES, tool_name, tool_call_id[:8], tool_call_id[-8:],
+            )
+            return False
+        async with self._pool.acquire() as conn:
+            tag = await conn.execute(
+                """INSERT INTO tool_call_results
+                       (tool_call_id, tool_name, task_id, args_digest, result)
+                   VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+                   ON CONFLICT (tool_call_id) DO NOTHING""",
+                tool_call_id, tool_name, task_id,
+                json.dumps(args_digest, ensure_ascii=False) if args_digest else None,
+                payload,
+            )
+        return tag == "INSERT 0 1"
 
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -127,6 +129,16 @@ def _summarize_result(result: Any) -> dict:
     return {"kind": type(result).__name__}
 
 
+def _tool_call_id(task_id: str | None, name: str, idem_key: str) -> str:
+    """把 (task, tool, 语义键) 压成确定性的幂等指纹。
+
+    ★ 必须是确定性哈希而不是随机 UUID：中断续跑时「同一个逻辑调用」要算出
+    同一个 id 才能查到首次结果 —— 随机 id 重启后对不上号，幂等整个失效。
+    task_id 参与哈希 ⇒ 缓存天然按任务隔离，跨任务永不串。
+    """
+    return hashlib.sha256(f"{task_id or '-'}|{name}|{idem_key}".encode("utf-8")).hexdigest()
+
+
 class ToolDef:
     """工具定义 —— 将"做什么(handler)"和"如何描述"(schema)封装。
 
@@ -204,6 +216,12 @@ class MCPServer:
         # 这里刻意不 import AgentLogDAO —— mcp 层不该反向依赖 db 层，
         # 鸭子类型足够，测试时塞个假对象就能验审计。
         self._audit = audit
+        # 幂等存储：任何带 `async get(id) -> Any|None` / `async save(...) -> bool`
+        # 的对象（项目里是 ToolCallResultDAO）。同 audit 一样鸭子类型后置挂载。
+        self._idem = None
+        # 进程内同 key 在跑的执行任务：并发/重试同 key 共享一次执行，
+        # 不只是查表 —— 表只在执行**完成后**才有记录，in-flight 期查表是查空的。
+        self._inflight: dict[str, asyncio.Task] = {}
 
     def attach_audit(self, audit) -> None:
         """后置挂载审计出口。
@@ -213,6 +231,14 @@ class MCPServer:
         避免为了构造函数多传一层依赖。
         """
         self._audit = audit
+
+    def attach_idempotency(self, store) -> None:
+        """后置挂载幂等存储（项目里是 ToolCallResultDAO，同 attach_audit 理由）。
+
+        不挂 = invoke 的 idem_key 参数被忽略、行为与改动前完全一致 ——
+        幂等是**逐调用点选择**的（只有副作用工具传 idem_key），不是全局开关。
+        """
+        self._idem = store
 
     @property
     def settings(self):
@@ -272,6 +298,7 @@ class MCPServer:
         *,
         task_id: str | None = None,
         agent_name: str | None = None,
+        idem_key: str | None = None,
     ) -> dict:
         """执行工具调用（MCP tools/call 标准格式）。
 
@@ -301,7 +328,8 @@ class MCPServer:
         # 外部 MCP 调用和 Agent 进程内直调走的是同一套白名单/校验/审计。
         try:
             result = await self.invoke(
-                name, arguments, task_id=task_id, agent_name=agent_name
+                name, arguments, task_id=task_id, agent_name=agent_name,
+                idem_key=idem_key,
             )
         except ToolNotFound:
             return {
@@ -339,10 +367,12 @@ class MCPServer:
         *,
         task_id: str | None = None,
         agent_name: str | None = None,
+        idem_key: str | None = None,
     ) -> Any:
         """统一执行层 —— 所有工具调用的唯一实现路径。
 
-        【职责】白名单 → 参数校验 → 执行 → 审计，返回工具原生 dict/list。
+        【职责】白名单 → 参数校验 → （幂等回放）→ 执行 → 落结果 → 审计，
+        返回工具原生 dict/list。
         【与 call_tool 的分工】
             invoke    = 管控 + 原生结果（进程内 Agent 走这里）
             call_tool = MCP 协议编解码（content 数组 + JSON 字符串），内部调 invoke
@@ -355,6 +385,16 @@ class MCPServer:
 
         【审计口径】只记参数摘要不记原文；失败必记、成功也记 ——
         「调了但没成功」和「根本没调」必须能区分，否则轨迹评估无从谈起。
+
+        【幂等（2026-10-30）】idem_key 是调用方给的「逻辑调用」语义键
+        （如 f"search|{competitor}|{query}"），与 (task_id, tool_name) 一起
+        哈希成 tool_call_id：
+          命中结果日志表 / 进程内 in-flight → 回放首次结果，不重复副作用；
+          未命中 → 执行，成功后落表。
+        为什么只有副作用工具传 idem_key：embed/rerank 是纯计算，重跑无副作用，
+        传了反而把 MB 级向量塞进缓存表。⚠️ 只缓存成功结果 —— 失败可重试，
+        缓存失败等于把偶发故障钉死。⚠️ 调用方拿到回放结果时审计里
+        replayed=true，轨迹评估据此区分「真执行」与「回放」。
         """
         tool = self._tools.get(name)
         if tool is None:
@@ -373,6 +413,12 @@ class MCPServer:
             )
             raise
 
+        # ── 幂等层：不传 idem_key 或未挂存储 → 走原路径，行为零变化 ──
+        if idem_key is not None and self._idem is not None:
+            return await self._invoke_idempotent(
+                tool, arguments, idem_key, task_id, agent_name, started
+            )
+
         error: str | None = None
         result_summary: dict | None = None
         try:
@@ -390,6 +436,91 @@ class MCPServer:
                 round((time.perf_counter() - started) * 1000, 1),
                 error, result_summary,
             )
+
+    async def _invoke_idempotent(
+        self,
+        tool: ToolDef,
+        arguments: dict,
+        idem_key: str,
+        task_id: str | None,
+        agent_name: str | None,
+        started: float,
+    ) -> Any:
+        """带幂等的执行：查表回放 → 共享 in-flight → shield 执行 + 落结果。
+
+        ★ 执行体必须套 asyncio.shield：调用方超时 wait_for 掐断的是 shield 外层，
+          执行体继续跑完并落表 —— 于是「超时重试返回首次结果」成立：
+          重试同 key 查表即命中。不 shield 的话超时会连执行体一起取消，
+          表里永远没有记录，重试只会再次重复副作用。
+        ★ in-flight 表的清理在执行体 finally 里做，不在等待方做 ——
+          等待方超时先走，若由它清理，后来的同 key 调用查不到 in-flight
+          又查不到表（还没落库），会再起一次重复执行。
+        """
+        tc_id = _tool_call_id(task_id, tool.name, idem_key)
+        name = tool.name
+
+        # 1) 首次结果已落表 → 直接回放（覆盖：上次正常执行完、中断后续跑重放）
+        try:
+            cached = await self._idem.get(tc_id)
+        except Exception:
+            # 存储挂了不能阻断主流程：退化为直接执行（幂等失效一次，可用性优先）
+            logger.exception("幂等查询失败，退化为直接执行 tool=%r", name)
+            cached = None
+        if cached is not None:
+            await self._record(
+                name, arguments, task_id, agent_name,
+                round((time.perf_counter() - started) * 1000, 1),
+                None, {"replayed": True, **_summarize_result(cached)},
+            )
+            return cached
+
+        # 2) 进程内已有同 key 执行在跑（并发 / 快速重试）→ 共享它的结果
+        existing = self._inflight.get(tc_id)
+        if existing is not None:
+            return await asyncio.shield(existing)
+
+        # 3) 新执行：成功落表，异常不落表（可重试）
+        exec_task = asyncio.create_task(
+            self._exec_and_cache(tool, arguments, tc_id, task_id)
+        )
+        self._inflight[tc_id] = exec_task
+        error: str | None = None
+        result_summary: dict | None = None
+        try:
+            result = await asyncio.shield(exec_task)
+            result_summary = _summarize_result(result)
+            return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            await self._record(
+                name, arguments, task_id, agent_name,
+                round((time.perf_counter() - started) * 1000, 1),
+                error, result_summary,
+            )
+
+    async def _exec_and_cache(
+        self,
+        tool: ToolDef,
+        arguments: dict,
+        tc_id: str,
+        task_id: str | None,
+    ) -> Any:
+        """执行工具并把**成功**结果落幂等表。执行失败只上抛、不落表。"""
+        try:
+            result = await tool.handler(arguments)
+        finally:
+            self._inflight.pop(tc_id, None)
+        try:
+            await self._idem.save(
+                tc_id, tool.name, task_id, _digest_arguments(arguments), result
+            )
+        except Exception:
+            # 落表失败 ≈ 这次执行白缓存（重试会重跑一次），但不能让它炸掉主流程
+            logger.exception("幂等结果落库失败 tool=%r tc_id=%s…%s",
+                             tool.name, tc_id[:8], tc_id[-8:])
+        return result
 
     async def _record(
         self,

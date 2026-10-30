@@ -628,3 +628,19 @@ CREATE TABLE IF NOT EXISTS checkpoint_writes (
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
 );
 
+
+-- ============================================================
+-- 10. tool_call_results —— MCP 工具级幂等的结果日志
+-- ============================================================
+-- 【为什么主键不是随机 UUID】tool_call_id = sha256(task_id|tool_name|idem_key)，
+-- 是「逻辑调用」的确定性指纹：中断续跑/超时重试时，同一逻辑调用算出同一个 id，
+-- 才能查到首次结果并回放。随机 id 重启后对不上号，幂等失效。
+-- 【只缓存成功结果】失败不落表 —— 失败是可重试的，缓存失败等于把偶发故障钉死。
+CREATE TABLE IF NOT EXISTS tool_call_results (
+    tool_call_id  TEXT PRIMARY KEY,
+    tool_name     TEXT NOT NULL,
+    task_id       TEXT,
+    args_digest   JSONB,
+    result        JSONB NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);

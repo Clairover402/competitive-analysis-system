@@ -448,9 +448,12 @@ async def lifespan(app: FastAPI):
     # ── MCP Server + 连接池（全局单例）──
     # audit 注入：让 5 个工具（含绕过 call_tool 的 3 个检索工具）的每次调用
     # 都落 agent_logs，action='tool_call' —— 轨迹评估的 L2 数据源。
+    # 幂等存储注入：web_search / web_fetch 的 idem_key 调用命中即回放首次结果，
+    # 中断续跑不重复副作用（2026-10-30）。
     from src.mcp import create_mcp_server
-    from src.db.dao import AgentLogDAO
+    from src.db.dao import AgentLogDAO, ToolCallResultDAO
     mcp_server = create_mcp_server(settings, audit=AgentLogDAO(pool))
+    mcp_server.attach_idempotency(ToolCallResultDAO(pool))
     app.state.mcp_server = mcp_server
 
     # ── Pipeline 图（预编译，所有 Pipeline 任务复用）──

@@ -570,11 +570,14 @@ async def collector_agent(
             # 【2026-10-14】返回值带上 query —— 后续 URL 选取要按 query 轮转，
             #   必须知道每个候选来自哪条 query（否则还是会退回「先到先得」）。
             try:
+                # idem_key：搜索是纯语义键（竞品+关键词）→ 中断续跑/重试同 key
+                # 直接回放首次结果，不重复烧 Tavily 配额（2026-10-30 工具级幂等）。
                 results = await mcp_server.invoke(
                     "web_search",
                     {"query": query, "max_results": 10},
                     task_id=task_id,
                     agent_name="collector",
+                    idem_key=f"search|{competitor}|{query}",
                 )
                 return (competitor, query, results or [])
             except Exception as e:
@@ -836,12 +839,14 @@ async def collector_agent(
 
         async with semaphore:
             # 【2026-10-19】同 web_search：改走 invoke，拿原生 dict
+            # idem_key：按 URL 幂等 → 续跑不重复抓同一页面（2026-10-30）。
             try:
                 data = await mcp_server.invoke(
                     "web_fetch",
                     {"url": url, "max_chars": 15000},
                     task_id=task_id,
                     agent_name="collector",
+                    idem_key=f"fetch|{url}",
                 )
                 return (competitor, {
                     "url": url,

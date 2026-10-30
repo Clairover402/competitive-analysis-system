@@ -623,6 +623,8 @@ async def run_pipeline_task(
         settings = Settings()
         mcp_server = create_mcp_server(settings)
         pool = await create_pool(settings)
+        from src.db.dao import ToolCallResultDAO
+        mcp_server.attach_idempotency(ToolCallResultDAO(pool))
 
     try:
         graph = await build_pipeline_graph(mcp_server, pool)
