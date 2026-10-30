@@ -536,7 +536,11 @@ def _make_node_think(
 # §4 _make_node_act — act 节点闭包工厂
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_node_act(router: A2ARouter, log_dao: AgentLogDAO | None = None):
+def _make_node_act(
+    router: A2ARouter,
+    log_dao: AgentLogDAO | None = None,
+    limits: tuple[int, int] | None = None,
+):
     """创建 act 节点函数——注入 A2ARouter（+可选 log_dao 只用于强制结束留痕）。
 
     【L3 核心考点】act 为什么不需要 LLM？
@@ -557,10 +561,19 @@ def _make_node_act(router: A2ARouter, log_dao: AgentLogDAO | None = None):
 
     Args:
         router: 已注册 4 个 Agent 的 A2ARouter
+        log_dao: 可选，强制结束留痕
+        limits: (竞品上限, 维度上限)。None 时在构图时从 Settings 读一次
+            （不放在每次 act 里读：那是每轮一次 pydantic 实例化，纯浪费）
 
     Returns:
         async def node_act(state: SupervisorState) -> dict
     """
+    if limits is None:
+        from src.config import Settings
+
+        _s = Settings()
+        limits = (_s.max_competitors, _s.max_dimensions)
+    max_competitors, max_dimensions = limits
     async def node_act(state: SupervisorState) -> dict:
         """act 节点: 执行 LLM 决策，调用对应 Agent。
 
@@ -623,6 +636,27 @@ def _make_node_act(router: A2ARouter, log_dao: AgentLogDAO | None = None):
                 arguments["competitors"] = state.get("found_competitors", [])
             if "dimensions" not in arguments or not arguments["dimensions"]:
                 arguments["dimensions"] = state.get("dimensions", [])
+
+            # ─── 闸门：探索发现的竞品/维度也要守 4×4（2026-10-30）───
+            # 显式参数路径有 `_reject_oversized` 兜底（400），但 Supervisor 的竞品是
+            # LLM 在 round1 现场**推断**出来的，此前无人校验：实测 8 个跨领域任务
+            # 全部越界（5~8 个竞品），daac0b1c 7 个竞品铺 12 格 → 覆盖偏斜 0.000
+            # （有竞品一页都没抓到）、召回/精排 5.9→5.9（池子不够，精排没筛选）。
+            # ★ 为什么闸门在 act 而不在 classify：classify 时 competitors 还是空数组，
+            #   **派活给 collector 的那一刻**才是唯一一次真正决定"分析谁"的地方。
+            # ★ 为什么截断而不报错：supervisor 是探索模式，用户没点名竞品，
+            #   没有"砍哪个由用户决定"这回事；保留 LLM 的相关性排序取前 N。
+            for key, limit, label in (
+                ("competitors", max_competitors, "竞品"),
+                ("dimensions", max_dimensions, "维度"),
+            ):
+                values = arguments.get(key) or []
+                if len(values) > limit:
+                    logger.warning(
+                        "【规模闸门】%s %d 个超过上限 %d，截断保留前 %d：%s",
+                        label, len(values), limit, limit, values,
+                    )
+                    arguments[key] = values[:limit]
 
         # ─── 安全网：writer 的 analysis_results 强制从 state 注入 ───
         # 【2026-09-27 BUG修复】analysis_results 是 analyzer 已产出的确定性事实，

@@ -56,6 +56,10 @@ DEFAULT_MAX_ROUNDS = 10
 # 任务还在写日志时算出来的 termination 可能是假的 incomplete。
 SETTLE_MINUTES = 10
 
+# 抓取正文少于这个字符数算「没拿到正文」。与 tools_web 的 Jina 兜底判据同源
+# （那边是 cjk < 200 就重试一次），同一个「太少」的标准不要在两处各写一个数字。
+NEAR_EMPTY_CHARS = 200
+
 # 各 Agent action 的必填参数（来自 A2A AgentCard input_schema.required）。
 # 只用来判「键有没有丢」——参数值是摘要（如 "list(len=3)"），判不了空。
 #
@@ -253,15 +257,22 @@ def _termination_reason(trace: Trace) -> dict:
     return _metric("incomplete", "既没 finish 也没到上限，轨迹中断（可能进程被杀）")
 
 
-def _round_stats(trace: Trace) -> tuple[int, int] | None:
-    """(总轮次, 有效轮次)。无 think 日志返回 None（算不出来，不是 0）。
+def _round_stats(trace: Trace) -> tuple[int, int | None] | None:
+    """(总轮次, 有效轮次)。算不出来的那一项给 None，不给 0。
 
     有效 = 该轮有 observe、状态 completed、且 observation 非空
     （finish 轮和失败轮都不产生新业务状态）。
+
+    ★ 有 think 但零 observe 时，有效轮次返回 **None 而不是 0**：
+      observe 埋点 2026-10-19 才上线，此前 13 个 Supervisor 任务只有决策日志。
+      那批任务的「有效轮次」是没采到，不是「一轮都没生效」——记 0 会让总览把
+      埋点断层读成系统效率极低。总轮次仍能算，照常返回。
     """
     if not trace.thinks:
         return None
     rounds_used = max(t["round"] for t in trace.thinks)
+    if not trace.observes:
+        return rounds_used, None
     effective = {
         o["round"] for o in trace.observes
         if o["status"] == "completed" and o["observation"]
@@ -271,13 +282,42 @@ def _round_stats(trace: Trace) -> tuple[int, int] | None:
 
 
 def _round_efficiency(trace: Trace) -> dict:
-    """轮次效率 = 有效轮次 / 总轮次。"""
+    """轮次效率 = 有效轮次 / **可计轮次**。
+
+    【为什么分母不是「总轮次」（2026-10-30 改）】
+      finish 轮按定义不产生业务状态（think 决策结束 → act 短路 → observe 空）。
+      把它留在分母里，任何健康任务都恒等于 (n-1)/n：5 轮 0.800、6 轮 0.833、
+      10 轮 0.900 —— **指标测的是「结束在第几轮」，不是「每轮有没有白跑」**。
+      实测 2026-10-30 补跑的 8 个任务：7 个 0.800 + 1 个 0.833，一个失败轮都没有，
+      指标却在「波动」，这就是分母错了的样子。
+
+    【为什么不改成「有 tool_call 的轮次」】
+      writer / quality 两轮**根本没有 tool_call**：它们不做检索，只消费上游 state。
+      实测 50619e03：最后一条 tool_call 在 21:53:19，writer 的 think 在 21:53:23、
+      quality 在 21:54:09 —— 两轮之间一条工具日志都没有，但「写了报告」「评了分」
+      都真的发生了。用 tool_call 做判据会把这两个有产出的轮判成无效（5 轮任务掉到 0.4）。
+
+    【口径边界】
+      分母的分子判定都来自 observe 埋点：失败轮（status != completed）和
+      「observation 为空但没结束」的轮都会掉出分子 → 效率下降。所以它有分辨力，
+      只是**只在出问题时才动**；健康任务全是 1.000 是正确结果，不是没测到。
+    """
     stats = _round_stats(trace)
     if stats is None:
         return _metric("n/a", "无 think 日志")
     rounds_used, effective = stats
-    ratio = effective / rounds_used if rounds_used else 0.0
-    return _metric(round(ratio, 3), f"有效轮次 {effective} / 总轮次 {rounds_used}")
+    if effective is None:
+        return _metric("n/a", "无 observe 日志（埋点缺失，有效轮次算不出来）")
+
+    reason = _termination_reason(trace)["value"]
+    finish_rounds = 1 if reason == "finish" else 0
+    countable = rounds_used - finish_rounds
+    if countable <= 0:
+        return _metric("n/a", f"只有终止轮（{reason}），没有可计的业务轮次")
+
+    ratio = effective / countable
+    tail = "finish 轮不计" if finish_rounds else f"{reason}，全部轮次计入"
+    return _metric(round(ratio, 3), f"有效轮次 {effective} / 可计轮次 {countable}（{tail}）")
 
 
 def _illegal_transitions(trace: Trace) -> dict:
@@ -339,20 +379,31 @@ def _arg_completeness(trace: Trace) -> dict:
 
     checked = 0
     ok = 0
+    unlogged = 0
     missing: list[str] = []
     for item in trace.thinks:
         required = _REQUIRED_ARGS.get(item["agent"])
         if not required:
             continue
+        args = item.get("arguments") or {}
+        if not args:
+            # 该轮决策没有落 arguments —— 2026-10-19 前的 think 日志没有这个字段。
+            # 跳过而不是判缺键：否则「没埋点」会被算成「参数全丢」，得出 0% 的假警报。
+            unlogged += 1
+            continue
         checked += 1
-        absent = [k for k in required if k not in item["arguments"]]
+        absent = [k for k in required if k not in args]
         if absent:
             missing.append(f"第{item['round']}轮 {item['agent']} 缺 {absent}")
         else:
             ok += 1
 
     if not checked:
-        return _metric("n/a", "没有需要参数的决策轮")
+        note = (
+            f"{unlogged} 轮未落 arguments（埋点缺失）"
+            if unlogged else "没有需要参数的决策轮"
+        )
+        return _metric("n/a", note)
     return _metric(round(ok / checked, 3), "；".join(missing) if missing else f"{ok}/{checked} 轮键齐全")
 
 
@@ -423,8 +474,17 @@ def _empty_search_rate(trace: Trace) -> dict:
 def _fetch_buckets(trace: Trace) -> tuple[int, Counter[str]] | None:
     """(抓取次数, 失败分桶)。无 web_fetch 调用返回 None。
 
-    ⚠️ 只能分「抛异常」的失败；web_fetch 若以正常返回的形式带回错误
-    （如 dict 带 error 键），这里会算成成功。当前 tools_web 是抛异常的，口径成立。
+    【失败判据 = 抛异常 或 正文 < NEAR_EMPTY_CHARS（2026-10-30 改）】
+      ❌ 旧口径只看 `ok`。但 `tools_web.web_fetch` 遇 4xx/5xx **不抛异常**——
+         它把 `result["error"]="HTTP 403"` 塞进返回 dict 后正常返回，日志包装只记
+         `{"ok": true, "chars": 0}`。于是 403 被算成成功。
+      ★ 那句「当前 tools_web 是抛异常的，口径成立」的旧注释正是这个 bug 活下来的原因：
+        实现改了，注释没改，指标静默美化。
+      📊 实测（2026-10-30 补跑的 8 个 supervisor 任务）：web_fetch 返回 0 字符占
+         19%~60%（中位约 32%），同期指标报 0.000 —— 差 30 个百分点，方向是「美化」。
+
+    阈值 200 与 Jina Reader 兜底同源（那边判 `cjk < 200` 就认为没拿到正文）。
+    chars 缺失时不当失败：宁可漏报，也不能把「没记上」判成「失败」（同 n/a 纪律）。
     """
     fetches = _tools(trace, "web_fetch")
     if not fetches:
@@ -432,19 +492,27 @@ def _fetch_buckets(trace: Trace) -> tuple[int, Counter[str]] | None:
 
     buckets: Counter[str] = Counter()
     for item in fetches:
-        if item["ok"]:
+        if not item["ok"]:
+            err = (item["error"] or "").lower()
+            if "timeout" in err:
+                buckets["timeout"] += 1
+            elif "403" in err:
+                buckets["403"] += 1
+            elif "ssl" in err:
+                buckets["ssl"] += 1
+            elif "connect" in err:
+                buckets["连接失败"] += 1
+            else:
+                buckets["其他异常"] += 1
             continue
-        err = (item["error"] or "").lower()
-        if "timeout" in err:
-            buckets["timeout"] += 1
-        elif "403" in err:
-            buckets["403"] += 1
-        elif "ssl" in err:
-            buckets["ssl"] += 1
-        elif "connect" in err:
-            buckets["连接失败"] += 1
-        else:
-            buckets["其他"] += 1
+
+        chars = item.get("chars")
+        if chars is None:
+            continue                      # 无字符数字段 → 判不了，不算失败
+        if chars == 0:
+            buckets["空正文"] += 1          # 403/404/SPA 骨架：工具没报错，但一个字没拿到
+        elif chars < NEAR_EMPTY_CHARS:
+            buckets[f"近空<{NEAR_EMPTY_CHARS}字"] += 1
     return len(fetches), buckets
 
 
@@ -695,7 +763,12 @@ def l3_metrics(trace: Trace) -> dict[str, dict]:
 # v1 → v2：参数完整率不再把 writer/quality 计入（state 流转的参数不算「LLM 漏传」）。
 # v2 → v3：termination 新增 forced_finish / json_error 两类（依赖 act/think 新埋点）。
 # v3 → v4：新增 L3 检索侧 5 列（数据源 retrieval_snapshot，日志侧无变化）。
-METRICS_VERSION = 4
+# v4 → v5（2026-10-30）两处口径同时改，都会让老行不可直接比：
+#   ① fetch_fail_rate：判据从「只看 ok」改成「ok=False 或 chars<200」。
+#      旧算法下 403 被算成功（tools_web 不抛异常），实测 8 个任务里报 0.000 而真实约 32%。
+#   ② round_efficiency：分母从「总轮次」改成「可计轮次」（finish 轮退出分母）。
+#      旧算法下健康任务恒等于 (n-1)/n，看起来在波动其实测的是「结束在第几轮」。
+METRICS_VERSION = 5
 
 # 与 schema.sql 的 trajectory_metrics 列顺序一一对应（不含 task_id / computed_at）。
 _ROW_COLUMNS = (

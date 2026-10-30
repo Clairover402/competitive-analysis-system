@@ -175,6 +175,26 @@ def _competitors_from_state(final_state: dict) -> list[str]:
     return out
 
 
+def _merge_competitors(seed: list[str], discovered: list[str], cap: int) -> list[str]:
+    """seed ∪ discovered，去重后截断到 cap，**seed 优先**（2026-10-30）。
+
+    【为什么并集】用户 seed 了「飞书」、ReAct 又分析了「钉钉」，这是同一份报告里的
+      两家，两个名字都该能查回来 —— 覆盖写会丢掉 seed。
+
+    【为什么要 cap】`tasks.competitors` 的语义是"这份报告真的分析了谁"：
+      · supervisor 的 act 闸门把**派给 collector 的**竞品截到 max_competitors 个；
+      · 但并集会把 seed 加回来 —— seed 4 个 + 发现 4 个 = 8 个，而报告只覆盖 4 个。
+      · 多出来的名字会让 lookup 把这份报告挂到**没分析过**的竞品上（`?| ` 是 OR 匹配），
+        用户点开发现报告里根本没这家。
+    【为什么 seed 优先】seed 是用户点名的，探索发现的排后面。
+    """
+    merged = _dedupe([str(c).strip() for c in seed if str(c).strip()] + list(discovered))
+    if len(merged) > cap:
+        logger.info("竞品回写截断 %d → %d（上限 %d）：%s", len(merged), cap, cap, merged[cap:])
+        merged = merged[:cap]
+    return merged
+
+
 def _reject_duplicates(
     competitors: list[str] | None,
     dimensions: list[str] | None,
@@ -813,9 +833,11 @@ async def _execute_task(
         if route_type == "supervisor":
             discovered = _competitors_from_state(final_state)
             if discovered:
-                merged = _dedupe(
-                    [str(c).strip() for c in enriched_task["competitors"] if str(c).strip()]
-                    + discovered
+                # ⚠️ settings 走 app.state 兜底：单测里的假 request 没有 lifespan，
+                #    没有 state.settings —— 不能因为读不到配置就让回写整段失败。
+                _st = getattr(request.app.state, "settings", None) or Settings()
+                merged = _merge_competitors(
+                    enriched_task["competitors"], discovered, _st.max_competitors
                 )
                 try:
                     await task_dao.update_competitors(task_id_str, merged)
