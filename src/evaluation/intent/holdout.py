@@ -12,7 +12,7 @@
 
 用法
 ────
-    python -m src.evaluation.intent_holdout
+    python -m src.evaluation.intent.holdout
 
 口径
 ────

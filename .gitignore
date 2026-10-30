@@ -41,8 +41,9 @@ phase_report/
 # 评估 run 归档（ragas_core 每次跑自动落 run.json/summary.md/TREND.md，不入库）
 evaluation_runs/
 
-# golden 的 run 版是派生产物（每次评估都会重写），数据集本体与 trend.json 才入库
-src/evaluation/golden/intent_run_*.jsonl
+# intent 评估的每轮明细是派生产物（每次评估都会重写），data/ 下的
+# golden_v1.jsonl（数据集本体）与 trend.json（指标序列）才入库
+src/evaluation/intent/data/runs/
 
 # 手绘图导出产物（源 HTML 与 PNG 都是派生物，随时可重画）
 generated-images/

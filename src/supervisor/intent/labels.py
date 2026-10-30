@@ -18,7 +18,7 @@
     `UNSUPPORTED_EXEMPLARS`——它们仍然是 L2 的识别目标，只是命中的结果是
     **明确拒绝**（unknown + 固定说明），而不是执行一个半成品能力。
   ★ EXEMPLARS 是 L2 的"训练集"，改它等于改模型行为：加句子必须重跑
-    `python -m src.evaluation.intent_golden`，并过 `intent_holdout` 验收集。
+    `python -m src.evaluation.intent.golden`，并过 `intent_holdout` 验收集。
 【读法】
   改判据先改这里 → 跑评估 → 再看 classifier 的阈值要不要动。
 """

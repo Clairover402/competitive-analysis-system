@@ -34,9 +34,9 @@ L2 每句一次 embedding；L3 只跑下沉样本，一次 LLM 调用（deepseek
 149 句 `--concurrency 6` 实测约 13 分钟（并发 4 更慢，旧的"1~2 分钟"早不准了）。
 
 用法:
-    python -m src.evaluation.intent_eval
-    python -m src.evaluation.intent_eval --no-l3     # 只看 L2 接管与下沉量
-    python -m src.evaluation.intent_eval --sweep     # 顺带扫 floor × margin
+    python -m src.evaluation.intent.runner
+    python -m src.evaluation.intent.runner --no-l3     # 只看 L2 接管与下沉量
+    python -m src.evaluation.intent.runner --sweep     # 顺带扫 floor × margin
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from src.evaluation.intent_cases import CASES, Case, stats
+from src.evaluation.intent.cases import CASES, Case, stats
 from src.supervisor.intent import (
     INTENTS,
     l2_semantic,
@@ -59,7 +59,7 @@ from src.supervisor.intent import (
 
 logger = logging.getLogger(__name__)
 
-_OUT_DIR = Path(__file__).parent / "evaluation_runs"
+_OUT_DIR = Path(__file__).parent / "data" / "runs"
 _ALL_INTENTS = (*INTENTS, "unknown")
 
 # ★ 这两个意图必须抽竞品，所以走到 L3 是"顺路"（判完还得再调一次 LLM 抽槽位）；

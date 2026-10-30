@@ -20,9 +20,9 @@
 主指标只在 `ambiguous=False` 的样本上算。
 
 【怎么用】
-  python -m src.evaluation.intent_eval             # L2 全量 + L3 只跑下沉样本
-  python -m src.evaluation.intent_eval --no-l3      # 只看 L2 接管率与下沉量
-  python -m src.evaluation.intent_eval --sweep      # 顺带扫 floor × margin
+  python -m src.evaluation.intent.runner             # L2 全量 + L3 只跑下沉样本
+  python -m src.evaluation.intent.runner --no-l3      # 只看 L2 接管率与下沉量
+  python -m src.evaluation.intent.runner --sweep      # 顺带扫 floor × margin
 """
 
 from __future__ import annotations

@@ -5,11 +5,13 @@
   做   发版前显式跑 Golden 回归，回答「这次改动让分数变好还是变坏」。
   不做 自动跟着生产任务跑、判门禁、上报 Prometheus——评估是离线工具。
 
-【模块结构（四个文件）】
+【模块结构】
   golden_dataset.py  10 条 Golden Case + 分维度 / 分 cell 标准答案
   llm_factory.py     judge / embeddings / RunConfig 构造 + reference 三级解析
   ragas_core.py      四指标唯一实现 + CLI（跑分、出分数表、默认留痕）
   run_archive.py     run 归档 / compare / trend（纯读 JSON，零 LLM 成本）
+  intent/            意图识别评估：题库 / 跑分 / 金标准 / 验收集，产物全在 data/
+                     （原先四个文件平铺在本目录，2026-10-30 归到子包，见其 __init__）
 
   ⚠️ 刻意不做 re-export：直接 `from src.evaluation.ragas_core import ...`。
      旧版 `__init__.py` 把符号全导出一遍，导致任何 import 都会把 ragas /

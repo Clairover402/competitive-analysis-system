@@ -150,5 +150,23 @@
       "unknown": 0.9
     },
     "l3_enabled": true
+  },
+  {
+    "ts": "2026-10-30T08:58:46",
+    "total": 149,
+    "accuracy": 1.0,
+    "n": 25,
+    "L1": 0.0,
+    "L2": 0.1678,
+    "L3": 0.0,
+    "L4": 0.0,
+    "early_exit_rate": 0.1678,
+    "recall": {
+      "analysis": 1.0,
+      "lookup": 1.0,
+      "trace": 1.0,
+      "unknown": 1.0
+    },
+    "l3_enabled": false
   }
 ]
