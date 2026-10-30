@@ -425,14 +425,16 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     -- ── M3 semantic 事实的时效字段（2026-10-27）────────────────────────
     -- observed_at: 这条结论**什么时候被观测到**（= 证据抓取时间），不是入库时间。
     --   两者会差几分钟到几天（任务跑完才写记忆、或从历史报告回填），
-    --   而 verify 问的是"多久没核对过"→ 必须用观测时间，用 created_at 会少算。
+    --   而"这份数据多久没核对过"问的是后者 → 必须用观测时间，用 created_at 会少算。
     observed_at     TIMESTAMPTZ,
     ttl_days        INT,
                         -- 保鲜期档位（定价30/功能60/融资90/组织180），NULL = 不判过期
                         -- ⚠️ 这是**写入时的默认档位**，不是最终判定值：
-                        --    用户在偏好 ttl_overrides 里改过档位后，verify 读取时
-                        --    会重算覆盖（见 query_handlers._effective_ttl）。
-                        --    直接 SELECT 这一列得到的可能是旧档位。
+                        --    用户在偏好 ttl_overrides 里改过档位后，只在**写入**时
+                        --    按偏好定档（见 query_handlers.ttl_days_for）。
+                        -- ⚠️ 2026-10-30 verify 下线后本列**只写不读**：
+                        --    "这条数据是否过期"已不作为能力提供，
+                        --    SELECT 它看到的只是写入那一刻的档位快照。
     status          VARCHAR(16) NOT NULL DEFAULT 'active',
                         -- active / superseded（被新观测取代）/ expired（超保鲜期）
     superseded_by   UUID REFERENCES agent_memories(id) ON DELETE SET NULL,

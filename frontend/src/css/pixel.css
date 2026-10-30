@@ -197,12 +197,7 @@ body.scanlines::after { content: ''; position: fixed; top: 0; left: 0; right: 0;
 .pixel-chat-opt.ghost { color: var(--pixel-light); }
 .pixel-chat-opt.ghost:hover { color: var(--pixel-black); background: var(--pixel-mid); }
 
-/* ── 偏好弹层（事实保鲜期的唯一 UI 入口） ─────────────────────────────
-   为什么单独做一个弹层而不是塞进输入框：保鲜期是 键→天数 的映射，
-   不是一句话能说清的偏好。用一行自由文本猜「定价 30 天」的格式，
-   解析失败时用户不知道错在哪。 */
-.pixel-modal-mask { position: fixed; inset: 0; background: rgba(10,10,10,0.82); display: flex; align-items: center; justify-content: center; z-index: 500; padding: 20px; }
-.pixel-modal { width: min(560px, 100%); max-height: 84vh; overflow-y: auto; padding: 22px; }
-.pixel-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-.pixel-modal-title { font-family: var(--pixel-font); font-size: 14px; letter-spacing: 3px; color: var(--pixel-green); }
+/* 行内小按钮（历史报告翻页，见 dashboard.js renderPager）：
+   比 .pixel-btn 矮一档，否则默认 padding 会把「上一页 / 第 2/3 页 / 下一页」撑成两行。 */
 .pixel-btn-compact { padding: 8px 14px; font-size: 12px; letter-spacing: 1px; }
+
