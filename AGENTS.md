@@ -4,7 +4,7 @@
 
 ## 我是谁
 
-LangGraph 1.0 竞品分析系统。四个Agent（Collector/Analyzer/Writer/Quality）+ LLM实体提取后代码路由分流。
+LangGraph 1.0 竞品分析系统。四个Agent（Collector/Analyzer/Writer/Quality）+ 双入口：结构化 API 直接给参数，对话入口靠意图漏斗分流。
 
 ## 必须先读
 
@@ -25,15 +25,20 @@ LangGraph 1.0 竞品分析系统。四个Agent（Collector/Analyzer/Writer/Quali
 ## 架构
 
 ```
-请求 → LLM实体提取(competitors/dimensions) → 代码路由
-  ├── 竞品≥2且维度明确 → Pipeline: Collector→Analyzer→Writer→Quality, score<70 回退
-  └── 参数不足或模糊 → Supervisor+ReAct: think→act→observe, MAX_ROUNDS=10
+请求进入
+  ├── POST /api/tasks   竞品+维度已给 ────┐
+  └── POST /api/chat    一句话 → 意图漏斗 ┤（只有 analysis 出口并入下行）
+                                          ▼
+                     IntentRouter.classify(llm_parsed)   ← 零 LLM，只判"参数够不够启动"
+                       ├── 参数齐全   → Pipeline: Collector→Analyzer→Writer→Quality, score<70 回退
+                       └── 参数不足/模糊 → Supervisor+ReAct: think→act→observe, MAX_ROUNDS=10
 ```
 
 - MCP: Agent工具箱 (`src/mcp/`)
 - A2A: Agent间P2P通信 (`src/supervisor/a2a.py`)
 - Harness: 五层安全（白名单/参数校验/频控/PII阻断/审计） (`src/harness/`)
-- 记忆: 短期(Checkpoint→PG) / 摘要(memory_summaries, 递增+10轮全量合并校准) / 长期(agent_memories+pgvector, 五步检索+时间衰减) (`src/memory/`)
+- 意图漏斗: L2向量→L3 LLM→L4澄清 (`src/supervisor/intent/`)，详见下面「意图识别要点」
+- 记忆: 短期(Checkpoint→PG) / 摘要(memory_summaries, 递增+10轮全量合并校准) / 语义事实(agent_memories+pgvector, **只写不读**) / 偏好(preferences, inject 键进 writer prompt) (`src/memory/`)
 
 ## 编码规范
 
@@ -77,12 +82,28 @@ D:\AAAProgram` Files\Python\python\python.exe script.py
 
 **pgvector**：`CREATE EXTENSION IF NOT EXISTS vector;`
 
+## 意图识别要点
+
+`src/supervisor/intent/`：L2 向量最近邻 → L3 LLM → L4 澄清反问。**没有 L1**（2026-10-29 删）。
+
+- ★ **L2 是最近邻，删一个类别会把它的话术「吸」给邻居**：删 verify 时必须把它的原型句
+  降级成 `UNSUPPORTED_EXEMPLARS`（拒绝类，仍参与排名但返回 unknown + 专用说明），
+  否则「这结论还能信吗」会被 trace 接走、答成"引用了哪些网站"——不报错，只答非所问。
+- ⚠️ 删类别时**同步删 `clarify.CLARIFY_CHOICES` 里的选项**，否则用户点完选项下一轮
+  又判回 unknown，死循环反问。
+- **两个 `classify` 不是一回事**：`supervisor/router.IntentRouter.classify(llm_parsed)`
+  判「参数够不够启动分析」（零 LLM，`/api/tasks` 与 `/api/chat` 都走）；
+  `intent/classifier.classify()` 判「问题属于哪一类」（漏斗）。别合并。
+- **槽位**：`fill_slots` 按 label 抽，值池匹配优先、LLM 只兜底。闸门方向相反——
+  读取侧（lookup/trace）池外 `gate_llm` 丢弃，写入侧（analysis）`normalize_to_pool` 只改名不丢弃。
+- 没有 keyword 槽位（2026-10-30 删）：它曾拿维度名去 `claim ILIKE` 正文，漏 11 条真定价。
+  维度走 `e.dimension = ANY($3)` 精确列。
+
 ## 记忆系统要点
 
-长期记忆检索SQL（一次完成，不返Python二次排序）：
-```sql
-ORDER BY (1.0-(embedding<=>$1))*importance*POWER(0.5,EXTRACT(DAY FROM NOW()-created_at)/half_life_days) DESC
-```
+**★ 语义事实（`agent_memories`）只写不读**：verify 下线后读取路径（`retrieve` /
+`_effective_ttl`）一并删除，零调用方；写入仍在跑（`ttl_days_for` 定档 + 同 subject
+余弦 ≥0.90 取代）。看到这张表别以为有检索能力——**列还在 ≠ 能力还在**。
 
 摘要Prompt必须限≤500字 · 所有记忆操作带 `user_id` · 软删除，不物理删
 

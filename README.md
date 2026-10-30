@@ -1,7 +1,8 @@
 # AI驱动的竞品分析多Agent协作系统
 
 > **Competitive Analysis Multi-Agent System**  
-> 四个专职Agent + Supervisor双模架构，Pipeline确定性执行 + ReAct自适应探索
+> 四个专职Agent + Supervisor双模架构，Pipeline确定性执行 + ReAct自适应探索  
+> 双入口：结构化 API 直接给参数；对话入口一句话，由意图漏斗判断是分析、查历史还是查证据
 
 [![状态](https://img.shields.io/badge/状态-已完成-brightgreen)](./DEVELOPMENT_PLAN.md)
 [![Python](https://img.shields.io/badge/Python-3.13-blue)](https://www.python.org/)
@@ -30,31 +31,69 @@
 ## 系统架构
 
 ```
-                         请求进入
-                            │
-                   ┌────────▼────────┐
-                   │  IntentRouter   │  ← LLM实体提取 → 代码路由决策
-                   └───┬────────┬────┘
-                       │        │
-           竞品列表明确  │        │  开放性探索
-           (~80% 流量)  │        │  (~20% 流量)
-                       │        │
-              ┌────────▼───┐ ┌──▼──────────────┐
-              │  Pipeline  │ │ Supervisor+ReAct │
-              │            │ │                  │
-              │ Collector  │ │ _think()→_act()  │
-              │   ↓        │ │ →_observe()      │
-              │ Analyzer   │ │                  │
-              │   ↓        │ │ A2A 通信         │
-              │ Writer     │ │ MCP 工具调用     │
-              │   ↓        │ │ Harness 安全壳   │
-              │ Quality    │ │                  │
-              │   ↓        │ │ MAX_ROUNDS=10    │
-              │ score≥70?  │ │                  │
-              │ YES→完成    │ │                  │
-              │ NO→回退重写  │ │                  │
-              └────────────┘ └──────────────────┘
+                       请求进入
+                          │
+        ┌─────────────────┴──────────────────┐
+        │                                    │
+  POST /api/tasks                     POST /api/chat
+  竞品 + 维度（参数明确）               一句话（自由文本）
+        │                                    │
+        │                          ┌─────────▼──────────┐
+        │                          │      意图漏斗       │
+        │                          │ L2 向量最近邻       │
+        │                          │ L3 LLM（仅兜底）    │
+        │                          │ L4 澄清反问         │
+        │                          └────┬───────────────┘
+        │                               │ 四个出口：
+        │                               │  analysis / lookup / trace / 拒绝类
+        │                               │  （只有 analysis 往下走，其余当场作答）
+        ▼                               │
+  ┌─────────────────┐                   │
+  │  IntentRouter   │ ◄─────────────────┘
+  │    （零 LLM）    │
+  │ 只判：参数够不够？│
+  └──┬───────────┬──┘
+     │           │
+  参数齐全    参数不足
+     │           │
+┌────▼─────┐ ┌───▼──────────────┐
+│ Pipeline │ │ Supervisor+ReAct │
+│Collector │ │ _think→_act→     │
+│    ↓     │ │ _observe         │
+│Analyzer  │ │ A2A 通信         │
+│    ↓     │ │ MCP 工具调用     │
+│ Writer   │ │ Harness 安全壳   │
+│    ↓     │ │ MAX_ROUNDS=10    │
+│ Quality  │ └──────────────────┘
+│ score≥70?│
+│ NO→重写   │
+└──────────┘
 ```
+
+意图漏斗本身是三层，且**只在 L2 判不准时才花钱**：
+
+```
+一句话
+  │
+  ▼
+┌──────────────────────────────────────────────────┐
+│ L2  向量最近邻（零 LLM，接管大部分明确问法）        │
+└──┬───────────────────────────────────────────┬───┘
+   │ 命中且 top1-top2 差距够大                   │ 差距太小 / 类别不明
+   │                                            ▼
+   │                                  ┌──────────────────┐
+   │                                  │ L3  LLM 分类      │
+   │                                  └──┬───────────────┘
+   │                                     │ 仍判不出
+   │                                     ▼
+   │                            L4 澄清反问（给可点选项）
+   ▼
+analysis / lookup / trace / 拒绝类
+```
+
+> 没有 L1。历史上第一层是"正则/关键词"兜底，2026-10-29 删除——
+> 它的输入是"参数够不够启动分析"，而它要回答的是"这是哪一类问题"，
+> 参数是分析对象、不是意图，所以那层在生产路径上永不成立。
 
 ### 三层架构
 
@@ -69,8 +108,13 @@
 | 层 | 存储 | 用途 |
 |----|------|------|
 | **短期记忆** | LangGraph Checkpoint → PostgreSQL | 当前会话完整对话历史 |
-| **摘要记忆** | `memory_summaries` 表 | 跨轮压缩要点，递增+全量合并校准 |
-| **长期记忆** | `agent_memories` 表 + pgvector | 用户偏好、历史决策、领域知识（时间衰减） |
+| **摘要记忆** | `memory_summaries` 表 | 跨轮压缩要点，递增 + 每 10 轮全量合并校准 |
+| **语义事实** | `agent_memories` 表 + pgvector | 从报告抽出的结论：观测时间、来源 URL、取代链、保鲜期档位 |
+| **用户偏好** | `preferences` 表 | `inject=True` 的键注入 writer prompt |
+
+> 语义事实目前**只写不读**。唯一需要它的意图（"这条数据现在还准吗"）已作为
+> 不提供的产品能力下线，读取口随之删除；写入仍在跑，因为它是以后做时效判定的原料。
+> 判据记在代码里：**列还在 ≠ 能力还在**——`SELECT ttl_days` 拿到的只是写入那刻的快照。
 
 ---
 
@@ -120,22 +164,32 @@ python -m src.main
 ### 使用示例
 
 ```bash
-# 提交竞品分析任务
-curl -X POST http://localhost:8000/api/analyze \
+# ① 结构化入口：直接给竞品与维度，返回 202 + task_id
+curl -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "competitors": ["飞书", "钉钉", "企业微信"],
     "dimensions": ["定价", "功能", "用户体验", "生态"]
   }'
 
-# SSE 实时查看进度
-curl -N http://localhost:8000/api/analyze/{task_id}/stream
+# ② 对话入口：一句话，由意图漏斗决定要做什么
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "对比一下飞书和钉钉的定价"}'
+#   → analysis：复用 ① 的整条链路（已抽好的槽位用 prefill 带进去，不再重复调模型）
+#   → lookup / trace：直接返回结果
+#   → 意图不明：返回 type=clarify，带可点选项
+
+# ③ SSE 实时查看进度
+curl -N http://localhost:8000/api/tasks/{task_id}/stream
 ```
 
 > **规模上限：单次任务最多 4 个竞品 × 4 个维度**（`MAX_COMPETITORS` / `MAX_DIMENSIONS`，
-> 见 `src/config.py`）。超出时入口直接返回 400，并在提示里写明「实际几个 / 上限几个」。
-> 不是成本考虑——检索是单任务混池取 60 条 chunk，竞品一多配额被摊薄，
+> 见 `src/config.py`）。超出时返回 400，并在提示里写明「实际几个 / 上限几个」；
+> **两条入口都校验**——显式参数查一次，对话抽出来的参数再查一次。
+> 不是成本考虑——检索是单任务混池取 60 条 chunk，竞品一多，每格分到的配额被摊薄，
 > 会出现某竞品在某维度整块「数据不足」，而最终报告看起来仍是完整的。
+> 调上限要同步调大 `VECTOR_SEARCH_TOP_K`（每竞品至少留 15 条）。
 
 ---
 
@@ -155,8 +209,8 @@ competitive-analysis-system/
 │   ├── mcp/                    # MCP 工具层（web_search, web_fetch, embed, rerank）
 │   ├── agents/                 # 4 个专职 Agent + System Prompts
 │   ├── pipeline/               # Pipeline 编排（StateGraph + Checkpoint）
-│   ├── supervisor/             # Supervisor + A2A + IntentRouter
-│   ├── memory/                 # 记忆系统（短期/摘要/长期/冲突/遗忘）
+│   ├── supervisor/             # Supervisor + A2A + IntentRouter + intent/（意图漏斗）
+│   ├── memory/                 # 记忆系统（短期/摘要/语义事实/偏好/冲突/遗忘）
 │   ├── harness/                # 安全壳（五层检查 + 审计）
 │   ├── api/                    # FastAPI 路由 + SSE + 限流
 │   ├── observability/          # 日志 + Prometheus 指标
@@ -199,8 +253,10 @@ competitive-analysis-system/
 
 ## 关键设计决策
 
-- **双模架构**：LLM 提取实体 → 代码路由决策——确定性任务 80% 走 Pipeline（快、稳、可预期），开放性探索 20% 走 Supervisor+ReAct（灵活、自适应）
-- **LLM提取实体+代码路由**：LLM 负责语义理解和实体提取（competitors/dimensions），代码根据结构化规则判断路径。路由规则变了不动 prompt，改一行代码上线
+- **双模架构**：确定性任务走 Pipeline（快、稳、可预期），开放性探索走 Supervisor+ReAct（灵活、自适应）。分流的判据是"参数够不够启动"，由 `IntentRouter` 零 LLM 判断——**"够不够启动"是能算出来的，不该再付一次模型调用**
+- **推断与匹配分开**：`/api/chat` 要判断"这是哪一类问题"（只能推断，走向量最近邻 + LLM 兜底）；`/api/tasks` 收到的请求参数已经齐了（无需判断）。所以 `IntentRouter` 不是意图识别，是参数校验——两者共用一个类，判的却是两件事
+- **参数抽取以值池为锚**：竞品与维度先拿库里的真实取值做匹配（零 LLM），词表覆盖不了的才交给 LLM 兜底。读取侧（查历史 / 查证据）池外一律丢弃——编造的名字本来就查不到；写入侧（发起分析）池外必须放行——用户比库更早知道新竞品
+- **"不提供"要明说，不能装作答了**：核实数据时效（"这价格现在还准吗"）不是本系统能力，这类问题会收到明确说明 + 指到证据溯源，而不是拿一份旧报告冒充答案
 - **PostgreSQL 一体存储**：业务数据、向量、Checkpoint、记忆、日志全部存 PostgreSQL，不引入 Redis/ES/向量数据库
 - **质检回退循环**：Writer → Quality，score<70 时回退重写，直到通过或达到重试上限
 - **全链路异步**：FastAPI + asyncpg + httpx，无同步阻塞
