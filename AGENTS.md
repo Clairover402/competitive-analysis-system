@@ -94,8 +94,9 @@ D:\AAAProgram` Files\Python\python\python.exe script.py
 - **两个 `classify` 不是一回事**：`supervisor/router.IntentRouter.classify(llm_parsed)`
   判「参数够不够启动分析」（零 LLM，`/api/tasks` 与 `/api/chat` 都走）；
   `intent/classifier.classify()` 判「问题属于哪一类」（漏斗）。别合并。
-- **槽位**：`fill_slots` 按 label 抽，值池匹配优先、LLM 只兜底。闸门方向相反——
-  读取侧（lookup/trace）池外 `gate_llm` 丢弃，写入侧（analysis）`normalize_to_pool` 只改名不丢弃。
+- **槽位**：`fill_slots` 按 label 抽，值池匹配优先、LLM 只兜底。值池只用于**改写法**：
+  `gate_llm` / `normalize_to_pool` 都只改名、不丢弃（池外值原样下推）。⚠️ 读取侧尤其不能丢——
+  空槽在 SQL 里等于"不限竞品"（`$2 IS NULL`），会把最近 N 条无关任务当答案，且响应里看不出来。
 - 没有 keyword 槽位（2026-10-30 删）：它曾拿维度名去 `claim ILIKE` 正文，漏 11 条真定价。
   维度走 `e.dimension = ANY($3)` 精确列。
 
