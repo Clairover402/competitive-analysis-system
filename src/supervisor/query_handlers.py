@@ -49,6 +49,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -590,16 +592,33 @@ async def lookup_reports(
     else:
         page = None
 
+    t0 = time.perf_counter()
     rows = await pool.fetch(_LOOKUP_SQL, user_id, competitors, limit, skip)
     # 库里的真实总数（窗口函数给的），用来把"另有 N 条"说准。
     # 空结果时无从得知，留 None 让 describe_tasks 退回窗口内计数。
     total = rows[0].get("total") if rows else None
+    # ★ 一次查询一行日志，不打 items：条件是排障入口（竞品/维度有没有被抽歪），
+    #   首条 task_id 是核对"念的到底是哪一次"的唯一凭据 —— 回落锚点写错那次
+    #   （把 GitHub Copilot 的定价念给无关任务）正是靠这两个字段才定位得到的。
+    logger.info(
+        "lookup 查询 user=%s 竞品=%s 维度=%s limit=%s skip=%s → %d 条 total=%s "
+        "首条=%s 耗时=%.1fms",
+        str(user_id)[:8], competitors or "（不限）", dims or "（不限）",
+        limit, skip, len(rows), total,
+        str(rows[0]["task_id"])[:8] if rows else "-",
+        (time.perf_counter() - t0) * 1000,
+    )
     if not rows:
         # ⚠️ OFFSET 越界时一行都不返回，窗口函数算好的 total 也就拿不到 ——
         #    窗口函数是"每行带上总数"，没有行就没有总数。这里补问一次。
         #    分页把这个路径从"罕见"变成了"翻到末页就会走"，所以必须准。
         counted = await pool.fetch(_COUNT_TASKS_SQL, user_id, competitors)
         total = counted[0]["n"] if counted else None
+        # 「翻过头了」和「本来就没有」在响应里长得一模一样，只有这条日志能分开。
+        logger.info(
+            "lookup OFFSET 越界（skip=%s 无返回行），补 count 得 total=%s",
+            skip, total,
+        )
 
     items = []
     for row in rows:
@@ -636,6 +655,26 @@ async def lookup_reports(
                 #   `_pick_facts` 会把它当"非对象"整批丢掉（踩过，静默空）。
                 fallback_rows = await pool.fetch(_FACT_BY_SUBJECT_SQL, user_id, scope, dims, 6)
                 head["facts"] = _pick_facts([dict(r) for r in fallback_rows], dims)
+                # 回落是"这次任务没提炼出可念的结论"的补丁，命中几条直接决定
+                # 用户是看到答案还是看到"有这份报告但没内容"，必须留痕。
+                logger.info(
+                    "lookup 首条自身无 fact，回落同竞品事实 scope=%s 维度=%s → %d 条",
+                    scope, dims or "（不限）", len(head["facts"]),
+                )
+            else:
+                # 这条不是异常，是"刻意不回落"：锚点缺失时宁可少念，也不念别家的。
+                logger.info(
+                    "lookup 首条未记录竞品，跳过 fact 回落 task=%s",
+                    str(head["task_id"])[:8],
+                )
+        if head["fact_count"] == 0:
+            # 任务提炼了 0 条事实 = writer 侧的 fact 落库断了，不是查询的问题。
+            # 带上"回落后几条"才不会被误读成"这次回答是空的"——回落补上时用户
+            # 明明看到了结论，只报"缺失"会让人以为白跑一趟。
+            logger.warning(
+                "lookup 首条任务自身未提炼 fact（上游缺失）task=%s status=%s 回落后=%d 条",
+                str(head["task_id"])[:8], head["status"], len(head["facts"]),
+            )
         for fact in head["facts"]:
             fact.setdefault("source_task_id", head["task_id"])
             fact.setdefault("source_title", head["title"])
@@ -705,7 +744,23 @@ async def trace_evidence(
     """
     competitors = [c for c in (competitors or []) if str(c).strip()] or None
     dimensions = [d for d in (dimensions or []) if str(d).strip()] or None
+    t0 = time.perf_counter()
     rows = await pool.fetch(_TRACE_SQL, user_id, competitors, dimensions, limit)
+
+    # 窗口函数在 LIMIT 之前算，所以 total 是"符合条件的一共几条"，不是本次返回几条
+    total = rows[0]["total"] if rows else 0
+    logger.info(
+        "trace 查询 user=%s 竞品=%s 维度=%s limit=%s → %d 条 total=%d 耗时=%.1fms",
+        str(user_id)[:8], competitors or "（不限）", dimensions or "（不限）",
+        limit, len(rows), total, (time.perf_counter() - t0) * 1000,
+    )
+    if not rows:
+        # 0 条只有两种成因：库里确实没有，或竞品名对不上（「企微」≠「企业微信」）。
+        # 后者在响应里和"真的没分析过"长得一模一样，只能靠这条日志留证据。
+        logger.info(
+            "trace 无匹配证据 竞品=%s 维度=%s —— 若该竞品确实分析过，先查名称与库内是否一致",
+            competitors or "（不限）", dimensions or "（不限）",
+        )
 
     items = [{
         "claim": row["claim"],
@@ -720,8 +775,16 @@ async def trace_evidence(
         "competitors": _as_list(row["competitors"]),
     } for row in rows]
 
-    # 窗口函数在 LIMIT 之前算，所以 total 是"符合条件的一共几条"，不是本次返回几条
-    total = rows[0]["total"] if rows else 0
+    # ★ 竞品分布是 trace 最该盯的指标：过滤失效时**行数看起来完全正常**，
+    #   只是列表里悄悄混进了没选的竞品。证据归属错（`7b52c9f` 修的那种）
+    #   在响应里表现为"多念了一条"，从条数看不出来，只有分布能一眼看出。
+    if rows:
+        dist = Counter(row["competitor"] for row in rows)
+        logger.info(
+            "trace 竞品分布 %s%s",
+            ", ".join(f"{k or '未标注'}×{v}" for k, v in dist.most_common(4)),
+            " …（还有更多）" if len(dist) > 4 else "",
+        )
 
     if not items:
         # 空结果要说明是哪个条件没命中 —— 只说"没有找到"，用户不知道该改什么去重试

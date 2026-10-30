@@ -1289,6 +1289,16 @@ async def chat(
         dimension_pool=pool_dims,
     )
 
+    # ★ 一行交代三件事：判成了什么、在哪一层定的、槽位抽成什么。
+    #   三条意图的错法各不相同（lookup 念错任务 / trace 掺进别家证据 / analysis
+    #   竞品被抽空），但都能从这一行反推；margin 留着是为了回答"这句为什么下沉到 L3"。
+    #   结果条数不在这里打——handler 那边每次查询都有一行，别重复。
+    logger.info(
+        "chat 意图=%s 层=%s margin=%.2f 问法=%r → 竞品=%s 维度=%s",
+        decision.intent, decision.layer, decision.margin, body.message[:40],
+        slots.competitors or "（空）", slots.dimensions or "（空）",
+    )
+
     # ── analysis：复用 /api/tasks 的整条链路 ──
     if decision.intent == "analysis":
         # 竞品可能重复出现，先归一 —— 否则 _reject_duplicates 会把它当用户输入报 400
@@ -1338,6 +1348,10 @@ async def chat(
         # 序数（上上次 / 前两次 / 全部）由规则抽，不占 LLM —— 封闭词表能穷举，
         # 且 L2 收走 lookup 时走不到 L3，只能在这里抽。
         ordv = parse_ordinal(body.message) or {}
+        # 序数抽错是**静默**的：抽不出就退成 skip=0，于是"上上次"被当成"最近一次"
+        # 答出去，响应里看不出任何异常。这条日志是唯一能事后对账的地方。
+        if ordv:
+            logger.info("lookup 序数解析 问法=%r → %s", body.message[:40], ordv)
         if ordv.get("unsupported"):
             # 识别到了但做不了。这比答成"最近一次"好：那是自信地答错。
             data = {
@@ -1369,6 +1383,9 @@ async def chat(
         # 竞品和维度都是多值下推：问「飞书和钉钉的功能和定价」四个值一次带下去。
         # 不再有 keyword —— 它本来就是维度名，改走 `e.dimension = ANY($3)`。
         if not competitors and not slots.dimensions:
+            # 意图判对了、槽位却全空 —— 这是 L3 抽失败的典型形态。它和"查了但没数据"
+            # 在响应里都是"没找到"，日志必须能把两者分开，否则排障时无从下手。
+            logger.info("trace 无锚点（竞品与维度皆空），返回引导而非查全库")
             # ★ 一个锚点都没有时**不能**退回"列全部证据"：259 条里挑最近 10 条，
             #   用户看到的是混着各家各维度的一堆结论，既不是他要的、又看不出被降级了。
             #   这里明说没听出来，比静默列全更有用（也覆盖 LLM 挂了返回空槽的情形）。
