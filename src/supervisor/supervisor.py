@@ -827,10 +827,22 @@ def _make_node_observe(
 
         updates: dict = {}
         trace_obs = {}
+        # ★ 本轮是否**真的产出了新业务状态** —— 与 status 正交的第二个信号。
+        # 【为什么需要它（2026-10-30）】
+        #   status 只反映「调度有没有异常」：failed 全部来源只有两处（占位符竞品
+        #   拦截、"待探索"安全网；router.send_task 抛异常）。而「collector 拿到 0 页」
+        #   「analyzer 一个维度都没分析出来」这类**业务级失败**，status 仍是 completed，
+        #   只体现在 observation 文案里 —— 轨迹指标因此全盲。
+        #   实测全库 observe 86 条，status 100% completed、0 条 failed ⇒
+        #   失败轮占比恒 0 → 观察响应性恒 n/a → 轮次效率把空转轮算成有效、恒 1.000。
+        #   ⚠️ 不能直接把这类情况改成 status="failed"：那会撞上下面「failed 不更新
+        #   业务字段」的主流程分支，改变 merge 行为。所以另开一个布尔字段。
+        business_noop = False
 
         # ─── 步骤②: 失败路径 — 只记日志，不更新业务字段 ───
         if status == "failed":
             logger.warning("Agent %s 执行失败（业务字段不更新）", agent_name)
+            business_noop = True
             trace_obs = {
                 "round": current_round,
                 "observation": f"{agent_name} failed",
@@ -852,6 +864,7 @@ def _make_node_observe(
                         "⚠️ Collector 返回空数据: %d竞品 0chunk — 视为采集失败",
                         len(found),
                     )
+                    business_noop = True      # ← 业务级空转：调度成功，但一页都没拿到
                     trace_obs = {
                         "round": current_round,
                         "observation": (
@@ -875,6 +888,8 @@ def _make_node_observe(
                 updates["analysis_results"] = result
                 dims = list(result.keys()) if result else []
                 logger.info("分析完成: %d 个维度", len(dims))
+                if not dims:
+                    business_noop = True  # ← 一个维度都没出结论，等于没分析
                 trace_obs = {
                     "round": current_round,
                     "observation": f"analyzed {len(dims)} dimensions",
@@ -894,6 +909,8 @@ def _make_node_observe(
                 # 重写次数 +1（用于防止无限重写）
                 updates["rewrite_count"] = state.get("rewrite_count", 0) + 1
                 logger.info("报告生成完成（质量评分已重置，待重新质检）")
+                if not updates["report_content"]:
+                    business_noop = True  # ← 空报告：状态重置了，但没有产出
                 trace_obs = {
                     "round": current_round,
                     "observation": "report rewritten, quality reset",
@@ -961,6 +978,17 @@ def _make_node_observe(
         # 为什么不能只靠 reasoning_trace：那个列表只活在内存里，
         # 任务结束就没了；轨迹评估要能事后按 task_id 重建
         # 「第几轮想了什么 → 调了谁 → 结果如何」的完整链路。
+        #
+        # effective（2026-10-30 新增）：本轮是否真的产出了新业务状态。
+        # 判据 = 调度成功 ∧ 有 observation ∧ 没有业务级空转 ∧ 不是终止轮。
+        # 三个轨迹指标（失败轮占比 / 观察响应性 / 轮次效率）改读它，
+        # 因为 status 只覆盖「调度异常」，覆盖不到「拿到 0 页」这类业务空转。
+        effective = (
+            status == "completed"
+            and agent_name not in ("finish", "")
+            and bool(trace_obs.get("observation"))
+            and not business_noop
+        )
         if log_dao is not None:
             try:
                 await log_dao.log(
@@ -971,6 +999,7 @@ def _make_node_observe(
                         "round": current_round,
                         "agent": agent_name,
                         "status": status,
+                        "effective": effective,
                     },
                     response={"observation": trace_obs.get("observation", "")},
                 )

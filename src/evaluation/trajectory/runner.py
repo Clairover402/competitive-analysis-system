@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import statistics
 import sys
 from collections import Counter
@@ -184,6 +185,9 @@ def build_trace(task_id: str, rows: list[dict]) -> Trace:
                 "round": _round_of(request),
                 "agent": request.get("agent") or "",
                 "status": request.get("status") or "",
+                # effective 是 2026-10-30 新增字段：本轮有没有真的产出业务状态。
+                # 旧日志没有这个键 → None，由 _effective_flag 走回退判据。
+                "effective": request.get("effective"),
                 "observation": response.get("observation") or "",
                 "ts": row.get("created_at"),
             })
@@ -257,28 +261,85 @@ def _termination_reason(trace: Trace) -> dict:
     return _metric("incomplete", "既没 finish 也没到上限，轨迹中断（可能进程被杀）")
 
 
-def _round_stats(trace: Trace) -> tuple[int, int | None] | None:
-    """(总轮次, 有效轮次)。算不出来的那一项给 None，不给 0。
+def _effective_flag(observe: dict) -> bool | None:
+    """单轮是否产出了业务状态（None = 判不了）。
 
-    有效 = 该轮有 observe、状态 completed、且 observation 非空
-    （finish 轮和失败轮都不产生新业务状态）。
+    【两级判据（2026-10-30）】
+      ① 新埋点有 `effective` 布尔字段 → 直接读。它在 observe 节点里由
+         「调度成功 ∧ 有 observation ∧ 没有业务级空转 ∧ 不是终止轮」算出。
+      ② 旧埋点（2026-10-30 前无该字段）→ 退回 status + observation 非空。
+         ⚠️ 这条回退**看不见业务级空转**：collector 拿到 0 页时 status 仍是
+         completed。全库 observe 86 条 status 100% completed、0 条 failed ——
+         正因为如此，新埋点必须显式加字段，不能靠 status 推断。
+    """
+    raw = observe.get("effective")
+    if isinstance(raw, bool):
+        return raw
+    if observe.get("status") != "completed":
+        return False
+    return bool(observe.get("observation"))
 
-    ★ 有 think 但零 observe 时，有效轮次返回 **None 而不是 0**：
-      observe 埋点 2026-10-19 才上线，此前 13 个 Supervisor 任务只有决策日志。
-      那批任务的「有效轮次」是没采到，不是「一轮都没生效」——记 0 会让总览把
-      埋点断层读成系统效率极低。总轮次仍能算，照常返回。
+
+def _round_accounting(trace: Trace) -> dict | None:
+    """按轮统计：总轮次 / 可计轮次 / 有效轮次 / 无效明细。三项 L1 指标共用。
+
+    【可计轮次 = 总轮次 − 终止轮】
+      finish 轮按定义不产生业务状态（think 决策结束 → act 短路 → observe 空）。
+      留在分母里，任何健康任务都恒等于 (n-1)/n：5 轮 0.800、6 轮 0.833 ——
+      指标测的其实是「结束在第几轮」，不是「每轮有没有白跑」。
+
+    【为什么把三份统计合成一个函数】
+      失败轮 / 观察响应性 / 轮次效率原本各算各的，2026-10-30 发现它们全挂在
+      status 上因而全部失效。口径分散在三处时，改判据必有一处漏改，而漏改的
+      后果是**数字错但不报错**。
+
+    【effective=None 的语义】
+      有 think 但零 observe（2026-10-19 埋点上线前的任务）：有效轮次是「没采到」
+      不是「一轮都没生效」，返回 None 给上层降级成 n/a，不记 0。
     """
     if not trace.thinks:
         return None
-    rounds_used = max(t["round"] for t in trace.thinks)
+
+    rounds = sorted({t["round"] for t in trace.thinks if t["round"]})
+    total = rounds[-1] if rounds else 0
+    reason = _termination_reason(trace)["value"]
+    finish_round = total if reason == "finish" else None
+    countable = [r for r in rounds if r != finish_round]
+
     if not trace.observes:
-        return rounds_used, None
-    effective = {
-        o["round"] for o in trace.observes
-        if o["status"] == "completed" and o["observation"]
+        return {
+            "total": total, "countable": len(countable), "reason": reason,
+            "finish_round": finish_round, "effective": None,
+            "noop": [], "unlogged": True,
+        }
+
+    obs_by_round = {o["round"]: o for o in trace.observes}
+    effective_rounds: set[int] = set()
+    noop: list[tuple[int, str]] = []
+    for rnd in countable:
+        ob = obs_by_round.get(rnd)
+        if ob is None:
+            noop.append((rnd, "无 observe 记录"))
+        elif _effective_flag(ob):
+            effective_rounds.add(rnd)
+        elif ob.get("status") != "completed":
+            noop.append((rnd, f"调度失败({ob.get('status')})"))
+        else:
+            noop.append((rnd, "业务空转"))
+
+    return {
+        "total": total, "countable": len(countable), "reason": reason,
+        "finish_round": finish_round, "effective": len(effective_rounds),
+        "noop": noop, "unlogged": False,
     }
-    effective &= {t["round"] for t in trace.thinks}
-    return rounds_used, len(effective)
+
+
+def _round_stats(trace: Trace) -> tuple[int, int | None] | None:
+    """(总轮次, 有效轮次) —— to_row 落库只要这两个数，沿用旧签名。"""
+    acc = _round_accounting(trace)
+    if acc is None:
+        return None
+    return acc["total"], acc["effective"]
 
 
 def _round_efficiency(trace: Trace) -> dict:
@@ -291,33 +352,32 @@ def _round_efficiency(trace: Trace) -> dict:
       实测 2026-10-30 补跑的 8 个任务：7 个 0.800 + 1 个 0.833，一个失败轮都没有，
       指标却在「波动」，这就是分母错了的样子。
 
-    【为什么不改成「有 tool_call 的轮次」】
+    【为什么分子不是「有 tool_call 的轮次」】
       writer / quality 两轮**根本没有 tool_call**：它们不做检索，只消费上游 state。
       实测 50619e03：最后一条 tool_call 在 21:53:19，writer 的 think 在 21:53:23、
       quality 在 21:54:09 —— 两轮之间一条工具日志都没有，但「写了报告」「评了分」
-      都真的发生了。用 tool_call 做判据会把这两个有产出的轮判成无效（5 轮任务掉到 0.4）。
+      都真的发生了。用 tool_call 做判据会把这两个有产出的轮判成无效（5 轮掉到 0.4）。
 
-    【口径边界】
-      分母的分子判定都来自 observe 埋点：失败轮（status != completed）和
-      「observation 为空但没结束」的轮都会掉出分子 → 效率下降。所以它有分辨力，
-      只是**只在出问题时才动**；健康任务全是 1.000 是正确结果，不是没测到。
+    【分子读 effective，不读 status（2026-10-30 第二次修）】
+      status 只覆盖调度异常。实测全库 observe 86 条 100% completed、0 条 failed，
+      于是分子恒等于分母、指标恒 1.000 —— 而同期抓取失败率中位 53%，说明确实
+      有大量空转轮。现在 effective 把「collector 0 页 / analyzer 0 维度 /
+      writer 空报告」判成无效，分子才第一次动得起来。
     """
-    stats = _round_stats(trace)
-    if stats is None:
+    acc = _round_accounting(trace)
+    if acc is None:
         return _metric("n/a", "无 think 日志")
-    rounds_used, effective = stats
-    if effective is None:
+    if acc["effective"] is None:
         return _metric("n/a", "无 observe 日志（埋点缺失，有效轮次算不出来）")
+    if acc["countable"] <= 0:
+        return _metric("n/a", f"只有终止轮（{acc['reason']}），没有可计的业务轮次")
 
-    reason = _termination_reason(trace)["value"]
-    finish_rounds = 1 if reason == "finish" else 0
-    countable = rounds_used - finish_rounds
-    if countable <= 0:
-        return _metric("n/a", f"只有终止轮（{reason}），没有可计的业务轮次")
-
-    ratio = effective / countable
-    tail = "finish 轮不计" if finish_rounds else f"{reason}，全部轮次计入"
-    return _metric(round(ratio, 3), f"有效轮次 {effective} / 可计轮次 {countable}（{tail}）")
+    ratio = acc["effective"] / acc["countable"]
+    tail = "finish 轮不计" if acc["finish_round"] else f"{acc['reason']}，全部轮次计入"
+    return _metric(
+        round(ratio, 3),
+        f"有效轮次 {acc['effective']} / 可计轮次 {acc['countable']}（{tail}）",
+    )
 
 
 def _illegal_transitions(trace: Trace) -> dict:
@@ -339,40 +399,62 @@ def _illegal_transitions(trace: Trace) -> dict:
     return _metric(len(violations), "；".join(violations) if violations else "无")
 
 
-def _repeat_actions(trace: Trace) -> dict:
-    """连续两轮 (agent, 参数摘要) 完全相同 = 原地打转。"""
-    if len(trace.thinks) < 2:
-        return _metric("n/a", "决策轮次不足 2")
-
-    repeats = 0
-    for prev, cur in zip(trace.thinks, trace.thinks[1:]):
-        same_agent = prev["agent"] == cur["agent"]
-        same_args = json.dumps(prev["arguments"], sort_keys=True, default=str) == \
-            json.dumps(cur["arguments"], sort_keys=True, default=str)
-        if same_agent and same_args and cur["agent"] != "finish":
-            repeats += 1
-
-    total = len(trace.thinks) - 1
-    return _metric(round(repeats / total, 3), f"{repeats} 次连续重复 / {total} 次相邻比较")
-
-
 def _failed_rounds(trace: Trace) -> dict:
-    """失败轮占比。"""
-    if not trace.thinks:
+    """无效轮占比 = 没产出业务状态的业务轮 / 可计轮次。
+
+    【改读 effective（2026-10-30）】
+      原实现只数 `status == "failed"`，而全库 observe 86 条 status 100% completed
+      ⇒ 恒 0。status 覆盖不到的业务级空转（collector 0 页、analyzer 0 维度、
+      writer 空报告）现在由 effective 兜住，note 里按原因分开写，方便区分
+      「调度坏了」和「调度成功但没料」——这两种的处理方式完全不同。
+    """
+    acc = _round_accounting(trace)
+    if acc is None:
         return _metric("n/a", "无 think 日志")
-    rounds_used = max(t["round"] for t in trace.thinks)
-    failed = sum(1 for o in trace.observes if o["status"] == "failed")
-    return _metric(
-        round(failed / rounds_used, 3) if rounds_used else 0.0,
-        f"失败 {failed} 轮 / 总 {rounds_used} 轮",
-    )
+    if acc["effective"] is None:
+        return _metric("n/a", "无 observe 日志（埋点缺失，无效轮算不出来）")
+    if acc["countable"] <= 0:
+        return _metric("n/a", "没有可计的业务轮次")
+
+    rate = len(acc["noop"]) / acc["countable"]
+    if not acc["noop"]:
+        return _metric(round(rate, 3), f"无无效轮 / 可计 {acc['countable']} 轮")
+    detail = "；".join(f"第{r}轮 {why}" for r, why in acc["noop"][:4])
+    more = f" 等 {len(acc['noop'])} 轮" if len(acc["noop"]) > 4 else ""
+    return _metric(round(rate, 3), f"{detail}{more} / 可计 {acc['countable']} 轮")
+
+
+def _arg_value_empty(value: Any) -> bool:
+    """参数值是不是空的 —— 能识别落库摘要里的 list(len=0) / dict(len=0)。
+
+    日志里的参数值是 `_digest_decision_args` 压过的摘要，不是原生结构：
+      · 列表 → `"list(len=3)"`      · 字典 → `"dict(len=2)"`
+      · 字符串 → 原文（>80 字符截断并附 `…(len=N)`）
+    所以「键在但值是空列表」这件事**能从摘要里读出来** —— 原注释说「判不了空」
+    只对了一半：判不了空，但判得了 len=0。
+    """
+    if value is None or value == "" or value == [] or value == {}:
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        for prefix in ("list(len=", "dict(len="):
+            if text.startswith(prefix) and text.endswith(")"):
+                try:
+                    return int(text[len(prefix):-1]) == 0
+                except ValueError:
+                    return False
+    return False
 
 
 def _arg_completeness(trace: Trace) -> dict:
-    """必填参数有没有丢键。
+    """必填参数有没有丢键、或者键在但值为空。
 
-    只判键存在：日志里参数是摘要（"list(len=3)"），空列表与有内容无法区分。
-    要判空需要把长度也落进摘要，属后续增强。
+    【判据（2026-10-30 加强）】
+      ① 键缺失 → 计入不完整（原判据）
+      ② 键在但值是空列表/空字典 → **也计入不完整**（新判据）
+      只判 ① 时，LLM 输出 `{"competitors": [], "dimensions": ["定价"]}` 会被判成
+      100% 完整，而 collector 拿到空竞品列表必然空转 —— 这正是「参数完整率恒 1.0」
+      和「采集 0 页」能同时存在的缝。摘要里已有 len=N，判 ② 不需要改埋点。
     """
     if not trace.thinks:
         return _metric("n/a", "无 think 日志")
@@ -393,8 +475,11 @@ def _arg_completeness(trace: Trace) -> dict:
             continue
         checked += 1
         absent = [k for k in required if k not in args]
+        blank = [k for k in required if k in args and _arg_value_empty(args[k])]
         if absent:
             missing.append(f"第{item['round']}轮 {item['agent']} 缺 {absent}")
+        elif blank:
+            missing.append(f"第{item['round']}轮 {item['agent']} 空值 {blank}")
         else:
             ok += 1
 
@@ -404,44 +489,52 @@ def _arg_completeness(trace: Trace) -> dict:
             if unlogged else "没有需要参数的决策轮"
         )
         return _metric("n/a", note)
-    return _metric(round(ok / checked, 3), "；".join(missing) if missing else f"{ok}/{checked} 轮键齐全")
+    return _metric(round(ok / checked, 3), "；".join(missing) if missing else f"{ok}/{checked} 轮键齐全且非空")
 
 
 def _observation_responsiveness(trace: Trace) -> dict:
-    """失败之后有没有换策略 —— 「看到失败仍原样重试」是死循环的典型前兆。"""
-    by_round = {t["round"]: t for t in trace.thinks}
-    failed_rounds = [o["round"] for o in trace.observes if o["status"] == "failed"]
-    if not failed_rounds:
-        return _metric("n/a", "无失败轮")
+    """无效轮之后有没有换策略 —— 「看到失败仍原样重试」是死循环的典型前兆。
 
+    无效轮的口径与失败轮占比一致（读 effective），两者必须同源：否则会出现
+    「失败轮 3 个」但「观察响应性：无失败轮」这种自相矛盾的报告。
+    """
+    acc = _round_accounting(trace)
+    if acc is None or acc["effective"] is None:
+        return _metric("n/a", "无 observe 日志")
+    noop_rounds = [r for r, _ in acc["noop"]]
+    if not noop_rounds:
+        return _metric("n/a", "无无效轮")
+
+    by_round = {t["round"]: t for t in trace.thinks}
     blind_retry = 0
-    for rnd in failed_rounds:
+    comparable = 0
+    for rnd in noop_rounds:
         cur = by_round.get(rnd)
         nxt = by_round.get(rnd + 1)
         if cur is None or nxt is None:
             continue
+        comparable += 1
         same_agent = cur["agent"] == nxt["agent"]
         same_args = json.dumps(cur["arguments"], sort_keys=True, default=str) == \
             json.dumps(nxt["arguments"], sort_keys=True, default=str)
         if same_agent and same_args:
             blind_retry += 1
 
-    comparable = len([r for r in failed_rounds if r + 1 in by_round])
     if not comparable:
-        return _metric("n/a", "失败轮后面没有下一轮决策")
+        return _metric("n/a", "无效轮后面没有下一轮决策")
     return _metric(
         round(blind_retry / comparable, 3),
         f"{blind_retry} 次原样重试 / {comparable} 次可比对",
     )
 
 
+
 def l1_metrics(trace: Trace) -> dict[str, dict]:
-    """L1 编排级七项。"""
+    """L1 编排级六项。"""
     return {
         "终止原因": _termination_reason(trace),
         "轮次效率": _round_efficiency(trace),
         "非法转移": _illegal_transitions(trace),
-        "重复动作率": _repeat_actions(trace),
         "失败轮占比": _failed_rounds(trace),
         "参数完整率": _arg_completeness(trace),
         "观察响应性": _observation_responsiveness(trace),
@@ -559,6 +652,42 @@ def _embedding_calls(trace: Trace) -> dict:
     )
 
 
+def _dimension_count(trace: Trace) -> int | None:
+    """从 think 的 arguments 摘要里读维度数（形如 "list(len=2)"）。
+
+    为什么不从 tasks.dimensions 读：那是**请求时**的维度；探索模式下维度由
+    Supervisor 中途补全，两者可能不同。think 里的才是本轮真正派下去的那份。
+    """
+    for item in trace.thinks:
+        if item["agent"] not in ("collector", "analyzer"):
+            continue
+        value = (item.get("arguments") or {}).get("dimensions")
+        if isinstance(value, str):
+            match = re.fullmatch(r"list\(len=(\d+)\)", value.strip())
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def _embed_coverage(trace: Trace) -> dict:
+    """embed 覆盖率 = embed_query 次数 / 维度数。
+
+    analyzer 每个维度要 embed 一次 query 去检索。次数 < 维度数 ⇒ 有维度根本没做
+    向量检索（结论多半来自模型自述而非材料）。大于 1 是重试，note 里说明。
+    实测（2026-10-30 十个 supervisor 任务）：两条维度却常只 embed 2 次，
+    原先只写在「embedding 调用」的 note 文字里，没有数值，统计时看不见。
+    """
+    queries = len(_tools(trace, "embed_query"))
+    dims = _dimension_count(trace)
+    if not dims:
+        return _metric("n/a", "读不到维度数（think 未落 dimensions 摘要）")
+    if queries == 0:
+        return _metric(0.0, f"0 次 embed_query / 维度 {dims} 个 —— 完全没做向量检索")
+    ratio = round(queries / dims, 3)
+    extra = f"（{queries} 次其中含重试）" if queries > dims else ""
+    return _metric(ratio, f"embed_query {queries} 次 / 维度 {dims} 个{extra}")
+
+
 def _rerank_discrimination(trace: Trace) -> dict:
     """精排区分度：top1 - median 越小，说明分数越挤、越分不开。"""
     reranks = _tools(trace, "rerank")
@@ -641,13 +770,14 @@ def _rerank_filtering(trace: Trace) -> dict:
 
 
 def l2_metrics(trace: Trace) -> dict[str, dict]:
-    """L2 工具级指标（能算的 8 项；跨维度重复率、每竞品覆盖度需更多埋点，暂缺）。"""
+    """L2 工具级指标（9 项）。"""
     return {
         "工具调用次数": _tool_counts(trace),
         "搜索空结果率": _empty_search_rate(trace),
         "抓取失败率": _fetch_failure_buckets(trace),
         "重复抓取率": _duplicate_fetch_rate(trace),
         "embedding 调用": _embedding_calls(trace),
+        "embed 覆盖率": _embed_coverage(trace),
         "rerank 区分度": _rerank_discrimination(trace),
         "精排筛除情况": _rerank_filtering(trace),
         "采集漏斗": _funnel(trace),
@@ -720,10 +850,18 @@ def compute_retrieval(
         distinct = len(set().union(*per_dimension.values()))
         dup = round(1 - distinct / reuse_total, 3) if reuse_total else None
 
+    recall_mean = statistics.fmean(recalled)
+    rerank_mean = statistics.fmean(reranked)
+    # 精排筛除率：精排到底筛掉了多少。实测 2026-10-30 十个任务全是 0.0
+    # （召回 4.6 → 精排 4.6，一条没筛），因为候选池 ≤ top_k=15，rerank 只排序不筛选。
+    # 只看 recall_avg / rerank_avg 两个相等的数，人眼看不出来"没问题"还是"没生效"。
+    rerank_drop = round(1 - rerank_mean / recall_mean, 3) if recall_mean else None
+
     return {
         "snapshots": count,
-        "recall_avg": round(statistics.fmean(recalled), 1),
-        "rerank_avg": round(statistics.fmean(reranked), 1),
+        "recall_avg": round(recall_mean, 1),
+        "rerank_avg": round(rerank_mean, 1),
+        "rerank_drop": rerank_drop,
         "coverage_skew": skew,
         "cross_dim_dup": dup,
     }
@@ -735,15 +873,16 @@ def l3_metrics(trace: Trace) -> dict[str, dict]:
     if not data:
         return {
             "检索快照": _metric("n/a", "无 retrieval_snapshot（任务未走到分析阶段）"),
-            "召回 / 精排": _metric("n/a", "无快照"),
+            "精排筛除率": _metric("n/a", "无快照"),
             "竞品覆盖偏斜": _metric("n/a", "无快照"),
             "跨维度重复率": _metric("n/a", "无快照"),
         }
     return {
         "检索快照": _metric(data["snapshots"], "竞品×维度级快照行数"),
-        "召回 / 精排": _metric(
-            f"{data['recall_avg']} → {data['rerank_avg']}",
-            "每格平均召回条数 → 精排后保留条数（差值过大说明候选池被竞品过滤掉大半）",
+        "精排筛除率": _metric(
+            data["rerank_drop"] if data.get("rerank_drop") is not None else "n/a",
+            f"召回 {data['recall_avg']} → 精排 {data['rerank_avg']}；"
+            "为 0 说明一条都没筛掉（候选池 ≤ top_k，精排只排序不筛选）",
         ),
         "竞品覆盖偏斜": _metric(
             data["coverage_skew"] if data["coverage_skew"] is not None else "n/a",
@@ -768,7 +907,15 @@ def l3_metrics(trace: Trace) -> dict[str, dict]:
 #      旧算法下 403 被算成功（tools_web 不抛异常），实测 8 个任务里报 0.000 而真实约 32%。
 #   ② round_efficiency：分母从「总轮次」改成「可计轮次」（finish 轮退出分母）。
 #      旧算法下健康任务恒等于 (n-1)/n，看起来在波动其实测的是「结束在第几轮」。
-METRICS_VERSION = 5
+# v5 → v6（2026-10-30）失败轮 / 观察响应性 / 轮次效率改读 observe.effective：
+#   原来三项都读 status，而 status 只覆盖调度异常（failed 仅来自占位符竞品拦截与
+#   send_task 抛异常）。实测全库 observe 86 条 status 100% completed ⇒
+#   失败轮恒 0、观察响应性恒 n/a、轮次效率把采集 0 页的轮算成有效、恒 1.000。
+#   同期抓取失败率中位 53%，说明空转轮大量存在，只是指标看不见。
+#   同时：删「重复动作率」（4 agent 各跑一次的 DAG 上结构恒 0，与好坏无关）；
+#   「参数完整率」增判空值（摘要里已有 len=N）；新增「embed 覆盖率」「精排筛除率」。
+#   ⚠️ v6 与 v5 的三项指标不可直接比：v5 是常数，不是基线。
+METRICS_VERSION = 6
 
 # 与 schema.sql 的 trajectory_metrics 列顺序一一对应（不含 task_id / computed_at）。
 _ROW_COLUMNS = (
@@ -777,9 +924,10 @@ _ROW_COLUMNS = (
     "observation_responsiveness", "tool_calls", "search_empty_rate", "fetch_fail_rate",
     "fetch_fail_detail", "dup_fetch_rate", "embed_calls", "embed_chunks",
     "rerank_gap", "rerank_under_k", "funnel_search", "funnel_fetch",
-    "funnel_pages", "funnel_chunks",
+    "funnel_pages", "funnel_chunks", "embed_coverage",
     # L3：检索侧（来源 retrieval_snapshot，不是 agent_logs）
-    "retrieval_cells", "recall_avg", "rerank_avg", "coverage_skew", "cross_dim_dup",
+    "retrieval_cells", "recall_avg", "rerank_avg", "rerank_drop_rate",
+    "coverage_skew", "cross_dim_dup",
 )
 
 _UPSERT_SQL = (
@@ -824,7 +972,11 @@ def to_row(trace: Trace) -> dict:
         "rounds": rounds[0] if rounds else None,
         "rounds_effective": rounds[1] if rounds else None,
         "illegal_transitions": _num(l1["非法转移"]),
-        "repeat_rate": _num(l1["重复动作率"]),
+        # repeat_rate 列保留但恒写 None（2026-10-30）：重复动作率已删——它判的是
+        # 「相邻两轮 agent+参数相同」，而 Supervisor 是 4 个 agent 各跑一次的 DAG，
+        # 相邻两轮几乎不可能是同一个 agent ⇒ 结构上恒 0，与系统好坏无关。
+        # 工具级重复另有 dup_fetch_rate 在测。列留着是为了不动 Grafana 面板。
+        "repeat_rate": None,
         "failed_round_rate": _num(l1["失败轮占比"]),
         "arg_completeness": _num(l1["参数完整率"]),
         "observation_responsiveness": _num(l1["观察响应性"]),
@@ -835,6 +987,7 @@ def to_row(trace: Trace) -> dict:
         "dup_fetch_rate": _num(l2["重复抓取率"]),
         "embed_calls": (embed[0] + embed[1]) if embed else None,
         "embed_chunks": embed[2] if embed else None,
+        "embed_coverage": _num(l2["embed 覆盖率"]),
         "rerank_gap": _num(l2["rerank 区分度"]),
         "rerank_under_k": _rerank_under_k(trace),
         "funnel_search": funnel[0] if funnel else None,
@@ -846,6 +999,9 @@ def to_row(trace: Trace) -> dict:
         "retrieval_cells": trace.retrieval["snapshots"] if trace.retrieval else None,
         "recall_avg": trace.retrieval["recall_avg"] if trace.retrieval else None,
         "rerank_avg": trace.retrieval["rerank_avg"] if trace.retrieval else None,
+        "rerank_drop_rate": (
+            trace.retrieval.get("rerank_drop") if trace.retrieval else None
+        ),
         "coverage_skew": trace.retrieval["coverage_skew"] if trace.retrieval else None,
         "cross_dim_dup": trace.retrieval["cross_dim_dup"] if trace.retrieval else None,
     }
@@ -971,8 +1127,11 @@ def _anomalies(trace: Trace, l1: dict, l2: dict, l3: dict | None = None) -> list
         out.append(f"非正常结束：{l1['终止原因']['value']}（{l1['终止原因']['note']}）")
     if l1["非法转移"]["value"] not in (0, "n/a"):
         out.append(f"调度顺序违规：{l1['非法转移']['note']}")
-    if isinstance(l1["重复动作率"]["value"], float) and l1["重复动作率"]["value"] >= 0.3:
-        out.append(f"连续重复动作占比 {l1['重复动作率']['value']}，疑似原地打转")
+    if isinstance(l1["失败轮占比"]["value"], float) and l1["失败轮占比"]["value"] > 0:
+        out.append(
+            f"无效轮占 {l1['失败轮占比']['value']}（{l1['失败轮占比']['note']}）"
+            "—— 调度成功但没有业务产出"
+        )
     if isinstance(l1["观察响应性"]["value"], float) and l1["观察响应性"]["value"] >= 0.5:
         out.append(f"失败后原样重试占 {l1['观察响应性']['value']}，未换策略")
     if isinstance(l2["搜索空结果率"]["value"], float) and l2["搜索空结果率"]["value"] >= 0.3:

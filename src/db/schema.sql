@@ -333,6 +333,7 @@ CREATE TABLE IF NOT EXISTS trajectory_metrics (
     dup_fetch_rate    FLOAT,
     embed_calls       INT,
     embed_chunks      INT,
+    embed_coverage    FLOAT,   -- embed_query 次数 / 维度数；<1 说明有维度没做向量检索
     rerank_gap        FLOAT,   -- top1 - median，越接近 0 越分不开
     rerank_under_k    INT,     -- 返回数 < 请求 top_k 的次数（候选池不够）
     funnel_search     INT,     -- 搜索命中条数
@@ -344,6 +345,7 @@ CREATE TABLE IF NOT EXISTS trajectory_metrics (
     retrieval_cells   INT,     -- 竞品×维度快照行数（样本量，也是加权分母）
     recall_avg        FLOAT,   -- 每格平均召回条数
     rerank_avg        FLOAT,   -- 每格精排后平均保留条数（与 recall_avg 一起看才有意义）
+    rerank_drop_rate  FLOAT,   -- 1 - rerank_avg/recall_avg；0=精排一条没筛掉（候选池≤top_k）
     coverage_skew     FLOAT,   -- 最少竞品页数 / 中位数；1.0=均衡，0=有竞品彻底没料
     cross_dim_dup     FLOAT    -- 不同维度复用同一批 URL 的比例
 );
@@ -355,6 +357,10 @@ ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS recall_avg FLOAT;
 ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS rerank_avg FLOAT;
 ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS coverage_skew FLOAT;
 ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS cross_dim_dup FLOAT;
+
+-- v6 起新增两列（同上：旧库不会自动补列）
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS embed_coverage FLOAT;
+ALTER TABLE trajectory_metrics ADD COLUMN IF NOT EXISTS rerank_drop_rate FLOAT;
 
 CREATE INDEX IF NOT EXISTS idx_traj_metrics_computed ON trajectory_metrics (computed_at);
 CREATE INDEX IF NOT EXISTS idx_traj_metrics_term ON trajectory_metrics (termination);
