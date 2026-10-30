@@ -13,7 +13,7 @@
   `effective()`               → `{key: value}`（只含 user_set/confirmed）
   `for_injection()`           → (可注入 dict, 被压制的 [(key, 原因)])
   `format_block()`            → writer prompt 的一段文本
-  `load_overrides()`          → 保鲜期覆盖 `{关键词: 天数}`（给 verify 与 fact 写入用）
+  `load_overrides()`          → 保鲜期覆盖 `{关键词: 天数}`（给 fact 写入定档用）
   `detect_proposals()`        → 待确认提案列表（进确认卡，不进 prompt）
 
 【关键决策】
@@ -30,7 +30,7 @@
   · 提案识别先过关键词门 ← 每轮对话都调一次 LLM 判"有没有在说偏好"，
       90% 的轮次是白烧；命中"以后/默认/每次"才花这次钱
   · `ttl_overrides` 标 `inject=False`，不进 writer prompt ← 其余三个键改的是
-      "报告长什么样"，它改的是"多久算旧"（verify 的判断标准）。混进 prompt
+      "报告长什么样"，它改的是"多久算旧"（写入侧定 ttl_days 用的档位）。混进 prompt
       只会让 writer 去操心它并不掌握的时效信息
   · 保鲜期覆盖**只按纯配置走**，不做对话自动推断 ← 猜错会静默改掉判断标准，
       正是三级写入纪律要防的那类错误；而它是纯配置项，显式设置成本极低
@@ -142,7 +142,7 @@ KNOWN_KEYS: dict[str, dict] = {
         "describe": _describe_ttl,
         # ★ inject=False：这一项**不写进 writer prompt**。
         #   前三个键改的是"报告长什么样"，这个键改的是"多久算旧"，
-        #   属于 verify 的判断标准。混进 prompt 只会让 writer 去操心时效，
+        #   属于 ttl 定档的标准。混进 prompt 只会让 writer 去操心时效，
         #   而它对"这条结论多少天前观测的"一无所知。
         "inject": False,
         "proposal_question": lambda v: f"以后「{_describe_ttl(v)}」按这个保鲜期算？",
@@ -264,12 +264,12 @@ async def load_overrides(pool: Any, user_id: str) -> dict[str, int]:
     """取用户设置的保鲜期覆盖（`ttl_overrides`）；没配或读失败就是空 dict。
 
     ★ 两处消费：fact 写入时定档（`semantic.write_task_facts`）、
-      verify 读取时覆盖（`query_handlers.check_freshness`）。
+      写入时按它定 `ttl_days`（`memory/semantic.py`）。
       读取侧每次都重读，所以**改偏好不需要回填历史数据**，
       落库的 ttl_days 退化成"当时的默认档位快照"。
 
     ⚠️ 这里吞掉异常是刻意的：保鲜期只是一档判断标准，偏好表查询失败
-       不该让任务收尾或 verify 整体挂掉 —— 降级到内置档位表继续跑。
+       不该让任务收尾挂掉 —— 降级到内置档位表继续跑。
     """
     if pool is None or not user_id:
         return {}

@@ -16,7 +16,7 @@
     user_input                  →  用户原话
     reference                   →  gold intent（"标准答案"）
     response                    →  系统判出的 intent
-    reference_contexts          →  [期望路由]（如 handler:check_freshness）
+    reference_contexts          →  [期望路由]（如 handler:trace_evidence）
     reference_context_ids       →  [case id]（对齐用）
     retrieved_contexts          →  []（意图识别不检索）
 
@@ -52,7 +52,6 @@ EXPECTED_ROUTE: dict[str, str] = {
     "analysis": "task:pipeline",
     "lookup": "handler:lookup_reports",
     "trace": "handler:trace_evidence",
-    "verify": "handler:check_freshness",
     "unknown": "clarify:l4",
 }
 

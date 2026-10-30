@@ -13,7 +13,7 @@
   ★ `Decision` 里**没有槽位字段**，这是刻意的结构约束。加回 entities/keyword
     就等于把"意图与槽位耦合"重新放回来，而这正是 2026-10-29 拆掉的东西。
   ★ L2 过阈即停，不再按意图类别看白名单。旧白名单只有 lookup 能停，理由是
-    "analysis 要实体、trace/verify 要 keyword"——那是**下游缺不缺输入**，
+    "analysis 要实体、trace 要 keyword"——那是**下游缺不缺输入**，
     不是**这次判得准不准**。实测代价与收益见 l2_semantic 的 docstring。
   ★ 删白名单后"把 lookup 误判成 analysis"仍不会跑错报告：槽位阶段抽不到锚点
     就追问。第三道防线从"意图层按类别拦"移到了"槽位层必填校验"。
@@ -32,7 +32,14 @@ from src.agents import create_llm_client
 from src.config import Settings
 from src.mcp.tools_rag import embed_texts
 from src.supervisor.intent.clarify import CLARIFY_QUESTION
-from src.supervisor.intent.labels import EXEMPLARS, INTENTS, INTENT_PROMPT, UNKNOWN
+from src.supervisor.intent.labels import (
+    EXEMPLARS,
+    INTENTS,
+    INTENT_PROMPT,
+    UNKNOWN,
+    UNSUPPORTED_ANSWER,
+    UNSUPPORTED_EXEMPLARS,
+)
 from src.supervisor.intent.parsing import parse_json_object
 
 logger = logging.getLogger(__name__)
@@ -103,6 +110,12 @@ async def _exemplar_vectors(settings: Settings) -> dict[str, list[list[float]]]:
             texts.extend(EXEMPLARS[intent])
             spans.append((intent, start, len(texts)))
 
+        # 拒绝类也进向量表，但**不**进 INTENTS —— 它不是一个能执行的分支。
+        # 进向量表的理由：不进来，时效核实类的话会被 trace 吸走（见 labels 的注释）。
+        start = len(texts)
+        texts.extend(UNSUPPORTED_EXEMPLARS)
+        spans.append((UNKNOWN, start, len(texts)))
+
         vectors = await embed_texts(texts, settings)
         if not vectors or len(vectors) != len(texts):
             logger.warning("L2 示例句编码失败（%d/%d），本次跳过语义层", len(vectors or []), len(texts))
@@ -133,6 +146,11 @@ async def l2_semantic(
           定 0.15 不是拍脑袋：150 条上 4 条错例 gap=0.100/0.109/0.125/0.143 全在 0.15 左侧，
           gap≥0.15 的 24 条零错误 —— 门槛正好卡在"分得清"与"没分清"之间。
     ⚠️ 别靠调 floor 治"域外被硬塞"——调不动，那是模型性质；要治就治 margin。
+
+    ★ 2026-10-30：向量表里多了**拒绝类**（`UNSUPPORTED_EXEMPLARS`，原 verify 的
+      7 句）。它不参与"该执行哪条路"的竞争，但必须参与排名 —— 否则
+      「这个结论还能信吗」会被 trace 吸走（与「证据在哪」词面极近，bge-m3 分不开），
+      于是用户拿到一份证据，以为时效被回答了。命中拒绝类 = 明确告知，不是分类失败。
 
     ★ 2026-10-29 删掉按类别的白名单（原 `INTENTS_L2_SAFE = ("lookup",)），
       改成"过阈即停 + margin 分档"。140 条非边界样本上三档实测：
@@ -171,6 +189,20 @@ async def l2_semantic(
     if not accepted:
         return None
 
+    if top_intent == UNKNOWN:
+        # ★ 命中的是**拒绝类**，不是分类失败。语义上"听懂了，但系统不做"，
+        #   所以要给明确告知（clarify 带着下一步），不能落到 L4 的通用追问 ——
+        #   用户明明说得很清楚，再被问"你是想做什么"是最伤的体验。
+        return Decision(
+            intent=UNKNOWN,
+            layer="L2",
+            confidence=round(top1, 4),
+            margin=round(gap, 4),
+            clarify=UNSUPPORTED_ANSWER,
+            reason=f"语义层命中拒绝类({top1:.3f})，领先 {second_intent}({top2:.3f})",
+            scores={k: round(v, 4) for k, v in scores.items()},
+        )
+
     return Decision(
         intent=top_intent,
         layer="L2",
@@ -197,6 +229,9 @@ async def l3_llm(
     ★ 2026-10-29：这里**不再**要求模型输出 competitors/dimensions/keyword。
       槽位由 slots.fill_slots 在 label 确定后单独处理。合在一起时，
       L2 判对却为了拿槽位被要求整句重判，等于把已做对的部分丢掉再做一遍。
+    ★ 2026-10-30：输出多了一个 `reject`（verify 下线后的落点）。它和 unknown
+      在系统里都记为 unknown，**只有话术不同** —— 合并就等于把"我不懂你"
+      和"我懂你但我做不到"说成同一句。
     """
     cfg = settings or Settings()
     data: dict = {}
@@ -208,6 +243,19 @@ async def l3_llm(
         logger.exception("L3 LLM 意图判定失败，兜底 analysis")
 
     intent = str(data.get("intent") or "").strip().lower()
+
+    # "reject" 是 prompt 对"听懂了但要核实时效"的专用标签（verify 下线后的落点）。
+    # 它和 unknown 在系统里都是 unknown，**只有话术不同** —— 不能合并，
+    # 合并就等于把"我不懂你"和"我懂你但我做不到"说成同一句。
+    if intent == "reject":
+        return Decision(
+            intent=UNKNOWN,
+            layer="L3",
+            confidence=0.8,
+            clarify=UNSUPPORTED_ANSWER,
+            reason="LLM 判为时效核实类（系统不做实时核对）",
+        )
+
     if intent not in INTENTS and intent != UNKNOWN:
         intent = "analysis" if not data else UNKNOWN
 
@@ -252,7 +300,7 @@ async def classify(
     history_block 只在 L3 生效（见 l3_llm 注释），单轮调用方不传即可。
 
     ⚠️ 这里**不返回槽位**。调用方拿到 label 后自行决定要不要 `fill_slots`：
-       analysis 必填竞品/维度、trace 必填竞品、verify 只抽维度、lookup 不强制。
+       analysis 必填竞品/维度、trace 必填竞品、lookup 不强制。
 
     ★ 2026-10-29 删掉 L1（确定性规则层），漏斗从四层变三层。理由不是"没接上线"：
       它想判的「参数齐全 ⇒ analysis」已经被**产品结构**表达掉了 ——
@@ -287,7 +335,10 @@ async def classify(
         return semantic
 
     llm_result = await l3_llm(text, cfg, history_block)
-    if llm_result.intent in INTENTS:
+    # ★ 判据是 `intent in INTENTS` **或带了 clarify**：L3 判出"时效核实类"时
+    #   返回的是 (unknown, 专用说明)，若只认 INTENTS 就会被 l4_clarify 覆盖成
+    #   "你是想做什么" —— 把一句明确的告知换成一句反问。
+    if llm_result.intent in INTENTS or llm_result.clarify:
         return llm_result
 
     return l4_clarify(text)

@@ -8,9 +8,11 @@
   ★ 该不该抽一个槽，判据是「**缺了下游会不会答错**」，不是「这个意图有什么槽」：
       analysis 缺竞品/维度 → 检索没有锚点，根本跑不起来            → 必抽
       trace    缺竞品       → `e.competitor = ANY($2)` 失效，会列出别家证据 → 必抽
-      trace    缺维度       → 只是"查全部维度"，用户看得见的宽        → 可空
-      verify   缺竞品       → 核该用户全部事实，**正是「数据新不新」要的** → 不抽
+      trace    缺维度       → 只是"查全部维度"，用户看得见的宽        → 可有可无
       lookup   缺序数       → 退回最近一次，是合理默认              → 不抽
+  ⚠️ **verify 已下线**（2026-10-30 产品决策），不再进本模块：它只按
+     `observed_at + ttl_days` 推断"这条结论多久没核过"，并不真的知道
+     "现在变了没"（那要重新抓网页）。这类问法由 classifier 判 unknown 并明确告知。
   ★ 竞品 / 维度走**同一条解析管线**（`match_values` → `gate_llm`）：
       ① 值池字面匹配 —— 用户话里出现了池里的值，直接用。**零 LLM**
       ② 词表翻译（仅维度）—— 价格→定价；翻出来的名字**回池校验**，池里没有就丢
@@ -374,22 +376,6 @@ async def fill_slots(
             if not ds:
                 ds = gate_llm(got.dimensions, dimension_pool)
         return Slots(competitors=cs, dimensions=ds, source=source)
-
-    # verify：**竞品不抽** —— 核该用户全部事实，正是「数据新不新」要的；
-    #   但**维度要抽**，它决定"核哪一维的 fact"。
-    #   ★ 这件事原来由 keyword 干，现在由 dimensions 干（2026-10-29）：
-    #     keyword 的值域是维度名，却拿去 `content ILIKE`。FACT_TEMPLATE 第 1 行
-    #     就写着 `{competitor}·{dimension}`，所以那个 ILIKE 约等于"筛维度"，
-    #     只是绕了一层 —— 代价是正文提到该词的**跨维度** fact 会被误带回来。
-    if intent == "verify":
-        if not ds:
-            ds, source = match_values(text, dimension_pool, _DIM_ALIASES)
-        if not ds:
-            # 池子拿不到时退回词表：维度是半封闭词表（不像竞品是开放集合），
-            # 规则认得出就够用。筛窄了只会少几行，不会把别家的事实念出来。
-            ds = rule_dimensions(text)
-            source = "rule" if ds else "none"
-        return Slots(dimensions=ds, source=source)
 
     # analysis：维度先走规则，竞品交给 LLM —— 这条路上**不可能**用值池代替 LLM：
     #   用户要分析的新竞品还没进过库，值池里根本没有它。

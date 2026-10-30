@@ -1155,12 +1155,12 @@ async def chat(
     )
     from src.supervisor.intent import (
         CLARIFY_CHOICES,
+        CLARIFY_QUESTION,
         classify,
         fill_slots,
         no_anchor_channel,
     )
     from src.supervisor.query_handlers import (
-        check_freshness,
         lookup_reports,
         parse_ordinal,
         trace_evidence,
@@ -1268,20 +1268,16 @@ async def chat(
     #   抽什么由 label 决定（见 intent/slots.py 顶上那张"缺了下游会不会答错"的表）；
     #   槽位**无权回头改 label** —— 单向依赖，否则耦合又回来了。
     #
-    #   四条意图都要池子，但用途不同：
+    #   三条意图都要池子，但用途不同：
     #     lookup / trace  池是**匹配基准**（用户说出的名字就是库里真实存在的值）
     #     analysis        池是**改名依据**（LLM 输出的简称归一成池里的正式名，
     #                     池外的新竞品放行 —— 见 slots.normalize_to_pool）
-    #     verify          池是**维度枚举依据**（2026-10-29 起）：它用
-    #                     `split_part(subject,'|',2)` 精确筛维度，而维度跟着品类走
-    #                     （游戏任务里的「玩法设计」词表没有），必须靠池子认出来。
-    #                     原来是靠 keyword 去 ILIKE 正文，所以不查池 —— 现已删除。
-    #   两条 SELECT DISTINCT，代价可忽略 —— 但只查用得上的那条：
-    #   verify 不按竞品筛（核全部事实），竞品池查了也没人读。
+    #   两条 SELECT DISTINCT，代价可忽略。
+    #   ⚠️ verify 下线（2026-10-30）：它曾在这里单独只查维度池；现在没有它了，
+    #      别为了"以后可能用得上"继续查 —— 没人读的查询就是白花。
     pool_comps = pool_dims = None
-    if decision.intent in ("lookup", "trace", "analysis", "verify"):
-        if decision.intent != "verify":
-            pool_comps = await competitor_pool(pool, current_user.user_id)
+    if decision.intent in ("lookup", "trace", "analysis"):
+        pool_comps = await competitor_pool(pool, current_user.user_id)
         pool_dims = await dimension_pool(pool, current_user.user_id)
 
     slots = await fill_slots(
@@ -1332,7 +1328,7 @@ async def chat(
             "echo": body.message,
         }, f"已开始分析：{'、'.join(competitors) or '（未指定竞品）'}", ref_task_id=task_id)
 
-    # ── lookup / trace / verify：意图与槽位都已就位，这里只执行 SQL ──
+    # ── lookup / trace：意图与槽位都已就位，这里只执行 SQL ──
     #   槽位已在上面按 label 抽过，这一段不再调模型（也不再改意图）。
     competitors = slots.competitors or None
 
@@ -1390,9 +1386,17 @@ async def chat(
                 pool, current_user.user_id, competitors, slots.dimensions
             )
     else:
-        data = await check_freshness(
-            pool, current_user.user_id, competitors, slots.dimensions
-        )
+        # 理论上到不了：analysis 上面已 return，unknown 在 L4 澄清分支已 return。
+        # ★ 不写成 `else: trace` 兜底：那会把"以后新增了 label 却忘了接线"
+        #   变成"拿 trace 的 SQL 答一个别的问题"—— 错得看不出来。
+        logger.error("未接线的意图 label: %s", decision.intent)
+        return await finish(200, {
+            "type": "clarify",
+            **base,
+            "question": CLARIFY_QUESTION,
+            "options": list(CLARIFY_CHOICES),
+            "echo": body.message,
+        }, f"（反问）{CLARIFY_QUESTION}")
 
     # 分页信息与翻页参数：前端据此渲染分页条，翻页时打 GET /api/lookup。
     # 为什么翻页不重发这句话：那会多走一次意图识别（白付一次编码），还会往

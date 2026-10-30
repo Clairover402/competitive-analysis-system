@@ -747,7 +747,7 @@ class AgentMemoryDAO:
         ------------------------------------------------------------
         observed_at —— 结论**什么时候被观测到**（= 证据抓取时间）。不是入库时间：
                        任务跑完到写记忆之间可能有几分钟，历史回填可能差几个月，
-                       而 verify 问的是"多久没核对过"，只能用观测时间。
+                       而"这条结论有多旧"只能靠观测时间判断。
         ttl_days    —— 保鲜期档位。和 half_life_days 是两回事：
                        half_life 管检索排序衰减（不影响正确性判断），
                        ttl 管正确性判定（超过就报 stale）。并存，不二选一。
@@ -880,7 +880,7 @@ class AgentMemoryDAO:
             )
             return [dict(r) for r in rows]
 
-    # ── M3 semantic 事实专用：取代链 / 幂等 / verify 取数 ──────────────────
+    # ── M3 semantic 事实专用：取代链 / 幂等 ──────────────────────────────
 
     async def find_active_similar(
         self,
@@ -951,11 +951,10 @@ class AgentMemoryDAO:
                 user_id, source_task_id, subject, content,
             ))
 
-    # ⚠️ 这里没有 `list_facts()`：verify 的取数 SQL 放在
-    #    `supervisor/query_handlers.py`，因为那三个执行器只用 `pool.fetch()`
-    #    一个方法（见该文件头部的"零 DB 测试"约定）。两边各留一份同名查询，
-    #    迟早会因为"只改了一处"而让 verify 和写入侧对不上。想复用时把 SQL
-    #    搬到一个公共模块，别在 DAO 里再抄一遍。
+    # ⚠️ 这里没有 `list_facts()`：原 verify 的取数 SQL 在
+    #    `supervisor/query_handlers.py`，而它已随 verify 下线一起删除（2026-10-30）。
+    #    将来若再需要"按 subject 取事实"，把 SQL 放一个公共模块，
+    #    别在 DAO 里再抄一份 —— 两份同名查询迟早因为"只改了一处"而打架。
 
     async def soft_delete(self, memory_id: str) -> None:
         """软删除记忆——标记 is_active=false，不物理删除数据。

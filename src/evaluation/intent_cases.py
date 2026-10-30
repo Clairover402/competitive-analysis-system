@@ -10,8 +10,10 @@
   analysis = 要一份**新**产出（跑报告）
   lookup   = 要一份**已有**产出（查报告、标题、历史记录）
   trace    = 要**证据**（URL、原文片段、引用链）
-  verify   = 要判断**还准不准**（观测时间、保鲜期、现在变了没）
-  unknown  = 该追问（信息不足 / 域外，猜一个不如问一句）
+  （原 verify 类已下线，见下）
+  unknown  = 该追问或明确拒绝。两种：
+             信息不足（"飞书""嗯"）/ 要核实数据现在是否还成立（"过时了吗"）
+             后者必须明说做不到，不能判成 trace 让用户以为时效被回答了
 
 两个意图都说得通的句子标 `ambiguous=True`，**单独统计、不混进主指标**：
 算进准确率会虚高错误率（模型怎么答都有一半算错），剔掉又会掩盖真实的边界模糊。
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-INTENTS_GOLD = ("analysis", "lookup", "trace", "verify", "unknown")
+INTENTS_GOLD = ("analysis", "lookup", "trace", "unknown")
 
 
 @dataclass(frozen=True)
@@ -157,40 +159,45 @@ _TRACE: list[Case] = [
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 四、verify — 要判断还准不准（30 条）
+# 四、原 verify 问法 — 系统应判 unknown 并明确告知（30 条）
+#
+# ★ 2026-10-30 verify 下线后，这 30 句的 gold 从 "verify" 改为 "unknown"。
+#   保留原句而不是删掉：它们是"听得懂、但系统不做"的负样本 ——
+#   用来量两件事：① 模型会不会误判成 trace（那就等于答非所问）；
+#   ② 系统会不会硬编一个"应该还没变"的答案。
 # ══════════════════════════════════════════════════════════════════════════════
 
-_VERIFY: list[Case] = [
-    Case("这个结论现在还准吗", "verify"),
-    Case("飞书定价现在是多少", "verify"),
-    Case("上次的数据过期了吗", "verify"),
-    Case("那个价格还有效吗", "verify"),
-    Case("这份报告的内容是不是过时了", "verify"),
-    Case("飞书现在的定价变了没", "verify"),
-    Case("那条结论还成立吗", "verify"),
-    Case("数据是最新的吗", "verify"),
-    Case("三个月前的定价现在还能用吗", "verify"),
-    Case("这个结论需要更新吗", "verify"),
-    Case("飞书最近涨价了吗", "verify"),
-    Case("报告里提到的功能现在还有吗", "verify"),
-    Case("保鲜期过了没", "verify"),
-    Case("这些数据多久没更新了", "verify"),
-    Case("现在钉钉定价是 45 吗", "verify"),
-    Case("结论的有效期到什么时候", "verify"),
-    Case("这份报告还能信吗", "verify"),
-    Case("数据新鲜度怎么样", "verify"),
-    Case("上次观测到现在多久了", "verify"),
-    Case("飞书定价有没有变动", "verify"),
-    Case("这个结论是不是该重跑了", "verify"),
-    Case("报告里的信息现在还准确不", "verify"),
-    Case("那条事实是不是已经失效", "verify"),
-    Case("现在的最新定价是多少", "verify"),
-    Case("上次分析的结论还作数吗", "verify"),
-    Case("这些数据是几号观测的", "verify"),
-    Case("有没有更新的观测", "verify"),
-    Case("现在市场上还是这个价吗", "verify"),
-    Case("报告过时了吧", "verify"),
-    Case("这个结论能信几天", "verify"),
+_UNSUPPORTED: list[Case] = [
+    Case("这个结论现在还准吗", "unknown"),
+    Case("飞书定价现在是多少", "unknown"),
+    Case("上次的数据过期了吗", "unknown"),
+    Case("那个价格还有效吗", "unknown"),
+    Case("这份报告的内容是不是过时了", "unknown"),
+    Case("飞书现在的定价变了没", "unknown"),
+    Case("那条结论还成立吗", "unknown"),
+    Case("数据是最新的吗", "unknown"),
+    Case("三个月前的定价现在还能用吗", "unknown"),
+    Case("这个结论需要更新吗", "unknown"),
+    Case("飞书最近涨价了吗", "unknown"),
+    Case("报告里提到的功能现在还有吗", "unknown"),
+    Case("保鲜期过了没", "unknown"),
+    Case("这些数据多久没更新了", "unknown"),
+    Case("现在钉钉定价是 45 吗", "unknown"),
+    Case("结论的有效期到什么时候", "unknown"),
+    Case("这份报告还能信吗", "unknown"),
+    Case("数据新鲜度怎么样", "unknown"),
+    Case("上次观测到现在多久了", "unknown"),
+    Case("飞书定价有没有变动", "unknown"),
+    Case("这个结论是不是该重跑了", "unknown"),
+    Case("报告里的信息现在还准确不", "unknown"),
+    Case("那条事实是不是已经失效", "unknown"),
+    Case("现在的最新定价是多少", "unknown"),
+    Case("上次分析的结论还作数吗", "unknown"),
+    Case("这些数据是几号观测的", "unknown"),
+    Case("有没有更新的观测", "unknown"),
+    Case("现在市场上还是这个价吗", "unknown"),
+    Case("报告过时了吧", "unknown"),
+    Case("这个结论能信几天", "unknown"),
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -202,23 +209,23 @@ _VERIFY: list[Case] = [
 # 混进主指标等于用一个没有唯一答案的题去算对错。
 
 _ADV_RAW: list[Case] = [
-    # ── 易混：analysis / verify ──
+    # ── 易混：analysis / 时效核实 ──
     Case("飞书和钉钉哪个好", "analysis", ambiguous=True,
          note="要结论还是要新报告？产品上会跑分析，但也可能想听现成判断"),
-    Case("飞书多少钱", "verify", ambiguous=True,
-         note="问当前值 → verify；但没有主语时也可能是在要一次分析"),
-    # ── 易混：lookup / verify ──
-    Case("上次分析飞书的结果现在还对吗", "verify", ambiguous=True,
+    Case("飞书多少钱", "unknown", ambiguous=True,
+         note="问当前值 → 系统不核对，应 unknown；没有主语时也可能是在要一次分析"),
+    # ── 易混：lookup / 时效核实 ──
+    Case("上次分析飞书的结果现在还对吗", "unknown", ambiguous=True,
          note="先 lookup 再 verify，复合句"),
-    Case("上次报告现在还能用吗", "verify"),
-    Case("上次报告里那个定价，现在还是 45 吗", "verify", ambiguous=True,
-         note="带具体旧值地问现状，最接近 verify 的典型形态"),
+    Case("上次报告现在还能用吗", "unknown"),
+    Case("上次报告里那个定价，现在还是 45 吗", "unknown", ambiguous=True,
+         note="带具体旧值地问现状，是原 verify 的典型形态，现在应明确拒绝"),
     # ── 易混：lookup / trace ──
     Case("那份报告的定价部分", "lookup", ambiguous=True),
     Case("报告里说的定价，来源是哪", "trace", note="复合句，取后半段的诉求"),
     # ── 复合句：两个诉求，取向看后半句 ──
-    Case("这个数你从哪抄的，现在变了没", "verify", ambiguous=True),
-    Case("那条结论的依据，以及它过没过期", "verify", ambiguous=True),
+    Case("这个数你从哪抄的，现在变了没", "unknown", ambiguous=True),
+    Case("那条结论的依据，以及它过没过期", "unknown", ambiguous=True),
     Case("把上次报告的来源列一下", "trace"),
     Case("报告里那几条结论的出处都给我", "trace"),
     Case("我要看飞书定价的原始网页", "trace"),
@@ -254,7 +261,7 @@ _ADV_RAW: list[Case] = [
 _ADVERSARIAL: list[Case] = [replace(c, group="adversarial") for c in _ADV_RAW]
 
 
-CASES: list[Case] = _ANALYSIS + _LOOKUP + _TRACE + _VERIFY + _ADVERSARIAL
+CASES: list[Case] = _ANALYSIS + _LOOKUP + _TRACE + _UNSUPPORTED + _ADVERSARIAL
 
 
 def stats() -> dict:

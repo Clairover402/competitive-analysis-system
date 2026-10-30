@@ -117,7 +117,7 @@ class LongTermMemoryEngine:
     【职责边界】只写不读。
       — 写：semantic.write_task_facts() 把 evidence_map 里的事实升格成
         agent_memories 一行（带 embedding、importance、half_life_days）。
-      — 读：不在这里。verify 走 subject 精确键（见 query_handlers.check_freshness），
+      — 读：不在这里。按 subject 精确键取 content（读取口见 query_handlers），
         lookup 走 source_task_id。两者都不碰 embedding。
 
     【取代判定为什么用向量】同一个 subject（如「飞书·定价」）可能有新旧两条观测，

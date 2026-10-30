@@ -9,7 +9,7 @@ import { SFX } from '../js/sounds.js';
 //   对话模式        ：一句话交给漏斗判意图 → 四种之一，**只有 analysis 会出报告**
 //
 // ⚠️ 旧名叫"高级模式"，立论是"更慢更不确定的那条才配叫高级"。接上意图漏斗后
-//    lookup / trace / verify 三个意图都比分析更快更确定，这个词的立论已经失效，
+//    lookup / trace 两个意图都比分析更快更确定，这个词的立论已经失效，
 //    2026-10-27 改名（见 notes/实施计划_意图漏斗与对话入口_2026-10-27.md D4）。
 //
 // ⚠️ 对话模式**不跳页**：一次任务分析要跑几分钟，跳走就看不了对话了。
@@ -47,10 +47,6 @@ export function render() {
         '<div class="pixel-sidebar-user">' +
           '<span>&#x1f464;</span> <span id="sidebar-user">' + username + '</span>' +
         '</div>' +
-        // 保鲜期是唯一一项"配了但界面上点不到"的偏好（后端只有 PUT，没有入口）。
-        // 放在侧边栏而不是塞进对话模式：它是设置项，不该靠用户碰巧说对一句话才生效。
-        '<button id="btn-prefs" class="pixel-btn-secondary pixel-w-full" ' +
-                'style="margin-bottom:8px">\u4E8B\u5B9E\u4FDD\u9C9C\u671F</button>' +
         '<button id="btn-logout" class="pixel-btn-secondary pixel-w-full">\u9000\u51FA\u767B\u5F55</button>' +
       '</div>' +
 
@@ -122,35 +118,6 @@ export function render() {
 
     '</main>' +
 
-    // ── 事实保鲜期弹层 ──
-    // 骨架常驻 DOM、默认 display:none：打开时才去拉接口，避免每次进仪表盘
-    // 都多打一次 /api/preferences（这个页面本来就要拉任务列表 + 会话列表）。
-    '<div id="pref-mask" class="pixel-modal-mask" style="display:none">' +
-      '<div class="pixel-box pixel-modal">' +
-        '<div class="pixel-modal-head">' +
-          '<span class="pixel-modal-title">\u4E8B\u5B9E\u4FDD\u9C9C\u671F</span>' +
-          '<button id="pref-close" class="pixel-btn-secondary pixel-btn-compact">\u5173\u95ED</button>' +
-        '</div>' +
-        '<p class="pixel-mode-hint">' +
-          '\u4E00\u6761\u7ED3\u8BBA\u591A\u5C11\u5929\u540E\u7B97\u300C\u65E7\u300D\u3002' +
-          '\u952E\u662F\u7EF4\u5EA6\u6216\u7ED3\u8BBA\u91CC\u7684\u5173\u952E\u8BCD\uFF08\u5982 \u5B9A\u4EF7\u3001\u878D\u8D44\uFF09\uFF0C' +
-          '\u547D\u4E2D\u5C31\u6309\u8FD9\u4E2A\u5929\u6570\u7B97\uFF1B\u672A\u547D\u4E2D\u7684\u8D70\u5185\u7F6E\u6863\u4F4D\u3002' +
-        '</p>' +
-        '<div class="pixel-ttl-head">' +
-          '<span class="pixel-ttl-key">\u952E\uFF08\u7EF4\u5EA6\u6216\u5173\u952E\u8BCD\uFF09</span>' +
-          '<span class="pixel-ttl-head-days">\u5929\u6570</span>' +
-        '</div>' +
-        '<div id="pref-ttl-rows"></div>' +
-        '<button id="pref-add-row" class="pixel-btn-secondary pixel-btn-compact pixel-mt-sm">' +
-          '+ \u52A0\u4E00\u6761' +
-        '</button>' +
-        '<div class="pixel-modal-actions">' +
-          '<button id="pref-save" class="pixel-btn pixel-btn-compact">\u4FDD\u5B58</button>' +
-          '<span id="pref-msg" class="pixel-msg"></span>' +
-        '</div>' +
-      '</div>' +
-    '</div>' +
-
   '</div>';
 }
 
@@ -172,152 +139,6 @@ export function mount() {
   var btnSubmitChat = document.getElementById('btn-submit-chat');
   var btnRefresh = document.getElementById('btn-refresh-tasks');
   var btnLogout = document.getElementById('btn-logout');
-
-  // ── 事实保鲜期（ttl_overrides）编辑器 ────────────────────────────────
-  // 这一项此前只有 PUT 接口、前端没有入口 —— 用户能配却点不到，等于没做。
-  // 后端校验规则（src/memory/preferences.py::_check_ttl_overrides）在这里
-  // 复刻了一份：不是重复造轮子，是为了不必等一次网络往返才看到"哪写错了"。
-  // ⚠️ 后端那几条必须一一对上，改一处要改两处：非空、≤8 项、键≤16 字、
-  //    天数 1~3650 的整数（**布尔也要挡**，JSON 里 true 会被当成 1）。
-  var TTL_MAX_ITEMS = 8;
-  var TTL_MIN_DAYS = 1;
-  var TTL_MAX_DAYS = 3650;
-  var prefMask = document.getElementById('pref-mask');
-  var prefRows = document.getElementById('pref-ttl-rows');
-  var prefMsg = document.getElementById('pref-msg');
-
-  function prefSay(text, type) {
-    if (!prefMsg) return;
-    prefMsg.textContent = text;
-    prefMsg.className = 'pixel-msg';
-    if (type === 'error') prefMsg.classList.add('pixel-msg-error');
-    else if (type === 'success') prefMsg.classList.add('pixel-msg-success');
-    else prefMsg.classList.add('pixel-msg-info');
-  }
-
-  function addTtlRow(key, days) {
-    if (!prefRows || prefRows.children.length >= TTL_MAX_ITEMS) return;
-    var row = document.createElement('div');
-    row.className = 'pixel-ttl-row';
-    row.innerHTML =
-      '<input class="pixel-input pixel-ttl-key" maxlength="16" ' +
-             'placeholder="\u7EF4\u5EA6 / \u5173\u952E\u8BCD\uFF08\u5982 \u5B9A\u4EF7\uFF09">' +
-      '<input class="pixel-input pixel-ttl-days" type="number" min="1" max="3650" ' +
-             'placeholder="30">' +
-      '<span class="pixel-ttl-unit">\u5929</span>' +
-      '<button class="pixel-ttl-del" title="\u5220\u9664">\u00D7</button>';
-    row.querySelector('.pixel-ttl-key').value = key || '';
-    row.querySelector('.pixel-ttl-days').value = (days === 0 || days) ? days : '';
-    row.querySelector('.pixel-ttl-del').onclick = function() {
-      row.remove();
-      SFX.blip();
-    };
-    prefRows.appendChild(row);
-  }
-
-  function collectTtl() {
-    /* 收集并当场校验。返回 {ok:true, value} 或 {ok:false, error}。
-     * 校验顺序与后端一致，报错文案也尽量贴近 —— 用户看到的两处说法
-     * 不一致时，会以为是两个功能。 */
-    var out = {};
-    if (!prefRows) return { ok: true, value: out };
-    var rows = prefRows.querySelectorAll('.pixel-ttl-row');
-    for (var i = 0; i < rows.length; i++) {
-      var k = rows[i].querySelector('.pixel-ttl-key').value.trim();
-      var dRaw = rows[i].querySelector('.pixel-ttl-days').value.trim();
-      if (!k && !dRaw) continue;                 // 整行空着 = 没填，不算错
-      if (!k) return { ok: false, error: '\u7B2C ' + (i + 1) + ' \u884C\u6CA1\u586B\u5173\u952E\u8BCD' };
-      if (k.length > 16) return { ok: false, error: '\u300C' + k + '\u300D\u8D85\u8FC7 16 \u5B57' };
-      if (Object.prototype.hasOwnProperty.call(out, k)) {
-        return { ok: false, error: '\u300C' + k + '\u300D\u91CD\u590D\u4E86' };
-      }
-      if (!/^\d+$/.test(dRaw)) return { ok: false, error: '\u300C' + k + '\u300D\u5929\u6570\u9700\u8981\u662F\u6574\u6570' };
-      var d = parseInt(dRaw, 10);
-      if (d < TTL_MIN_DAYS || d > TTL_MAX_DAYS) {
-        return { ok: false, error: '\u300C' + k + '\u300D\u5929\u6570\u9700\u5728 ' +
-                 TTL_MIN_DAYS + '~' + TTL_MAX_DAYS + ' \u4E4B\u95F4' };
-      }
-      out[k] = d;
-      if (Object.keys(out).length > TTL_MAX_ITEMS) {
-        return { ok: false, error: '\u6700\u591A ' + TTL_MAX_ITEMS + ' \u9879' };
-      }
-    }
-    return { ok: true, value: out };
-  }
-
-  async function openPrefs() {
-    if (!prefMask) return;
-    prefMask.style.display = 'flex';
-    prefSay('\u52A0\u8F7D\u4E2D...', 'info');
-    if (prefRows) prefRows.innerHTML = '';
-    try {
-      var data = await API.get('/api/preferences');
-      var ttl = null;
-      (data.items || []).forEach(function(it) {
-        if (it.key === 'ttl_overrides') ttl = it.value;
-      });
-      if (ttl && typeof ttl === 'object') {
-        Object.keys(ttl).forEach(function(k) { addTtlRow(k, ttl[k]); });
-      }
-      if (!prefRows || !prefRows.children.length) addTtlRow('', '');
-      prefSay(ttl ? '' : '\u8FD8\u6CA1\u8BBE\u7F6E\u8FC7\uFF0C\u4E0B\u9762\u662F\u4E00\u4E2A\u7A7A\u6863', 'info');
-    } catch (e) {
-      prefSay('\u8BFB\u53D6\u5931\u8D25: ' + (e.message || '\u8BF7\u6C42\u5931\u8D25'), 'error');
-      SFX.error();
-    }
-  }
-
-  async function savePrefs() {
-    var res = collectTtl();
-    if (!res.ok) {
-      prefSay(res.error, 'error');
-      SFX.error();
-      return;
-    }
-    if (!Object.keys(res.value).length) {
-      // 空对象后端会 400（"需要是非空对象"）。要么删掉这条偏好，要么别保存。
-      prefSay('\u81F3\u5C11\u586B\u4E00\u6761\uFF0C\u6216\u76F4\u63A5\u5173\u95ED', 'error');
-      SFX.error();
-      return;
-    }
-    try {
-      var r = await API.put('/api/preferences/ttl_overrides', {
-        value: res.value, source: 'user_set',
-      });
-      // 回执必须如实：存下了但不会生效时，说"已保存"等于骗用户设置成功了
-      if (r && r.will_apply === false) {
-        prefSay('\u5DF2\u4FDD\u5B58\uFF0C\u4F46\u4E0E\u7CFB\u7EDF\u89C4\u5219\u51B2\u7A81\uFF0C' +
-                '\u672C\u6B21\u4E0D\u4F1A\u751F\u6548\uFF08' + (r.reason || '\u672A\u77E5\u539F\u56E0') + '\uFF09', 'error');
-      } else {
-        prefSay('\u5DF2\u4FDD\u5B58\uFF0C\u4E0B\u6B21\u5224\u5B9A\u65B0\u65E7\u65F6\u6309\u8FD9\u4E2A\u7B97', 'success');
-      }
-      SFX.confirm();
-    } catch (e) {
-      prefSay('\u6CA1\u4FDD\u5B58\u6210\u529F: ' + (e.message || '\u8BF7\u6C42\u5931\u8D25'), 'error');
-      SFX.error();
-    }
-  }
-
-  var btnPrefs = document.getElementById('btn-prefs');
-  if (btnPrefs) btnPrefs.onclick = function() { SFX.blip(); openPrefs(); };
-  var prefClose = document.getElementById('pref-close');
-  if (prefClose) prefClose.onclick = function() { prefMask.style.display = 'none'; };
-  var prefAdd = document.getElementById('pref-add-row');
-  if (prefAdd) prefAdd.onclick = function() {
-    if (prefRows && prefRows.children.length >= TTL_MAX_ITEMS) {
-      prefSay('\u6700\u591A ' + TTL_MAX_ITEMS + ' \u9879', 'error');
-      return;
-    }
-    addTtlRow('', '');
-    SFX.blip();
-  };
-  var prefSave = document.getElementById('pref-save');
-  if (prefSave) prefSave.onclick = savePrefs;
-  // 点遮罩关闭：只认"点在遮罩本身"，点在弹层内部冒泡上来的不算
-  if (prefMask) prefMask.onclick = function(ev) {
-    if (ev.target === prefMask) prefMask.style.display = 'none';
-  };
-  // ── 保鲜期编辑器结束 ──
 
   function showMsg(text, type) {
     if (!msgEl) return;
@@ -432,7 +253,6 @@ export function mount() {
     analysis: '竞品分析',
     lookup: '历史报告',
     trace: '证据溯源',
-    verify: '数据新旧',
   };
 
   // ★ 必须转义：summary / claim / source_text 全是**从竞品官网抓回来的原文**，
@@ -500,27 +320,10 @@ export function mount() {
     );
   }
 
-  function renderVerifyItem(it) {
-    var st = it.status === 'stale'
-      ? { t: '超过保鲜期', cls: 'pixel-badge-warning' }
-      : it.status === 'fresh'
-        ? { t: '保鲜期内', cls: 'pixel-badge-success' }
-        : { t: '时间未知', cls: 'pixel-badge-info' };
-    var age = (it.age_days == null) ? '抓取时间未知' : (it.age_days + ' 天前抓取');
-    return renderChatItem(
-      '<span class="pixel-badge ' + st.cls + '">' + st.t + '</span>' +
-      '<div class="pixel-chat-item-head pixel-mt-xs">' + esc(cut(it.claim, 100)) + '</div>' +
-      '<div class="pixel-chat-item-sub">' + esc(age) +
-        ' · 保鲜期 ' + esc(it.ttl_days) + ' 天</div>',
-      it.task_id
-    );
-  }
-
   function renderItems(intent, items) {
     if (!items || !items.length) return '';
-    var fn = intent === 'trace' ? renderTraceItem
-           : intent === 'verify' ? renderVerifyItem
-           : renderLookupItem;   // lookup 是默认，也是唯一一定能走到这里的分支
+    var fn = intent === 'trace' ? renderTraceItem : renderLookupItem;
+    // lookup 是默认：其余意图要么不出 items（analysis），要么根本走不到这里。
     return '<div class="pixel-chat-items">' + items.map(fn).join('') + '</div>';
   }
 

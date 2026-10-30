@@ -40,7 +40,9 @@ export const API = {
     return _handle(res);
   },
 
-  /* PUT：目前只有"UI 显式设置偏好"用到（保鲜期覆盖）。
+  /* PUT：语义是"不管之前有没有，现在就是这个值"（后端 dao.upsert 幂等覆盖）。
+   * ⚠️ 2026-10-30 保鲜期编辑器下线后，前端已没有 PUT 的调用点；
+   *    接口保留是因为偏好系统还在（POST 提案 + confirm 转正走另一条路）。
    * 与 POST 分开是因为语义不同——POST 是新建一条提案/任务，PUT 是
    * "不管之前有没有，现在就是这个值"（后端 dao.upsert 幂等覆盖）。 */
   async put(path, body) {

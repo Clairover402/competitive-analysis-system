@@ -1,4 +1,4 @@
-"""三个查询类意图的 SQL 执行器 — lookup / trace / verify。
+"""两个查询类意图的 SQL 执行器 — lookup / trace。
 
 【职责】
   做：把"意图 + 实体"翻译成一条 SQL，返回可直接念给用户的结构化结果。
@@ -9,10 +9,9 @@
   lookup_reports(pool, user_id, competitors, dimensions, limit, skip)
       -> {"items": [...], "total": int | None, "summary": str}
   trace_evidence(pool, user_id, competitors, dimensions, limit) -> 同上
-  check_freshness(pool, user_id, competitors, dimensions)  -> 同上（附 fresh/stale 判定）
 
 【关键决策】
-  ★ 三跳全走 SQL，零 LLM ← 用户问的是**确定指代**（"上次""那份"），
+  ★ 两跳全走 SQL，零 LLM ← 用户问的是**确定指代**（"上次""那份"），
     语义相似度会召回错任务，确定性查询只能用确定性工具
   ★ 排序一律 created_at DESC ← "上次"的字面含义就是时间最近，不需要模型理解
   ★ 序数（上上次 / 前两次 / 第五次）由 `parse_ordinal` 用**规则**抽，不进 L3 ←
@@ -23,11 +22,8 @@
   ★ SQL 的 WHERE 只写一份（_TASKS_FILTER），lookup 与 count 共用 ← 两处各写一遍
     就等于两个真相，改一处忘一处会让"一共几次"数错
   ★ lookup 也念事实正文（2026-10-28 补）← 问「上次钉钉定价多少」要的是那句话，
-    不是"有这么一份报告"。取法与 verify 相同：subject 定位 + content 第 2 行，
-    读的是同一张表、同一个 `_fact_claim`，不新增检索路径、不走向量
-  ★ verify 的数据源是 `agent_memories` 的 fact（带 observed_at / ttl_days），
-    不是 evidence_map ← M3 之后两者分工明确：证据答"引用过什么"，
-    事实答"当前有效观测是哪条"，只有后者能判"多久没核对"
+    不是"有这么一份报告"。取法是 subject 定位 + content 第 2 行（`_fact_claim`），
+    不新增检索路径、不走向量
   ★ trace 按 `evidence_map.competitor` 过滤，**不能**退回 `tasks.competitors ?|` ←
     一条证据只讲一家的事，一份报告却是 4 家合一的。按任务过滤会把别家证据一起捞
     （实测问「飞书」返回 10 条里 5 条是钉钉/企微），而且用户看不出来。
@@ -38,9 +34,10 @@
   ★ lookup 的竞品过滤仍用 jsonb `?|` ← 它答的是"哪份报告"，报告本来就是多竞品的，
     按任务过滤是正确的粒度；这和 trace 的差别就是**答案粒度**不同
   ★ 查不到就如实说查不到 ← 空结果编一句"可能是网络问题"最伤可信度
-  ★ verify 的保鲜期**读取时现算**，优先用偏好 `ttl_overrides` ← 若只信落库的
-    ttl_days，用户改完配置会看到"设置没生效"，而库里那列是写入时的快照
-    （理由见 _effective_ttl）
+  ⚠️ **verify 已于 2026-10-30 下线**：它的 `check_freshness` 只按
+    `observed_at + ttl_days` 判"多久没核对"，并不真的知道"现在变了没"
+    （那要重新抓网页）。与其答得像真的，不如在意图层就明确告知做不到。
+    事实表 `agent_memories` 与 ttl 字段都保留，只是不再有读取口。
 
 【读法】
   ⚠️ 所有查询都带 user_id，多租户隔离在这一层做，别指望调用方记得加。
@@ -188,29 +185,6 @@ def ttl_days_for(
         if any(k in blob for k in keywords):
             return days
     return DEFAULT_TTL_DAYS
-
-
-def _effective_ttl(
-    item: dict,
-    overrides: dict[str, int] | None,
-) -> tuple[int, str | None]:
-    """读取侧定档：用户配置 > 落库快照 > 现场按表补算。
-
-    ★ 为什么不直接信落库的 ttl_days：偏好可以在写入之后才改。
-      以落库值优先等于「配置改了、历史数据不认」，而用户看不到这个例外，
-      只会觉得设置没生效。落库值退化成「当时的默认档位」，只做兜底。
-
-    返回 (天数, 命中的偏好关键词)；第二项为 None 表示没走到用户配置。
-    """
-    dim = str(item.get("dimension") or "")
-    blob = f"{item.get('claim') or ''} {dim}"
-
-    hit = _override_hit(blob, dim, overrides)
-    if hit:
-        return hit[0], hit[1]
-    if item.get("ttl_days"):
-        return int(item["ttl_days"]), None
-    return ttl_days_for(blob, dim), None
 
 
 # ── ① lookup：找历史任务 ────────────────────────────────────────────────
@@ -776,36 +750,7 @@ async def trace_evidence(
     return {"items": items, "total": total, "summary": summary}
 
 
-# ── ③ verify：核对事实是否过期 ──────────────────────────────────────────
-
-# 【为什么这条 SQL 在本文件而不是 DAO】本文件三个执行器只依赖 `pool.fetch()`
-#   一个方法（见文件头"零 DB 测试"那段），这是刻意维持的约定：三个查询意图
-#   要做到"给个假池就能测"，多一层 DAO 就多一层 acquire() 要伪造。
-_FACTS_SQL = """
-SELECT id::text     AS memory_id,
-       content      AS content,
-       subject      AS subject,
-       ttl_days     AS ttl_days,
-       observed_at  AS observed_at,
-       created_at   AS created_at,
-       evidence_url AS evidence_url,
-       source_task_id::text AS task_id
-  FROM agent_memories
- WHERE user_id = $1
-   AND memory_type = 'fact'
-   AND status = 'active'          -- 被取代的旧观测不参与"当前是否新鲜"
-   AND is_active = true
-   -- 竞品过滤走 subject 前缀（`飞书|定价`），不用 content LIKE：
-   -- "与飞书相比，钉钉…"这类对比句会让 LIKE 把竞品 X 的事实串到竞品 Y 上
-   AND ($2::text[] IS NULL
-        OR subject ~ ('^(' || array_to_string($2::text[], '|') || ')\\|'))
-   -- 维度过滤走 subject 第 2 段（精确），不用 content ILIKE：
-   -- FACT_TEMPLATE 第 1 行就是「竞品·维度」，拿维度名匹配正文约等于筛维度，
-   -- 但正文提到该词的**跨维度** fact 也会被带回来（"定价"出现在"功能"那条的结论里）。
-   AND ($3::text[] IS NULL OR split_part(subject, '|', 2) = ANY($3))
- ORDER BY observed_at DESC NULLS LAST, created_at DESC
- LIMIT $4
-"""
+# ── 事实正文的取法（lookup 念答案用；verify 下线后只剩这里在用）─────────
 
 
 def _fact_claim(content: str) -> str:
@@ -823,108 +768,3 @@ def _split_subject(subject: str | None) -> tuple[str, str]:
     """`飞书|定价` → ("飞书", "定价")。"""
     left, _, right = str(subject or "").partition("|")
     return left or "未知竞品", right or "综合"
-
-
-async def check_freshness(
-    pool,
-    user_id: str,
-    competitors: list[str] | None = None,
-    dimensions: list[str] | None = None,
-    limit: int = 10,
-) -> dict:
-    """按事实的观测时间判 fresh / stale，不做重新采集。
-
-    ⚠️ 这不是"校验事实真伪"，只是"这条结论多久没被核对过"。
-    真伪要重新抓页面比原文，属于另一条链路，别在这里冒充。
-
-    【2026-10-27 M3：数据源从 evidence_map 切到 agent_memories 的 fact】
-    ------------------------------------------------------------
-    两者答的不是同一个问题：
-      evidence_map —— "某份报告引用过哪些原文"（逐条引用，含原文片段，用来溯源）
-      fact 记忆   —— "关于某竞品的某个维度，当前有效的观测是哪一条"
-                     （带 observed_at / ttl_days / 取代链）
-    用户问"这些结论还新不新"，答案在 fact 上：只有它知道哪条已被更晚的观测取代、
-    每条该按什么保鲜期算。查不到 fact 就如实说"还没提炼过"，
-    不要退回去用证据行的 created_at 假扮事实——那是拿引用时间冒充观测时间。
-
-    【2026-10-28 保鲜期可配】读取侧现读 `ttl_overrides` 偏好并优先采用，
-    所以改一次偏好，历史 fact 立刻按新档位判定，不需要回填脚本。
-    """
-    competitors = [c for c in (competitors or []) if str(c).strip()] or None
-    dimensions = [d for d in (dimensions or []) if str(d).strip()] or None
-
-    from src.memory.preferences import load_overrides   # 局部 import：避免 supervisor ↔ memory 循环
-
-    overrides = await load_overrides(pool, user_id)
-    rows = await pool.fetch(_FACTS_SQL, user_id, competitors, dimensions, limit)
-
-    items = []
-    for row in rows:
-        competitor, dimension = _split_subject(row.get("subject"))
-        claim = _fact_claim(row.get("content") or "")
-        items.append({
-            "claim": claim,
-            "source_url": row.get("evidence_url") or "",
-            "source_text": None,          # fact 不存原文片段，要原文走 trace
-            "dimension": dimension,
-            "competitor": competitor,
-            "observed_at": _iso(row.get("observed_at") or row.get("created_at")),
-            "ttl_days": row.get("ttl_days"),
-            "memory_id": str(row.get("memory_id") or ""),
-            "task_id": row.get("task_id"),
-        })
-
-    if not items:
-        return {"items": [], "summary": "没有可核对的事实记录。先跑一次分析，系统会把结论提成带保鲜期的事实。"}
-
-    now = datetime.now(timezone.utc)
-
-    fresh, stale = [], []
-    applied_keys: list[str] = []      # 被用户配置改过档的关键词，用于给回执
-    for item in items:
-        # 偏好 > 落库快照 > 现场补算（见 _effective_ttl 的说明）
-        ttl, hit_key = _effective_ttl(item, overrides)
-        item["ttl_days"] = ttl
-        item["ttl_from_user"] = bool(hit_key)
-        if hit_key and hit_key not in applied_keys:
-            applied_keys.append(hit_key)
-        observed = item["observed_at"]
-        age_days = None
-        if observed:
-            observed_dt = datetime.fromisoformat(observed)
-            age_days = (now - observed_dt).days
-        item["age_days"] = age_days
-        item["status"] = (
-            "unknown" if age_days is None
-            else ("stale" if age_days >= ttl else "fresh")
-        )
-        (stale if item["status"] == "stale" else fresh).append(item)
-
-    parts = []
-    if stale:
-        head = stale[0]
-        # ⚠️ 措辞守死：说"超过保鲜期"，不说"已过期"。
-        #   保鲜期是我们自己设的阈值，事实有没有变我们并不知道 ——
-        #   一没重新抓页面、二没比对原文，说"已过期"就是拿阈值冒充事实。
-        parts.append(
-            f"{len(stale)} 条已超过保鲜期。最久的是「{_short(head['claim'], 60)}」，"
-            f"{head['age_days']} 天前观测的，保鲜期 {head['ttl_days']} 天。"
-        )
-    if fresh:
-        head = fresh[0]
-        parts.append(
-            f"{len(fresh)} 条仍在保鲜期内。最近的是「{_short(head['claim'], 60)}」，"
-            f"{head['age_days']} 天前观测的。"
-        )
-    if applied_keys:
-        # ★ 改了配置必须看到回执：否则判定从「在保鲜期内」变成「超期」时，
-        #   用户分不清是设置生效了还是数据真的老了。
-        parts.append(
-            f"保鲜期按你自己设置的「{'、'.join(applied_keys)}」计算，不是内置档位。"
-        )
-    parts.append("以上只判断了「多久没核对」，不代表事实已变；要核实需重新抓取原文。")
-    return {
-        "items": items,
-        "summary": "\n".join(parts),
-        "ttl_overrides_applied": applied_keys,
-    }
