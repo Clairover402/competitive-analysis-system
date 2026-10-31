@@ -236,7 +236,7 @@ async def l3_llm(
     cfg = settings or Settings()
     data: dict = {}
     try:
-        llm = create_llm_client(cfg, temperature=0.0)
+        llm = create_llm_client(cfg, temperature=0.0, tier="secondary")
         resp = await llm.ainvoke(INTENT_PROMPT % (history_block + text))
         data = parse_json_object(getattr(resp, "content", "") or "")
     except Exception:

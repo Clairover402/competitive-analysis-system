@@ -550,7 +550,12 @@ async def lifespan(app: FastAPI):
     app.state.memory_engine = LongTermMemoryEngine(
         llm_analyzer, _AgentMemoryDAO(pool), model_version=settings.embed_model_version
     )
-    app.state.memory_llm = llm_analyzer
+    # 【2026-10-31 降本】偏好抽取是固定格式的 JSON 抽取（"这句话里有没有偏好"），
+    # 走次级模型。注意 conflict 仲裁仍在 memory_engine 内部、继续走主模型——
+    # 它要判断"新观测是否取代旧观测"，判错会误删记忆，不值得为省 token 冒险。
+    from src.agents import create_llm_client as _create_llm
+
+    app.state.memory_llm = _create_llm(settings, temperature=0.0, tier="secondary")
 
     logger.info(
         "竞品分析系统启动完成 | DB pool: min=2 max=10 | "

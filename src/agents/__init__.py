@@ -44,14 +44,17 @@ from src.agents.analyzer import analyzer_agent
 from src.agents.writer import writer_agent
 from src.agents.quality import quality_agent
 
+from typing import Any
+
 from langchain_deepseek import ChatDeepSeek
 
 
 def create_llm_client(
     settings: Settings,
     temperature: float = 0.3,
-) -> ChatDeepSeek:
-    """便捷工厂：创建配置好的 ChatDeepSeek 客户端。
+    tier: str = "primary",
+) -> Any:
+    """便捷工厂：创建配置好的 LLM 客户端。
 
     【L4 工程】集中工厂模式
     所有 LLM 实例通过这里创建，保证：
@@ -65,13 +68,44 @@ def create_llm_client(
     Analyzer 调用时覆盖为 0.1，Quality 覆盖为 0.0。
     工厂默认值取最常见场景，特殊场景显式覆盖。
 
+    【2026-10-31 新增 tier】为什么按任务分层而不是全局换模型
+    ────────────────────────────────────────────────────────
+    实测 106 个任务的 token 分布：analyzer 占 54%、writer 占 16%——这两处
+    要洞察，换小模型直接掉档。而关键词生成(7%)、质检打分(12%)、意图分类 /
+    槽位抽取（合计 ~3%）输出格式固定，对推理能力要求低，是 4B/9B 的甜区。
+    所以工厂按 tier 分流，**不是**全局替换——一改全变会毁掉核心产出。
+
+    「没配 secondary key 或开关关闭」时静默回退主模型，调用方无感知。
+    这样次要模型挂掉不影响主链路，也方便 A/B 对比（只翻开关）。
+
     Args:
         settings: 系统配置（api_key, base_url, model）
         temperature: 温度参数（默认 0.3，已按 Agent 需求选择）
+        tier: "primary" 走 deepseek；"secondary" 走小模型（见 settings.llm_secondary_*）
 
     Returns:
-        已配置的 ChatDeepSeek 实例
+        已配置的 LLM 实例（primary: ChatDeepSeek / secondary: ChatOpenAI）
     """
+    if tier == "secondary" and settings.llm_secondary_enabled and settings.llm_secondary_api_key:
+        # 【为什么用 ChatOpenAI】SiliconFlow 走 OpenAI 兼容协议，而 ChatDeepSeek
+        # 是 DeepSeek 专用适配层。用开放的 ChatOpenAI 接第三方，不依赖厂商 SDK。
+        from langchain_openai import ChatOpenAI
+
+        kwargs: dict[str, Any] = dict(
+            model=settings.llm_secondary_model,
+            api_key=settings.llm_secondary_api_key,
+            base_url=settings.llm_secondary_base_url,
+            temperature=temperature,
+            timeout=60.0,
+            max_retries=2,
+        )
+        if settings.llm_secondary_disable_thinking:
+            # 【必须走 extra_body】Qwen3.5 系列默认带 reasoning：实测「回复两个字」
+            # 也要 190+ reasoning token。直接放进 create() 会被 openai SDK 拒绝
+            # （unexpected keyword argument），必须包进 extra_body 透传给厂商。
+            kwargs["extra_body"] = {"enable_thinking": False}
+        return ChatOpenAI(**kwargs)
+
     return ChatDeepSeek(
         model=settings.deepseek_model,
         api_key=settings.deepseek_api_key,

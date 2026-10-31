@@ -549,6 +549,14 @@ async def collector_agent(
     # 工具级幂等在"续跑"这个场景下等于没有（2026-10-31 实测 6/6 未命中）。
     kw_store = ToolCallResultDAO(pool)
 
+    # 【2026-10-31 降本】关键词生成走次级模型：输出是固定格式的 JSON 列表，
+    # 不需要洞察能力。实测该步骤占 7% 的 token（118 次调用 42.8 万），换 9B
+    # 后成本降一档，且有关键词幂等缓存兜底（同一任务不重掷）。
+    # 局部 import 避免与 src.agents.__init__ 的循环依赖（collector 被它导入）。
+    from src.agents import create_llm_client
+
+    kw_llm = create_llm_client(settings, temperature=0.3, tier="secondary")
+
     # 【L4 工程】Semaphore 值来自配置（默认3），可以根据目标站点的反爬力度调
     semaphore = asyncio.Semaphore(settings.max_concurrent_collectors)
     result: dict[str, dict] = {}
@@ -578,7 +586,7 @@ async def collector_agent(
     gen_usage: dict[str, int] = {}  # 【2026-10-01】累计关键词生成的 token 用量
     for competitor in competitors:
         keywords, official_domains = await _generate_keywords_cached(
-            task_id, competitor, dimensions, llm, gen_usage, store=kw_store
+            task_id, competitor, dimensions, kw_llm, gen_usage, store=kw_store
         )
         per_competitor_keywords[competitor] = keywords
         official_domains_by_competitor[competitor] = official_domains

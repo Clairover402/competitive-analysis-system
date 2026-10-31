@@ -339,7 +339,14 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
         }
         logger.info("【Pipeline】quality node ── task=%s v=%d", 
                     state["task_id"], state.get("report_version", 1))
-        result = await quality_agent(task, mcp_server, llm)
+        # 【2026-10-31 降本】质检打分走次级模型：输出是五维分 + issues 的固定
+        # JSON，占 12% 的 token（114 次 69.7 万）。风险是打分尺度会变（同一份
+        # 报告 9B 给的分与 DeepSeek 不同），所以这次只换模型、不改阈值 70，
+        # 并用规则门禁（计划 D）兜住「分数高但报告差」——打分可以松，规则不会。
+        from src.agents import create_llm_client
+
+        q_llm = create_llm_client(mcp_server.settings, temperature=0.0, tier="secondary")
+        result = await quality_agent(task, mcp_server, q_llm)
         return {
             "quality_score": result["overall_score"],
             "quality_details": result["dimensions"],

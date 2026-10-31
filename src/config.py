@@ -22,10 +22,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ---- LLM: DeepSeek Chat API ----
+    # ---- LLM: DeepSeek Chat API（主模型）----
     deepseek_api_key: str = "competitive-analysis-system-key"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
+
+    # ---- 次级 LLM：结构化抽取 / 打分（2026-10-31）----
+    # 【为什么分层】主模型跑「要洞察」的任务（分析、撰写、RAGAS judge），
+    #   次级模型跑「输出格式固定、不需洞察」的任务（关键词生成、意图分类、
+    #   槽位抽取、偏好抽取、质检打分）。这五处占 22% 的 token，但对模型推理
+    #   能力要求低。
+    # 【为什么不是 4B】实测 SiliconFlow 上 Qwen3.5-4B 单次调用 47-98s（免费档
+    #   限流排队），9B 反而 0.6s。同价位下 4B 不可用，故默认 9B。
+    # 【必须关思考】Qwen3.5 系列默认带 reasoning，连「回复两个字」都要 190+
+    #   reasoning token；enable_thinking=False 后 completion 从 195 降到 1。
+    llm_secondary_enabled: bool = False
+    llm_secondary_base_url: str = "https://api.siliconflow.cn/v1"
+    llm_secondary_api_key: str = ""
+    llm_secondary_model: str = "Qwen/Qwen3.5-9B"
+    llm_secondary_disable_thinking: bool = True
 
     # ---- Database: PostgreSQL + pgvector ----
     pg_host: str = "localhost"
