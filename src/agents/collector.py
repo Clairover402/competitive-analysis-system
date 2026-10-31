@@ -56,7 +56,8 @@ from typing import TYPE_CHECKING
 import tiktoken
 
 from src.db.connection import create_pool
-from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO
+from src.db.dao import ChunkEmbeddingDAO, AgentLogDAO, ToolCallResultDAO
+from src.mcp.server import _tool_call_id
 from src.observability.token_usage import extract_usage, add_usage
 from src.agents.content_quality import (
     clean_chunk_text,
@@ -82,13 +83,20 @@ _MIN_READABLE_CHARS = 200
 # §1 搜索关键词生成
 # ═════════════════════════════════════════════════════════════════════════════
 
-_KEYWORD_PROMPT = """你是一个搜索专家。根据竞品名称和分析维度，生成 3-5 个精准的搜索 query。
-要求：每个 query 要具体，结合竞品名+维度+时间限定，不同 query 覆盖不同角度。
+_KEYWORD_PROMPT = """你是一个搜索专家。根据竞品名称和分析维度，生成恰好 3 个精准的搜索 query。
+要求：只给 3 个，把多个角度合并进同一条 query（竞品名+维度+时间限定写在一条里），
+例如「飞书 2025 企业版 价格 订阅费率」而不是把角度拆成多条。
+不同 query 之间必须覆盖不同维度，不允许同一维度出两条。
 另外给出该竞品的**官方网站域名**（official_domains）：只写注册域或产品子域本身，
 如 feishu.cn / dingtalk.com / notion.com；**不确定就留空数组，不要猜**。
 
 输入: {competitor: "%s", dimensions: %s}
-输出: {"queries": ["query1", "query2", ...], "official_domains": ["domain1", ...]}"""
+输出: {"queries": ["query1", "query2", "query3"], "official_domains": ["domain1", ...]}"""
+
+# 【2026-10-31 配额闸门】Tavily 免费额度 1000 次/月已用尽，40 条任务按旧口径
+# （每竞品 3~5 条 query）要烧 ~800 次搜索。压到 3 条/竞品后 4 竞品任务 = 12 条，
+# 40 条任务 ≤ 500 次。⚠️ prompt 只能"劝"，LLM 仍会超发 —— 真正的保证是这里切片。
+MAX_QUERIES_PER_COMPETITOR = 3
 
 
 def _extract_json_payload(text: str) -> str:
@@ -328,6 +336,14 @@ async def _generate_keywords(
             domains = [d.strip() for d in domains if isinstance(d, str) and d.strip()]
 
             if isinstance(keywords, list) and len(keywords) > 0:
+                # 硬上限：prompt 让 LLM 只给 3 条，但它不总是听话 —— 这里切片兜底。
+                # 模板兜底路径（函数末尾）不切片：那是每维度一条，切了会丢维度。
+                if len(keywords) > MAX_QUERIES_PER_COMPETITOR:
+                    logger.info(
+                        "LLM 为 %r 超发 %d 条 query，截到 %d",
+                        competitor, len(keywords), MAX_QUERIES_PER_COMPETITOR,
+                    )
+                    keywords = keywords[:MAX_QUERIES_PER_COMPETITOR]
                 logger.info(
                     "日志：LLM为 %r 生成了 %d 个关键词，官网域=%s",
                     competitor, len(keywords), domains or "（未提供）",
@@ -371,6 +387,55 @@ async def _generate_keywords(
     ]
     """
     return [f"{competitor} {dim}" for dim in dimensions], []
+
+
+# ── 关键词生成也要幂等（2026-10-31，亮点 A / A5 实测发现的缺口）───────────
+# 【实测证据】同一条任务被杀在中途后重跑，6 条 web_search 的幂等键全没命中：
+#   LLM 重新生成的 query 措辞整体换了（连年份都从「2025」漂到「2026」），
+#   而 idem_key = f"search|{竞品}|{query}" 把措辞也纳进了指纹。
+#   ⇒ 工具级幂等只对「同一句话再调一次」有效，对「续跑重跑」几乎无效。
+# 【根因】指纹该落在**这次调用的目的**上，而 query 是手段：同一竞品的同一轮
+#   关键词生成，逻辑上只该发生一次。把这一步的结果也记进同一张结果日志，
+#   续跑时直接回放 → query 字符串不变 → 后面所有 search/fetch 的指纹自然稳定。
+# 【为什么不改 search 的键】去掉 query 会让"不同目的的搜索"撞成一条
+#   （见 MEMORY 里「池外竞品必须原值下推」同类教训：键丢信息=静默错配）。
+# 【代价】同一任务内不会重新掷骰子：首次生成的关键词质量差就一直是那批。
+#   这与工具幂等的既有口径一致（首次结果不可变），且新任务是新 task_id，不受影响。
+async def _generate_keywords_cached(
+    task_id: str,
+    competitor: str,
+    dimensions: list[str],
+    llm: ChatDeepSeek,
+    usage_acc: dict[str, int] | None = None,
+    store=None,
+) -> tuple[list[str], list[str]]:
+    """按 (task, 竞品) 幂等地生成关键词：命中就回放，不重掷。"""
+    if store is None:
+        return await _generate_keywords(competitor, dimensions, llm, usage_acc)
+
+    tc_id = _tool_call_id(task_id, "gen_keywords", f"keywords|{competitor}")
+    try:
+        cached = await store.get(tc_id)
+    except Exception:  # noqa: BLE001 — 存储挂了退化为重新生成
+        logger.warning("关键词缓存查询失败，重新生成 competitor=%r", competitor, exc_info=True)
+        cached = None
+    if isinstance(cached, dict) and cached.get("keywords"):
+        logger.info(
+            "关键词回放 competitor=%r（续跑/重试不重掷）n=%d",
+            competitor, len(cached["keywords"]),
+        )
+        return list(cached["keywords"]), list(cached.get("official_domains") or [])
+
+    keywords, domains = await _generate_keywords(competitor, dimensions, llm, usage_acc)
+    try:
+        await store.save(
+            tc_id, "gen_keywords", task_id,
+            {"competitor": competitor, "dimensions": dimensions},
+            {"keywords": keywords, "official_domains": domains},
+        )
+    except Exception:  # noqa: BLE001 — 落库失败只是下次重新生成
+        logger.warning("关键词结果落库失败 competitor=%r", competitor, exc_info=True)
+    return keywords, domains
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -480,6 +545,9 @@ async def collector_agent(
     pool = await create_pool(settings)
     chunk_dao = ChunkEmbeddingDAO(pool)
     log_dao = AgentLogDAO(pool)
+    # 关键词生成也纳入幂等日志：否则续跑会重掷 query → 下游 search/fetch 指纹全变，
+    # 工具级幂等在"续跑"这个场景下等于没有（2026-10-31 实测 6/6 未命中）。
+    kw_store = ToolCallResultDAO(pool)
 
     # 【L4 工程】Semaphore 值来自配置（默认3），可以根据目标站点的反爬力度调
     semaphore = asyncio.Semaphore(settings.max_concurrent_collectors)
@@ -509,8 +577,8 @@ async def collector_agent(
     official_domains_by_competitor: dict[str, list[str]] = {}
     gen_usage: dict[str, int] = {}  # 【2026-10-01】累计关键词生成的 token 用量
     for competitor in competitors:
-        keywords, official_domains = await _generate_keywords(
-            competitor, dimensions, llm, gen_usage
+        keywords, official_domains = await _generate_keywords_cached(
+            task_id, competitor, dimensions, llm, gen_usage, store=kw_store
         )
         per_competitor_keywords[competitor] = keywords
         official_domains_by_competitor[competitor] = official_domains
