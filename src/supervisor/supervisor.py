@@ -25,9 +25,8 @@ Supervisor 是竞品分析系统的"探索模式控制器"。
   │          │ → 写 pending_task_result/agent/status                    │
   │          │ 【L3】闭包工厂注入 router（不持有 LLM）                    │
   ├──────────┼──────────────────────────────────────────────────────────┤
-  │ observe  │ 读 pending_* → 映射 result 到业务字段 → 提取长期记忆     │
-  │          │ → 增量摘要 → 每10轮全量合并 → current_round += 1          │
-  │          │ 【L3】闭包工厂注入 summarizer + memory_engine             │
+  │ observe  │ 读 pending_* → 映射 result 到业务字段 → current_round += 1  │
+  │          │ 【L3】闭包工厂注入 AgentLogDAO（轨迹埋点）                  │
   ├──────────┼──────────────────────────────────────────────────────────┤
   │ route    │ 读 is_complete + current_round vs max_rounds              │
   │          │ → "continue"(回到think) 或 "end"(到END)                   │
@@ -51,7 +50,7 @@ Supervisor 是竞品分析系统的"探索模式控制器"。
               async def run(self): while(...) ...
   当前设计:   _make_node_think(llm, router, ...) → node_think
               _make_node_act(router, log_dao)    → node_act
-              _make_node_observe(summarizer, ...) → node_observe
+              _make_node_observe(log_dao)        → node_observe
 
   闭包工厂的优势:
   — 依赖精确到节点: think 持有 LLM+router，act 只持有 router
@@ -115,7 +114,6 @@ if TYPE_CHECKING:
     from asyncpg import Pool
     from langchain_deepseek import ChatDeepSeek
     from src.mcp.server import MCPServer
-    from src.memory.summarizer import MemorySummarizer
     from src.memory.long_term import LongTermMemoryEngine
 
 logger = logging.getLogger(__name__)
@@ -757,11 +755,19 @@ def _make_node_act(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_node_observe(
-    summarizer: MemorySummarizer | None = None,
-    memory_engine: LongTermMemoryEngine | None = None,
     log_dao: AgentLogDAO | None = None,
 ):
-    """创建 observe 节点函数——注入 MemorySummarizer + LongTermMemoryEngine。
+    """创建 observe 节点函数——注入 AgentLogDAO（轨迹埋点）。
+
+    ★ 2026-10-31：删掉了 summarizer / memory_engine 两个参数。
+      它们从建图到调用全程没有任何一处传值（`build_supervisor_graph` 的
+      两个可选参数恒为 None），等于一个"每轮会调 LLM、但永远不执行"的分支。
+      更关键的是**即使接上也没有收益**：think 的 prompt 是**有界**的
+      （progress 固定字段 + reasoning_trace 只取最后 3 条），
+      轮次增加不会让上下文变长，没有需要压的东西；而摘要也没有任何消费方
+      （think 从不读 summary）。接上去只会每轮多一次 LLM 调用。
+      会话侧的"滑窗 + 摘要压缩"在 `supervisor/conversation.py`，
+      那里才是长对话，别把两件事混在一起。
 
     【L3 核心考点】observe 是 ReAct 循环中最重的节点
     ──────────────────────────────────────────────
@@ -784,8 +790,7 @@ def _make_node_observe(
     │     │ 映射评分 + 门禁              │ rewrite_suggestions               │
     │  ⑦  │ 长期记忆提取                │ (LongTermMemoryEngine.add_memory) │
     │  ⑧  │ 追加 messages_buffer        │ messages_buffer(operator.add)     │
-    │  ⑨  │ 摘要记忆(增减+全量合并)      │ (MemorySummarizer)                │
-    │     │ + current_round += 1         │ current_round                     │
+    │  ⑨  │ current_round += 1          │ current_round                     │
     └─────┴─────────────────────────────┴───────────────────────────────────┘
 
     【L5 决策】为什么 status=="failed" 不更新业务字段？
@@ -796,14 +801,15 @@ def _make_node_observe(
 
     但失败会在 reasoning_trace 中记录，LLM 能看到"上轮失败了"→ 可自行决定重试。
 
-    【L5 决策】摘要记忆时序
-    ────────────────────
-    增量摘要每轮执行（轻量），全量合并每 10 轮执行（重量）。
-    两种摘要结束后才 current_round += 1——保证摘要中 round_num 与实际一致。
+    【L5 决策】摘要记忆为什么不在这里做（2026-10-31 定论）
+    ──────────────────────────────────────────────
+    ① think 的 prompt 有界：progress 是固定字段拼接、reasoning_trace 只取最后 3 条，
+       轮次再多 prompt 也不会变长 —— 没有"长对话"这回事，压缩没有对象。
+    ② 摘要没有消费方：think 从不读 summary，写了也进不了 prompt。
+    ③ 所以"接上摘要"= 每轮白加一次 LLM 调用。会话侧的滑窗摘要见 conversation.py。
 
     Args:
-        summarizer: 可选 MemorySummarizer（若 None 则跳过摘要）
-        memory_engine: 可选 LongTermMemoryEngine（若 None 则跳过长期记忆写入）
+        log_dao: 可选 AgentLogDAO（轨迹埋点；None 则跳过落库）
 
     Returns:
         async def node_observe(state: SupervisorState) -> dict
@@ -940,31 +946,13 @@ def _make_node_observe(
         reason = decision.get("reason", "")
         msg_entry = {"role": "assistant", "content": f"[{agent_name}] {reason}"}
 
-        # ─── 步骤⑨: 摘要记忆 ───
-        if summarizer is not None:
-            try:
-                task_id = state.get("task_id", "")
-                # messages_buffer 是 Annotated[list, operator.add] —
-                # 节点返回 {"messages_buffer": [entry]} 时 LangGraph 自动拼接
-                # 但完整历史列表需要手动构造
-                all_msgs = list(state.get("messages_buffer", [])) + [msg_entry]
-
-                # 增量摘要: 每轮执行（前轮摘要 + 本轮消息 → 新摘要）
-                await summarizer.summarize_round(
-                    task_id=task_id,
-                    messages=all_msgs,
-                    round_num=current_round,
-                )
-
-                # 全量合并: 每 10 轮校准语义漂移
-                # 增量摘要累积 10 轮后可能出现主题偏移，全量合并用原始消息
-                # 全部重新生成一次摘要，校准偏差
-                if current_round % 10 == 0:
-                    await summarizer.full_merge_summary(messages=all_msgs)
-                    logger.info("全量摘要合并完成: round=%d", current_round)
-            except Exception:
-                # 摘要失败不阻塞主循环
-                logger.exception("摘要记忆失败，继续执行")
+        # ─── 原步骤⑨（摘要记忆）已删除，见 §5 顶部「为什么不在这里做摘要」───
+        # 删掉的那段有两个独立缺陷：
+        #   ① `summarizer` 恒为 None（建图时不传）→ 整段从未执行；
+        #   ② 即便接上，`full_merge_summary()` 的返回值**被直接丢弃**、
+        #      没有写库也没有进 prompt —— 在第 10 轮多付一次 LLM 费用，
+        #      换一段没人看的字符串。而 summarize_round 内部已经做过全量合并，
+        #      等于同一轮做两次。
 
         # ─── 写入 updates ───
         updates["messages_buffer"] = [msg_entry]
@@ -1074,7 +1062,6 @@ async def build_supervisor_graph(
     pool: Pool,
     router: A2ARouter,
     llm_supervisor: ChatDeepSeek,
-    summarizer: MemorySummarizer | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
 ) -> CompiledStateGraph:
     """构建并编译 Supervisor StateGraph — 外部调用此函数获取可执行图。
@@ -1115,8 +1102,7 @@ async def build_supervisor_graph(
         pool: asyncpg 连接池（供 PostgresSaver 使用）
         router: A2A 路由器（已注册 4 个 Agent 的卡片+handler+LLM）
         llm_supervisor: Supervisor 专用 LLM（temperature=0.3，决策探索性）
-        summarizer: 可选摘要记忆器
-        memory_engine: 可选长期记忆引擎
+        memory_engine: 可选长期记忆引擎（think 节点用）
 
     Returns:
         编译后的 CompiledStateGraph（调用 ainvoke(state, config) 执行）
@@ -1137,7 +1123,7 @@ async def build_supervisor_graph(
         log_dao=log_dao,
     )
     node_act = _make_node_act(router, log_dao)
-    node_observe = _make_node_observe(summarizer, memory_engine, log_dao)
+    node_observe = _make_node_observe(log_dao)
 
     # ─── 步骤①: 创建 StateGraph ───
     graph = StateGraph(SupervisorState)
@@ -1180,7 +1166,6 @@ async def run_supervisor_task(
     pool: Pool,
     router: A2ARouter,
     llm_supervisor: ChatDeepSeek,
-    summarizer: MemorySummarizer | None = None,
     memory_engine: LongTermMemoryEngine | None = None,
 ) -> dict:
     """运行 Supervisor 模式竞品分析——外部调用的一键入口。
@@ -1216,7 +1201,6 @@ async def run_supervisor_task(
         pool: asyncpg 连接池
         router: A2A 路由器（已注册 4 Agent）
         llm_supervisor: Supervisor 专用 LLM
-        summarizer: 可选
         memory_engine: 可选
 
     Returns:
@@ -1233,7 +1217,6 @@ async def run_supervisor_task(
         pool=pool,
         router=router,
         llm_supervisor=llm_supervisor,
-        summarizer=summarizer,
         memory_engine=memory_engine,
     )
 
@@ -1309,7 +1292,11 @@ async def run_supervisor_task(
             from src.db.dao import TaskDAO
 
             task_dao = TaskDAO(pool)
-            await task_dao.update_status(task["id"], "completed")
+            # 同 pipeline finalize：只从 running/pending 推进到 completed，
+            # 不覆盖已完成的结论（CAS 详见 TaskDAO.update_status）。
+            await task_dao.update_status(
+                task["id"], "completed", expected=("running", "pending")
+            )
             logger.info("Supervisor 已回写 task status=completed task_id=%s", task["id"][:8])
         except Exception as e:
             # 回写失败不阻断返回——评估器会因 status 仍为 pending 而跳过，

@@ -60,7 +60,12 @@ FACT_TEMPLATE = """[事实] {competitor}·{dimension}（观测 {date}）
 # 太短的 claim 多是"数据不足""待验证"这类占位串，提成事实只会污染检索。
 _MIN_CLAIM_CHARS = 12
 # 单条 claim 上限：evidence_map 里有 400 字以上的整段论断，直接写进记忆会让
-# 一条记忆吃掉注入预算的一大截（analyze 注入 5 条 × 每条截 200 字）。
+# 一条记忆吃掉展示预算的一大截 —— lookup 念结论时只取 content 第 2 行
+# （见 query_handlers._fact_claim），太长的那一行挤掉的是同一任务的其它维度。
+# ⚠️ 2026-10-31 更正：这里原写"analyze 注入 5 条 × 每条截 200 字"，
+#    但 analyze 早已不注入长期记忆（59b530e 删，边界由
+#    tests/test_analyze_memory_boundary.py 锁住）。真正读这张表的是 lookup：
+#    _LOOKUP_SQL 的 LATERAL（同任务）+ _FACT_BY_SUBJECT_SQL（同竞品回落）。
 _MAX_CLAIM_CHARS = 220
 
 

@@ -41,23 +41,28 @@
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-               【L5 架构 — 为什么不集成 Pipeline】
+               【L5 架构 — 两条路径，一条在跑，一条不接】
 ═══════════════════════════════════════════════════════════════════════════════
 
-Pipeline 没有对话轮次概念:
-  Pipeline 是 5 节点顺序流，每个节点执行一次。Writer 最多重写 2 次
-  （3 个 report_version）——远达不到全量合并的 10 轮阈值。
-  Summarizer 在 Pipeline 中会永远运行在递增模式下，全量合并路径永不到达。
+✅ 在跑：`incremental_summary()` —— 会话入口的滑窗摘要
+  `supervisor/conversation.py::_refresh_summary` 在用：
+  会话超 RECENT_TURNS(6) 行后，每 3 轮把「前次摘要 + 最近 12 行原文」压成一条
+  滚动摘要，落在 conversations.summary 上，与最近 6 行原文一起拼成
+  format_history_block() 交给 L3。这是本项目**唯一**真实生效的上下文压缩。
 
-正确的归属:
-  Phase 7 Supervisor 有 ReAct 循环（_think → _act → _observe → _think → ...）。
-  每轮 think 就是一次 LLM 推理，天然有对话轮次。
-  摘要在第 5/10/15 轮触发全量合并，在中间轮次触发递增合并。
+❌ 不接：`summarize_round()` / `full_merge_summary()` —— 按 task_id 多版本存
+  设计假设是「ReAct 每轮都摘要，每 10 轮全量校准」。但 2026-10-31 核查后确认
+  Supervisor 不能接，三个理由：
+    ① think 的 prompt 是**有界**的（progress 固定字段 + reasoning_trace 只取
+       最后 3 条），轮次增加不会让上下文变长 —— 没有需要压的对象；
+    ② 摘要没有消费方：think 从不读 summary，写了也进不了 prompt；
+    ③ 因此接上等于每轮白加一次 LLM 调用（10 轮 10 次），换一段没人看的字符串。
+  原 observe 节点里那段调用已删除（它还有第二个缺陷：full_merge 的返回值被丢弃）。
 
-当前文件的角色:
-  写好了完整逻辑但不集成——Staged Integration 策略（先写再挂）。
-  Pipeline 的 graph.py 中有注释标记:
-    "write 后的摘要钩子跳过——Summarizer 留给 Phase 7 Supervisor"
+⚠️ 别把两条路径的「轮」混为一谈：
+  会话的轮 = 用户问答轮（会长，30 轮很常见）；
+  Supervisor 的轮 = ReAct 决策轮（硬上限 10，且 prompt 不随之增长）。
+  前者需要压缩，后者不需要 —— 这是同一个词在两种语境下含义不同。
 """
 
 from __future__ import annotations
@@ -76,6 +81,52 @@ logger = logging.getLogger(__name__)
 # LLM Prompt — 递增合并模板
 # ══════════════════════════════════════════════════════════════════════════════
 
+# 摘要输入的字符预算（不是消息条数）。
+# ★ 2026-10-31 改：原实现取 `new_messages[-5:]`，等于在调用方已经定好窗口之后
+#   又砍一刀 —— 首次摘要调用方传全量（6 行 / 3 轮），被它砍成 5 条，
+#   第 1 轮的**用户原话**正好被切掉，竞品名就此永久丢失。
+#   现在改成"按字符预算从尾部保留"：预算管的是成本，窗口宽度由调用方决定。
+_MAX_INPUT_CHARS = 8000
+
+# 单条消息的截断长度（递增合并）
+_PER_MSG_CHARS = 300
+
+# 单条消息的截断长度（全量合并：只看一次，需要更多上下文）
+_PER_MSG_CHARS_FULL = 500
+
+
+def _tail_within_budget(
+    messages: list[dict], budget: int, per_msg: int
+) -> list[dict]:
+    """从尾部往前取消息，直到字符预算用完；返回**保持原顺序**的切片。
+
+    为什么按预算而不是条数：一条 3000 字的长消息和 10 条 30 字的短消息，
+    对上下文的占用差两个数量级，用条数根本约束不住成本。
+    """
+    out: list[dict] = []
+    used = 0
+    for m in reversed(messages):
+        cost = min(len(m.get("content") or ""), per_msg)
+        if out and used + cost > budget:
+            break
+        out.append(m)
+        used += cost
+    return list(reversed(out))
+
+
+def fits_budget(messages: list[dict], *, full: bool = False) -> bool:
+    """这组消息能否**整段**喂进摘要器（超预算时 _tail_within_budget 只留尾部）。
+
+    ★ 为什么要暴露这个判定（2026-10-31）：
+      调用方要把"喂了多少行"记成"覆盖了多少行"（可回链锚点）。超预算时
+      摘要器静默丢掉头部，若调用方仍按 max(seq) 推进锚点，锚点就会声称
+      覆盖了一段从未被概括的原文 —— 回链过去对不上，而且**不报错**。
+      判据与 _tail_within_budget 同口径，否则两边会各算一套。
+    """
+    per = _PER_MSG_CHARS_FULL if full else _PER_MSG_CHARS
+    return sum(min(len(m.get("content") or ""), per) for m in messages) <= _MAX_INPUT_CHARS
+
+
 _INCREMENTAL_PROMPT = """你是对话摘要器。将前次摘要与新对话合并为一个简短摘要。
 
 前次摘要:
@@ -84,11 +135,28 @@ _INCREMENTAL_PROMPT = """你是对话摘要器。将前次摘要与新对话合�
 新对话:
 %s
 
-要求:
-- 保留所有关键决策和用户偏好，不可丢失
-- 丢弃闲聊和重复信息
-- 不确定的信息标注为 [unverified]
-- 输出不超过 500 字
+【输出格式：四节固定，缺内容写「无」，不许省略标题】
+【对象】竞品名 / 产品名 / 公司名，逐个列出
+【维度与要求】用户要看的评估维度、分析角度、报告结构
+【口径与约束】换算方式、统计范围、含税与否、付费周期、上限、排除项
+【未完成】用户明确说了还没做的动作
+
+【必须逐字保留，一个字都不许改】
+- 产品名 / 竞品名（如「Notion」「飞书」）—— 禁止替换成「该产品」「对话主题」「上述内容」
+- 评估维度名（如「并发上限」「技术架构」）—— 用户后面会说「那个维度」，
+  概括成「性能相关」就再也对不回去了
+- 版本号、URL、金额与币种、日期、比例
+- 用户明确设定的口径（换算方式、统计范围、上限、排除项）
+- 还没做完的动作（「最后再写技术架构」这类）
+
+【为什么这条约束是硬要求】
+摘要的消费者是**下一轮的指代消解**：用户会说「那 Slack 呢」「按刚才说的口径算」。
+一旦你把实体名或维度名概括掉，后续所有轮次都无法把它们映射回具体对象，
+表现为"上下文压缩之后答非所问"，而且**不报错**——只是越答越飘。
+所以宁可摘要长一点，也不许把名字换成代词。
+
+前次摘要里已经出现过的上述要素，必须原样带到新摘要中，不得二次概括。
+总长不超过 600 字（四节合计）。
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,11 +168,18 @@ _FULL_MERGE_PROMPT = """你是对话摘要器。从完整对话中提取所有�
 对话:
 %s
 
-要求:
-- 提取所有关键决策、用户偏好和事实表述
-- 丢弃闲聊和重复信息
-- 不确定的信息标注为 [unverified]
-- 输出不超过 500 字
+【输出格式：四节固定，缺内容写「无」，不许省略标题】
+【对象】竞品名 / 产品名 / 公司名，逐个列出
+【维度与要求】用户要看的评估维度、分析角度、报告结构
+【口径与约束】换算方式、统计范围、含税与否、付费周期、上限、排除项
+【未完成】用户明确说了还没做的动作
+
+【必须逐字保留】
+- 产品名/竞品名、评估维度名、版本号、URL、金额与币种、日期
+- 用户设定的口径、未完成动作
+禁止替换成「该产品」「上述内容」「性能相关」等代词或概括。
+
+总长不超过 600 字（四节合计）。
 """
 
 
@@ -123,10 +198,11 @@ class MemorySummarizer:
 
 
 
-    【L5 架构】Pipeline 不集成此类
+    【L5 架构】哪个方法在跑，哪个没有
     ─────────────────────────────
-    Pipeline 无对话轮次（最多 3 个 report_version），
-    Summarizer 留给 Phase 7 Supervisor 的 ReAct 循环激活。
+    在跑:   incremental_summary()  ← conversation.py 的会话滑窗摘要
+    不接:   summarize_round() / full_merge_summary()（按 task_id 多版本）
+            原因见文件头「两条路径，一条在跑，一条不接」。
     """
 
     # 【L4 工程】全量合并间隔 — 10 轮触发一次
@@ -159,17 +235,12 @@ class MemorySummarizer:
     ) -> str:
         """递增合并: 前次摘要 + 新对话 → LLM → 新摘要。
 
-        【L4 工程】为什么只取最后 5 条消息？
-        ─────────────────────────────────
-          — 消息太多会超过 LLM 上下文窗口（但不取全量又可能丢失上下文）
-          — 5 条的取舍: 够覆盖最近一轮对话（think + act + observe + user + think）
-          — 如果一轮有 10 条消息，取最后 5 条就丢了前半轮——但全量合并会补回来
-
-        【L4 工程】每条消息截断到 300 字符
-        ────────────────────────────────
-          — 防止长消息撑爆 prompt（如代码块 2000+ 字符）
-          — 300 字符 ≈ 中文 ~150 字，足够保留核心语义
-          — 截断不是摘要——LLM 生成的新摘要会做真正的信息压缩
+        【L4 工程】输入按字符预算裁，不按条数裁（2026-10-31 修）
+        ────────────────────────────────────────────────
+          旧实现 `new_messages[-5:]`：调用方（_refresh_summary）已经按窗口
+          挑好了行数，这里再按"5 条"砍一刀，第 1 轮用户原话被切掉 →
+          竞品名永久丢失。实测：8 轮会话里四家竞品名全丢，就是这一行造成的。
+          现在由 `_tail_within_budget` 只按总字数封顶，窗口宽度交还调用方。
 
         【L4 工程】失败回退策略
         ─────────────────────
@@ -177,10 +248,11 @@ class MemorySummarizer:
           不回退到空字符串——至少保留前一轮的摘要，信息不丢。
         """
         # ── 构造新消息文本 ──
+        kept = _tail_within_budget(new_messages, _MAX_INPUT_CHARS, _PER_MSG_CHARS)
         new_text = ""
-        for m in new_messages[-5:]:          # 只取最后 5 条
+        for m in kept:
             role = m.get("role", "?")
-            content = m.get("content", "")[:300]  # 截断到 300 字符
+            content = (m.get("content") or "")[:_PER_MSG_CHARS]
             new_text += f"[{role}]: {content}\n"
 
         prev = prev_summary if prev_summary else "(无前次摘要)"
@@ -217,10 +289,11 @@ class MemorySummarizer:
           截断到 500 字符（比递增的 300 更长）——全量合并只看这一次，
           需要更多上下文来理解整段对话。
         """
+        kept = _tail_within_budget(messages, _MAX_INPUT_CHARS, _PER_MSG_CHARS_FULL)
         full_text = ""
-        for m in messages:
+        for m in kept:
             role = m.get("role", "?")
-            content = m.get("content", "")[:500]  # 全量合并用更长的截断
+            content = (m.get("content") or "")[:_PER_MSG_CHARS_FULL]
             full_text += f"[{role}]: {content}\n"
 
         prompt = _FULL_MERGE_PROMPT % full_text

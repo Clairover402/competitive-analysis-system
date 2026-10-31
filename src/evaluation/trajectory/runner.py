@@ -199,6 +199,10 @@ def build_trace(task_id: str, rows: list[dict]) -> Trace:
                 "kind": response.get("kind"),
                 "n": response.get("n"),
                 "chars": response.get("chars"),
+                # 搜索结果的引擎分布（2026-10-30）：{"tavily": 7} 或 {"synthesize": 6}
+                "engines": response.get("engines") or {},
+                # 渲染兜底标记：playwright = httpx 拿骨架后由本地 chromium 补的正文
+                "fallback": response.get("fallback") or "",
                 "score_top1": response.get("score_top1"),
                 "score_median": response.get("score_median"),
                 "score_min": response.get("score_min"),
@@ -557,11 +561,47 @@ def _tool_counts(trace: Trace) -> dict:
 
 
 def _empty_search_rate(trace: Trace) -> dict:
+    """搜索层「不可信结果」占比 = synthesize 构造的 URL / 全部搜索返回条数。
+
+    ⚠️ 2026-10-30 口径变更（原名「搜索空结果率」，实测恒为 0，等于没测）
+      三层 fallback 的最后一层 `_synthesize_urls` **不搜索**，只按 query 拼出
+      site:zhihu.com 这类 URL 返回，列表因此永远非空 —— 「空结果率」在结构上
+      不可能非 0。真正该报警的是「有多少结果是拼出来的」：这个数高意味着
+      Tavily/Bing/Sogou 全挂，下游抓的是一堆虚构 URL，既浪费渲染成本，
+      又把无关页面（实测 cryptorank.io 的 Obsidian 资本公司）写进向量库。
+
+    旧日志没有 engines 字段 → 记 n/a，不猜。
+    """
     searches = _tools(trace, "web_search")
     if not searches:
         return _metric("n/a", "无 web_search 调用")
-    empty = sum(1 for s in searches if (s["n"] or 0) == 0)
-    return _metric(round(empty / len(searches), 3), f"{empty} 次空结果 / {len(searches)} 次搜索")
+    by_engine: Counter[str] = Counter()
+    for s in searches:
+        for eng, cnt in (s.get("engines") or {}).items():
+            by_engine[eng] += int(cnt or 0)
+    total = sum(by_engine.values())
+    if not total:
+        return _metric("n/a", "无引擎标记（旧日志或搜索无返回）")
+    synth = by_engine.get("synthesize", 0)
+    detail = " ".join(f"{k}×{v}" for k, v in by_engine.most_common())
+    return _metric(round(synth / total, 3), f"synthesize {synth}/{total}（{detail}）")
+
+
+def _playwright_fallback_rate(trace: Trace) -> dict:
+    """渲染兜底命中率 = 靠本地 chromium 救回正文的抓取 / 全部抓取。
+
+    【为什么单列，不并进失败分桶】
+      这些是 httpx 失败、但被渲染救回来的抓取。算进失败会把失败率抬高，
+      算进成功则看不出这层到底值不值。单列才能回答「兜底救了多少」——
+      实测单任务 7/10，即七成页面只有渲染才拿得到。
+    """
+    fetches = _tools(trace, "web_fetch")
+    if not fetches:
+        return _metric("n/a", "无 web_fetch 调用")
+    rendered = sum(1 for f in fetches if f.get("fallback") == "playwright")
+    return _metric(
+        round(rendered / len(fetches), 3), f"{rendered}/{len(fetches)} 次靠渲染取得"
+    )
 
 
 def _fetch_buckets(trace: Trace) -> tuple[int, Counter[str]] | None:
@@ -775,6 +815,7 @@ def l2_metrics(trace: Trace) -> dict[str, dict]:
         "工具调用次数": _tool_counts(trace),
         "搜索空结果率": _empty_search_rate(trace),
         "抓取失败率": _fetch_failure_buckets(trace),
+        "渲染兜底命中率": _playwright_fallback_rate(trace),
         "重复抓取率": _duplicate_fetch_rate(trace),
         "embedding 调用": _embedding_calls(trace),
         "embed 覆盖率": _embed_coverage(trace),
@@ -915,7 +956,10 @@ def l3_metrics(trace: Trace) -> dict[str, dict]:
 #   同时：删「重复动作率」（4 agent 各跑一次的 DAG 上结构恒 0，与好坏无关）；
 #   「参数完整率」增判空值（摘要里已有 len=N）；新增「embed 覆盖率」「精排筛除率」。
 #   ⚠️ v6 与 v5 的三项指标不可直接比：v5 是常数，不是基线。
-METRICS_VERSION = 6
+# v6 → v7（2026-10-30）：新增 playwright_fallback_rate（渲染兜底命中率），
+#   并把 search_empty_rate 的口径从「空结果率」改成「synthesize 构造 URL 占比」——
+#   旧口径受三层 fallback 影响恒为 0，等于没测。
+METRICS_VERSION = 7
 
 # 与 schema.sql 的 trajectory_metrics 列顺序一一对应（不含 task_id / computed_at）。
 _ROW_COLUMNS = (
@@ -923,8 +967,9 @@ _ROW_COLUMNS = (
     "illegal_transitions", "repeat_rate", "failed_round_rate", "arg_completeness",
     "observation_responsiveness", "tool_calls", "search_empty_rate", "fetch_fail_rate",
     "fetch_fail_detail", "dup_fetch_rate", "embed_calls", "embed_chunks",
+    "playwright_fallback_rate", "embed_coverage",
     "rerank_gap", "rerank_under_k", "funnel_search", "funnel_fetch",
-    "funnel_pages", "funnel_chunks", "embed_coverage",
+    "funnel_pages", "funnel_chunks",
     # L3：检索侧（来源 retrieval_snapshot，不是 agent_logs）
     "retrieval_cells", "recall_avg", "rerank_avg", "rerank_drop_rate",
     "coverage_skew", "cross_dim_dup",
@@ -984,6 +1029,7 @@ def to_row(trace: Trace) -> dict:
         "search_empty_rate": _num(l2["搜索空结果率"]),
         "fetch_fail_rate": _num(l2["抓取失败率"]),
         "fetch_fail_detail": dict(fetch[1]) if fetch else None,
+        "playwright_fallback_rate": _num(l2["渲染兜底命中率"]),
         "dup_fetch_rate": _num(l2["重复抓取率"]),
         "embed_calls": (embed[0] + embed[1]) if embed else None,
         "embed_chunks": embed[2] if embed else None,
