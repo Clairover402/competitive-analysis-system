@@ -330,6 +330,7 @@ CREATE TABLE IF NOT EXISTS trajectory_metrics (
     search_empty_rate FLOAT,
     fetch_fail_rate   FLOAT,
     fetch_fail_detail JSONB,   -- {"403":1,"timeout":2}，展开后画堆叠图
+    playwright_fallback_rate FLOAT,  -- 靠本地 chromium 渲染救回正文的抓取占比（httpx 只拿到骨架）
     dup_fetch_rate    FLOAT,
     embed_calls       INT,
     embed_chunks      INT,
@@ -528,10 +529,20 @@ CREATE TABLE IF NOT EXISTS conversations (
     user_id    VARCHAR(100) NOT NULL,
     title      VARCHAR(200),                    -- 首句话裁出来的标题，仅给会话列表看
     summary    TEXT,                            -- 超过 6 轮后的会话摘要（滚动覆盖）
+    summary_upto_seq INT,                       -- 摘要**已覆盖到**的最大 seq（可回链锚点）
     turn_count INT NOT NULL DEFAULT 0,          -- 用户轮数（不含 assistant 行）
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- 2026-10-31：给已有的库补可回链锚点。
+-- 【为什么需要这一列】summary 是 TEXT，只回答"概括了什么"，不回答"概括到哪"。
+--   缺了它会有两个说不清的地方：
+--     ① 前端回放时无法区分"已被摘要覆盖的早期轮次"与"仍在滑窗里的原文"；
+--     ② 摘要若某次刷新失败，没有标记能说明"覆盖位置停在上一轮"，
+--        下一篇摘要会以旧的 prev 为准继续合并 —— 中间那段既不在摘要里、
+--        也早滑出了 6 行窗口。有了锚点这个缺口是可检出的。
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary_upto_seq INT;
 
 -- 会话列表：按用户取最近活跃
 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
@@ -650,3 +661,67 @@ CREATE TABLE IF NOT EXISTS tool_call_results (
     result        JSONB NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+
+-- ============================================================
+-- 11. 迁移：memory_summaries 支持「会话」主体（2026-10-31）
+-- ============================================================
+-- 【为什么复用同一张表】摘要的粒度语义完全一致：一段轮次范围 → 一条摘要文本。
+--   差别只在主体是 task（一次分析）还是 conversation（一段对话）。
+--   拆两张表会让"摘要记忆有几种粒度"出现两个答案，查询逻辑也会各漂各的。
+-- 【为什么迁移写在文件末尾】memory_summaries 建表在前半段，而外键要引用
+--   conversations（后半段才建）。写在建表处会因 conversations 尚不存在而失败。
+-- 【幂等】全部 IF NOT EXISTS / DO 块，可反复执行（容器启动会重跑 schema）。
+ALTER TABLE memory_summaries ADD COLUMN IF NOT EXISTS conversation_id UUID
+    REFERENCES conversations(id) ON DELETE CASCADE;
+ALTER TABLE memory_summaries ALTER COLUMN task_id DROP NOT NULL;
+
+-- 恰有其一：要么属于某次任务，要么属于某段会话。两个都空 = 无法归属的孤儿行。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'ck_memory_summaries_subject'
+    ) THEN
+        ALTER TABLE memory_summaries ADD CONSTRAINT ck_memory_summaries_subject
+            CHECK ((task_id IS NULL) <> (conversation_id IS NULL));
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_memory_summaries_conversation_id
+    ON memory_summaries (conversation_id);
+
+
+-- ============================================================
+-- 12. task_runs —— 业务快照（2026-10-31，亮点 A / A3）
+-- ============================================================
+-- 【为什么另建一张表，不塞进 LangGraph 的 checkpoints】
+--   checkpoints 存的是序列化后的 AgentState（整个 messages + 业务字段的 blob），
+--   它能"恢复"，但不能**回答**：「这个任务现在卡在哪一步」「哪几步已经做完」
+--   「产物是哪个版本」。要读它就得反序列化整块状态，而且 blobs 里没有
+--   "已完成步骤"这个概念 —— 那是图拓扑的知识，不是 state 的字段。
+--   所以这里用一行可查询的业务快照与它并存：
+--     LangGraph checkpoint = 恢复执行用（谁在什么位置继续跑）
+--     task_runs            = 回答"进度到哪了"用（运维/前端/续跑前置判断）
+--   ★ 两者不互相替代：删掉 checkpoint 就续不上，删掉快照就说不清进度。
+--
+-- 【字段口径】
+--   step          当前/最近完成的节点名（collect/analyze/write/quality/finalize）
+--   completed     已完成的节点集合（write/quality 会因改写循环重复经过，去重）
+--   artifact_refs 产物引用与体积（pages/chunks/report_version/report_id/quality_score）
+--                 —— UPSERT 时**按 key 合并**，不整体替换：
+--                    collect 写的 pages 不该被 finalize 的 report_chars 抹掉。
+--   idem_keys     本任务用过的幂等指纹，写入时从 tool_call_results 派生
+--                 —— 不另存一份：两张表各记一套，迟早对不上，
+--                    而"幂等键"的唯一事实来源本来就是那张结果日志。
+--   version       快照版本，每次 UPSERT +1（= 图推进了几次，含改写循环）
+CREATE TABLE IF NOT EXISTS task_runs (
+    task_id       UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    step          VARCHAR(32)  NOT NULL,
+    completed     JSONB        NOT NULL DEFAULT '[]',
+    artifact_refs JSONB        NOT NULL DEFAULT '{}',
+    idem_keys     JSONB        NOT NULL DEFAULT '[]',
+    version       INT          NOT NULL DEFAULT 1,
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_runs_step ON task_runs (step);

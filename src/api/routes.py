@@ -15,6 +15,7 @@ routes.py 只做三件事：
   │ 端点                       │ 方法  │ 功能                           │
   ├───────────────────────────┼──────┼────────────────────────────────┤
   │ /api/tasks                │ POST │ 创建竞品分析任务                │
+  │ /api/tasks/{id}/resume    │ POST │ 从 checkpoint 续跑中断任务      │
   │ /api/tasks/{task_id}      │ GET  │ 查询任务状态                    │
   │ /api/tasks/{task_id}/stream│ GET  │ SSE 进度推送                    │
   │ /api/tasks/{task_id}/reports│ GET │ 获取报告列表                    │
@@ -30,6 +31,7 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
@@ -42,7 +44,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from src.config import Settings
 from src.db.connection import close_pool, create_pool
-from src.db.dao import ConversationDAO, PreferenceDAO, ReportDAO, TaskDAO
+from src.db.dao import ConversationDAO, PreferenceDAO, ReportDAO, TaskDAO, TaskRunDAO
 from src.observability.logging import BoundLogger
 from src.observability.metrics import (
     record_agent_call,
@@ -51,6 +53,7 @@ from src.observability.metrics import (
     record_task_completed,
     record_task_created,
     record_task_failed,
+    record_task_resumed,
     record_task_started,
 )
 from src.api.rate_limit import AgentSemaphore, LLMRateLimiter, TokenBucket
@@ -372,6 +375,10 @@ class TaskResponse(BaseModel):
     dimensions: list[str]
     pipeline_mode: str
     created_at: str
+    # 业务快照（2026-10-31）：{step, completed, version} 或 null（一步都没跑完）。
+    # 与 status 的分工：status 说"整体成没成"，progress 说"做到第几步"——
+    # 一个卡在 running 的任务，只有 progress 能告诉你它到底卡在 collect 还是 quality。
+    progress: dict | None = None
 
     model_config = {"from_attributes": True}
 
@@ -670,6 +677,7 @@ async def _execute_task(
     task: dict,
     llm_parsed: dict,
     request: Request,
+    resume: bool = False,
 ) -> None:
     """后台执行任务——从 app.state 复用预编译图，零初始化。
 
@@ -688,14 +696,39 @@ async def _execute_task(
 
     【2026-10-15】这里不再自动触发评估。评估是上线前的回归测试
     （CLI / Golden 回归显式触发），不是生产运行时的一环。
+
+    ── resume 参数（2026-10-31）──────────────────────────────────────────
+    ★ 唯一的差别是 ainvoke 的第一个参数：`None` 而非 initial_state。
+      LangGraph 的协议是——input 非 None ⇒ 当作新一轮输入从 START 重跑；
+      input=None ⇒ 先 aget_tuple() 读 checkpoint，从断点继续。
+      所以在 2026-10-31 之前，checkpoints 表一直在写、却一次都没被读过。
+
+      ⚠️ 实测（tests/_verify_resume.py，3 节点小图 + 真实 PG）：
+        传 initial_state 不是"重置后重跑"，而是**在旧状态之上把整条链路再跑一遍**——
+        reducer 是追加语义，`messages`/`visited` 这类字段会变成两倍。
+        所以对同一 task_id 反复 ainvoke(initial_state) 的重试方式，
+        会让 messages 翻倍、`collected_data` 被二次覆盖；
+        这不是"幂等重试"，是"叠加式重跑"。
+
+    ★ 其余步骤**故意完全复用**（状态流转、竞品回写、事实落库、指标）：
+      续跑不是另一条链路，是同一链路的第二次进入。为续跑单开一套收尾逻辑，
+      两套迟早分叉——比如只有新那套回写竞品，续跑任务就查不回来。
     """
     pool = _get_pool(request)
     task_id_str = str(task_id)
     started_at = time.monotonic()
 
-    # ── 路由决策（纯函数，零 LLM 调用）──
-    from src.supervisor.router import IntentRouter
-    route_type = IntentRouter.classify(llm_parsed)
+    # ── 路由决策 ──
+    if resume:
+        # ★ 续跑恒用库里记的模式，绝不重判。
+        #   thread_id 是 f"{route}-{task_id}"，前缀编码了路由；而重判会变：
+        #   竞品回写后 intent_is_clear 由 False 变 True，classify 就会把
+        #   一个 supervisor 任务判成 pipeline → 去读 pipeline-xxx，
+        #   真正存着快照的是 supervisor-xxx → 查不到、不报错、静默从头再来。
+        route_type = task.get("pipeline_mode") or "pipeline"
+    else:
+        from src.supervisor.router import IntentRouter
+        route_type = IntentRouter.classify(llm_parsed)
 
     # ── 丰富 task ──
     enriched_task = {
@@ -707,11 +740,34 @@ async def _execute_task(
     }
 
     try:
-        # ── 1. 标记 running + 回写实际路由模式 ──
+        # ── 1. 抢执行权（CAS）+ 回写实际路由模式 ──
         task_dao = TaskDAO(pool)
-        await task_dao.update_status(task_id_str, "running")
-        await task_dao.update_pipeline_mode(task_id_str, route_type)
-        record_task_started()
+        # ★ 起跑这一步必须 CAS（2026-10-31）：状态推进是"抢",不是"写"。
+        #   不抢的话，前端连点 / 续跑与首发撞车，会让两条协程各跑一遍同一任务，
+        #   两次都正常返回、都写报告，只多烧一份配额 —— 不报错，只重复。
+        #   夺不到执行权就直接退出：任务仍然由抢到的那条链路负责。
+        if resume:
+            # 续跑起点不是单一状态：崩溃留下的 running、上轮失败的 failed、
+            # 建好还没跑的 pending 都该能接管（静默期已在 resume_task 里判过）。
+            claimed = await task_dao.update_status(
+                task_id_str, "running", expected=("running", "failed", "pending")
+            )
+        else:
+            claimed = await task_dao.update_status(
+                task_id_str, "running", expected="pending"
+            )
+        if not claimed:
+            logger.info(
+                "任务已被其他执行体推进，跳过 task=%s（resume=%s）",
+                task_id_str[:8], resume,
+            )
+            return
+        if not resume:
+            # 续跑**不改** pipeline_mode：它是 thread_id 前缀的来源，
+            # 改写它等于把「去哪读快照」的路标挪走。也不重复计 started，
+            # 否则一个任务在 ca_tasks_total{status="running"} 上被数两次。
+            await task_dao.update_pipeline_mode(task_id_str, route_type)
+            record_task_started()
 
         # ── 2. 从 app.state 拿预编译图 → 直接执行 ──
         if route_type == "pipeline":
@@ -736,7 +792,10 @@ async def _execute_task(
                 "final_report": "",
             }
             config = {"configurable": {"thread_id": f"pipeline-{enriched_task['id']}"}}
-            final_state = await graph.ainvoke(initial_state, config)
+            # resume=True → None ⇒ 从 checkpoint 续跑；否则传初始态从 START 重跑
+            final_state = await graph.ainvoke(
+                None if resume else initial_state, config
+            )
             result = {
                 "task_id": enriched_task["id"],
                 "final_report": final_state.get("final_report", ""),
@@ -777,7 +836,10 @@ async def _execute_task(
                 "pending_task_status": "",
             }
             config = {"configurable": {"thread_id": f"supervisor-{enriched_task['id']}"}}
-            final_state = await graph.ainvoke(initial_state, config)
+            # 同 pipeline：resume 时传 None，让 aget_tuple() 命中上次的断点
+            final_state = await graph.ainvoke(
+                None if resume else initial_state, config
+            )
             result = {
                 "task_id": enriched_task["id"],
                 "final_output": final_state.get("final_output", ""),
@@ -797,7 +859,17 @@ async def _execute_task(
             and not final_state.get("is_complete", False)
         )
         if pipeline_failed or supervisor_failed:
-            await task_dao.update_status(task_id_str, "failed")
+            # ★ CAS：只允许从 running/pending 落到 failed。
+            #   万一收尾阶段抛错时任务早已被别的链路标成 completed，
+            #   这里不能把它"降级"成 failed —— 报告已经落库了，改状态只会让
+            #   下游评估按 failed 取任务，把一份合格的产物判成没跑成。
+            flipped = await task_dao.update_status(
+                task_id_str, "failed", expected=("running", "pending")
+            )
+            if not flipped:
+                logger.warning(
+                    "任务状态已被推进，不再标记 failed task=%s", task_id_str[:8]
+                )
             elapsed = time.monotonic() - started_at
             record_task_failed()
             request.app.state.log.bind(
@@ -809,9 +881,15 @@ async def _execute_task(
             return
 
         # ── 4. 标记 completed ──
-        await task_dao.update_status(task_id_str, "completed")
+        # expected 里含 "completed"：pipeline 的 finalize 节点 /
+        # supervisor 的回写已经先盖过一次章，这里是幂等确认，不是第二次推进。
+        # 真正的保护是"不含 failed"——已完成的任务不能被收尾逻辑改回失败。
+        await task_dao.update_status(
+            task_id_str, "completed", expected=("running", "completed")
+        )
         elapsed = time.monotonic() - started_at
-        record_task_completed(route_type, elapsed)
+        # 续跑只跑了后半段 → 不进耗时直方图（否则 P95 混两种口径，且曲线看不出自己脏）
+        record_task_completed(route_type, elapsed, observe_duration=not resume)
 
         request.app.state.log.bind(
             task_id=task_id_str[:8]
@@ -892,7 +970,10 @@ async def _execute_task(
         # ── 标记 failed ──
         try:
             task_dao = TaskDAO(pool)
-            await task_dao.update_status(task_id_str, "failed")
+            # 同上面失败分支的 CAS 口径：不把已完成的任务改回 failed
+            await task_dao.update_status(
+                task_id_str, "failed", expected=("running", "pending")
+            )
         except Exception as db_err:
             logger.exception(
                 "标记失败状态时 DB 写入也失败了 task_id=%s", task_id_str[:8],
@@ -1066,6 +1147,187 @@ async def _create_task_impl(
     return JSONResponse(
         status_code=202,
         content={"task_id": str(task_id), "status": "pending"},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §5.2 路由 — POST /api/tasks/{task_id}/resume（checkpoint 续跑，2026-10-31）
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 「这个任务是不是真的还在跑」的判据。
+# 进程崩溃时 status 会**停在 running**（来不及标 failed），所以不能靠 status 判。
+# 用「最近一次活动」代替：tasks.updated_at 与最近一条 agent_logs 取较新者。
+# 5 分钟这个值与 trajectory/runner.py 的 SETTLE_MINUTES 同源思路：
+# 宁可让运维多等 5 分钟，也不要让两个协程同时往同一条 thread 写 checkpoint。
+RESUME_STALE_MINUTES = 5
+
+_LAST_ACTIVITY_SQL = """
+SELECT GREATEST(
+         t.updated_at,
+         COALESCE(
+           (SELECT max(l.created_at) FROM agent_logs l WHERE l.task_id = t.id),
+           t.updated_at
+         )
+       ) AS last_at
+  FROM tasks t
+ WHERE t.id = $1
+"""
+
+
+@app.post("/api/tasks/{task_id}/resume", status_code=202)
+async def resume_task(
+    task_id: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> JSONResponse:
+    """从最近一次 checkpoint 续跑任务。
+
+    ★ 为什么必须传 None 而不是 initial_state（这是本端点存在的全部意义）：
+      LangGraph 的 ainvoke(input, config) 只要 input 非 None，就当「新一轮输入」
+      从 START 重跑；只有 input=None 才会先 aget_tuple() 读 checkpoint 接着跑。
+      在此之前 _execute_task 恒传完整 initial_state，所以 checkpoints 表
+      一直在写、却从未被读过一次 —— 存档从不读档。
+
+    ★ 为什么四种拒绝要分开报：
+      「续跑失败」这一句话对排查毫无用处。四种情况的原因和处置完全不同：
+        no_checkpoint → 崩在 collect 内部（首个节点未完成），该治的是节点粒度
+        finished      → 图已到终点，再跑只会原样返回终态（前端重复点）
+        rejected      → 疑似仍在运行，等静默期，不是代码问题
+        completed     → 任务本来就完了
+      混成一句"无法续跑"，运维就只能去翻日志。
+
+    ★ 为什么没有断点时**不做**静默全量重跑：
+      全量重跑会重写 reports（quality 节点 insert 新版本），
+      用户看到两份报告、却不知道哪份是这次的结果。返回 409 让他重新发起，
+      任务 id 变了，报告归属也就干净了。
+    """
+    # ── 0. 路径参数先过 UUID 校验 ──
+    # 不校验的话 TaskDAO.get 会把非法字符串丢给 asyncpg，直接 500（看起来像服务坏了）
+    try:
+        task_uuid = UUID(task_id)
+    except ValueError:
+        raise HTTPException(404, "任务不存在") from None
+
+    pool = _get_pool(request)
+    task_dao = TaskDAO(pool)
+    task = await task_dao.get(str(task_uuid))
+
+    # 404 而不是 403：不泄露「这个 id 存在，只是不是你的」
+    if task is None or task.get("user_id") != current_user.user_id:
+        raise HTTPException(404, "任务不存在")
+
+    if task["status"] == "completed":
+        record_task_resumed("completed")
+        raise HTTPException(409, "任务已完成，无需续跑")
+
+    # 崩溃留下的 running 与"真在跑"只能靠静默期区分
+    if task["status"] == "running":
+        row = await pool.fetchrow(_LAST_ACTIVITY_SQL, task_uuid)
+        last_at = row["last_at"] if row else None
+        if last_at is not None:
+            idle = (datetime.now(timezone.utc) - last_at).total_seconds()
+            if idle < RESUME_STALE_MINUTES * 60:
+                record_task_resumed("rejected")
+                raise HTTPException(
+                    409,
+                    f"任务最近 {int(idle)} 秒仍有活动，可能仍在运行；"
+                    f"静默满 {RESUME_STALE_MINUTES} 分钟后可续跑",
+                )
+
+    # ── 1. 路由必须沿用首次执行时的模式（见 _execute_task 里的同类说明）──
+    route_type = task.get("pipeline_mode") or "pipeline"
+    graph = (
+        request.app.state.pipeline_graph
+        if route_type == "pipeline"
+        else request.app.state.supervisor_graph
+    )
+    config = {"configurable": {"thread_id": f"{route_type}-{task_uuid}"}}
+
+    # ── 2. 先探测有没有可恢复断点，再决定要不要起后台任务 ──
+    # ★ 顺序很重要：先 aget_state 再 create_task。反过来的话，
+    #   后台协程已经跑起来了、HTTP 才回 409，用户会看到"报错但任务动了"。
+    snapshot = await graph.aget_state(config)
+    if not snapshot.values:
+        record_task_resumed("no_checkpoint")
+        raise HTTPException(
+            409,
+            "该任务没有可恢复的 checkpoint（首个节点执行完成前即中断）。"
+            "请重新发起任务——这里不做静默全量重跑，避免 reports 重复写入。",
+        )
+    if not snapshot.next:
+        # next 为空 = 图已到终点。此时 ainvoke(None) 只会原样返回终态，
+        # 是「看着成功其实什么都没跑」，必须挡住。
+        record_task_resumed("finished")
+        raise HTTPException(409, "该任务的断点已在终点，没有可续跑的步骤")
+
+    # ── 3. 续跑同样占并发名额（它照样烧 Tavily / LLM 配额）──
+    tb = request.app.state.token_bucket
+    if tb is not None and not await tb.acquire():
+        record_rate_limit_hit("global")
+        raise HTTPException(429, "请求过多，请稍后重试")
+
+    # 续跑不重判实体：它们已随 checkpoint 存在 state 里，
+    # 这里只用于收尾阶段的竞品回写与事实落库（两者都按 task_id 幂等）。
+    llm_parsed = {
+        "competitors": list(task.get("competitors") or []),
+        "dimensions": list(task.get("dimensions") or []),
+        "intent_is_clear": True,
+    }
+    task_dict = {
+        "id": str(task_uuid),
+        "title": task.get("title") or "竞品分析",
+        "user_id": current_user.user_id,
+        "competitors": llm_parsed["competitors"],
+        "dimensions": llm_parsed["dimensions"],
+        "pipeline_mode": route_type,   # ← _execute_task 续跑分支读它定路由
+    }
+
+    pending = list(snapshot.next)
+    record_task_resumed("accepted")
+    request.app.state.log.bind(task_id=str(task_uuid)[:8]).info(
+        "任务续跑已受理",
+        extra={
+            "route": route_type,
+            "checkpoint_id": (snapshot.config or {})
+            .get("configurable", {})
+            .get("checkpoint_id", ""),
+            "next_nodes": pending,
+        },
+    )
+    asyncio.create_task(
+        _execute_task(task_uuid, task_dict, llm_parsed, request, resume=True)
+    )
+
+    # ── 4. 附上业务快照（2026-10-31）──
+    # checkpoint 回答"从哪里接着跑"，task_runs 回答"已经做完哪几步"——
+    # 运维看到 `completed=["collect"]` 就知道这次续跑要从 analyze 起，
+    # 而不用去反序列化 checkpoint 的 blob 猜。
+    # ⚠️ 读不到就返回 null，不能让一次只读观测把续跑请求打成 500。
+    progress = None
+    try:
+        snap = await TaskRunDAO(pool).get(str(task_uuid))
+        if snap is not None:
+            progress = {
+                "step": snap["step"],
+                "completed": snap["completed"],
+                "version": snap["version"],
+            }
+    except Exception:  # noqa: BLE001 — 见上
+        logger.warning("读取业务快照失败（不影响续跑） task=%s",
+                       str(task_uuid)[:8], exc_info=True)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": str(task_uuid),
+            "status": "running",
+            "route": route_type,
+            "resumed_from": (snapshot.config or {})
+            .get("configurable", {})
+            .get("checkpoint_id", ""),
+            "next_nodes": pending,
+            "progress": progress,
+        },
     )
 
 
@@ -1705,14 +1967,40 @@ async def get_conversation_turns(
         raise HTTPException(404, "会话不存在")
 
     turns = await dao.all_turns(conversation_id, current_user.user_id, limit=limit)
+
+    # ★ 分段摘要快照（2026-10-31）：每次「全量重建」留一条，倒序。
+    #   它的用途不是注入（注入只用 conversation.summary 那一条），而是
+    #   **让漂移可对比** —— 第 10 轮和第 20 轮的快照放在一起，能看出
+    #   哪些约束在合并中被概括掉了。只写不留读口，快照就是零消费者。
+    #   ⚠️ 读失败不阻塞回放：它是观测数据，不是对话主链路。
+    try:
+        from src.db.dao import MemorySummaryDAO as _SummaryDAO
+        snapshots = await _SummaryDAO(pool).list_by_conversation(conversation_id, limit=10)
+    except Exception:
+        logger.exception("读取摘要快照失败 conversation=%s", conversation_id)
+        snapshots = []
+
     return {
         "conversation": {
             "id": conv["id"],
             "title": conv["title"] or "（未命名会话）",
             "summary": conv["summary"],
+            # ★ 摘要覆盖到第几行（可回链锚点，2026-10-31）：前端据此把
+            #   seq <= summary_upto_seq 的气泡标成"已入摘要"，
+            #   更早的原文因此不再是"看不见的历史"，而是"可点开核对的历史"。
+            "summary_upto_seq": conv.get("summary_upto_seq"),
             "turn_count": conv["turn_count"],
             "updated_at": conv["updated_at"].isoformat() if conv["updated_at"] else None,
         },
+        "summary_snapshots": [
+            {
+                "round_range": s["round_range"],
+                "summary": s["summary_text"],
+                "type": s["summary_type"],
+                "created_at": s["created_at"].isoformat() if s["created_at"] else None,
+            }
+            for s in snapshots
+        ],
         "items": [
             {
                 "seq": t["seq"],
@@ -1752,6 +2040,19 @@ async def get_task(
     if task is None:
         raise HTTPException(404, f"任务不存在: {task_id}")
 
+    # 业务快照：读不到就返回 null（观测缺席不该让一次查询 500）
+    progress = None
+    try:
+        snap = await TaskRunDAO(pool).get(str(task["id"]))
+        if snap is not None:
+            progress = {
+                "step": snap["step"],
+                "completed": snap["completed"],
+                "version": snap["version"],
+            }
+    except Exception:  # noqa: BLE001
+        logger.warning("读取业务快照失败 task=%s", task_id[:8], exc_info=True)
+
     return TaskResponse(
         task_id=str(task["id"]),
         status=task["status"],
@@ -1760,6 +2061,7 @@ async def get_task(
         dimensions=task.get("dimensions", []),
         pipeline_mode=task.get("pipeline_mode", "pipeline"),
         created_at=str(task.get("created_at", "")),
+        progress=progress,
     )
 
 

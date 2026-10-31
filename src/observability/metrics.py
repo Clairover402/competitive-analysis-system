@@ -9,7 +9,7 @@
   2. 每个 Counter 都有 status/type 标签 — 支持按维度下钻
   3. 指标采集在 HTTP 入口 + Harness 阻断点 — 不改动编排引擎
 
-五项指标：
+六项指标：
 ┌──────────────────────────────┬──────────┬─────────────────────────────────┐
 │ 指标名                        │ 类型      │ 说明                             │
 ├──────────────────────────────┼──────────┼─────────────────────────────────┤
@@ -18,6 +18,7 @@
 │ ca_agent_calls_total         │ Counter  │ Agent 调用按 agent/action/status │
 │ ca_rate_limit_hits           │ Counter  │ 限流触发按 layer 分              │
 │ ca_harness_blocks            │ Counter  │ Harness 阻断按 check_type 分     │
+│ ca_task_resumes_total        │ Counter  │ 续跑请求按 outcome 分（2026-10-31）│
 └──────────────────────────────┴──────────┴─────────────────────────────────┘
 
 ⚠️ 2026-10-19 删除了 ca_quality_score / ca_rag_recall / ca_eval_* 两批指标：
@@ -96,6 +97,41 @@ ca_harness_blocks = Counter(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# §3.5 续跑指标（2026-10-31）
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 【为什么必须有这一项】「支持中断续跑」在没有计数时是一句无法证伪的话。
+# 这个 Counter 让"续跑到底发生过几次、失败在哪一类"变成可查的数字：
+#   accepted      → 真的从 checkpoint 接着跑了（配合 agent_logs 能验"没重复采集"）
+#   no_checkpoint → 首个节点执行前就中断，压根没有断点（说明崩溃窗口在 collect 内）
+#   finished      → 图已到终点，续跑无意义（多为前端重复点）
+#   rejected      → 任务仍有日志写入，疑似还在跑（防双协程写同一 thread）
+# ⚠️ no_checkpoint 占比高 = collect 节点的执行窗口太长，该往"节点内细分快照"走，
+#   而不是继续加续跑重试。这是这个标签唯一真正的用法。
+ca_task_resumes_total = Counter(
+    "ca_task_resumes_total",
+    "checkpoint 续跑请求次数",
+    ["outcome"],
+)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §3.6 工具超时对账（2026-10-31，亮点 A / A1）
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 【为什么单独记】「超时后先对账再重试」这句话的价值全在 hit/miss 的比例上：
+#   hit  → 工具有真实副作用（Tavily 已经扣了配额 / 页面已经抓过），回放省一次
+#   miss → 超时的多半是"真没执行"，重试是对的
+# 只有 miss 而没有 hit，说明超时点落在执行之前（比如连接阶段），
+# 那时候对账这层代码是白跑的 —— 这个比例就是判断"值不值得留"的唯一依据。
+ca_tool_reconcile_total = Counter(
+    "ca_tool_reconcile_total",
+    "工具调用超时后的对账结果",
+    ["result"],  # hit / miss
+)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # §4 便捷采集函数（供 routes.py 和 harness/guard.py 调用）
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -109,15 +145,23 @@ def record_task_started() -> None:
     ca_tasks_total.labels(status="running").inc()
 
 
-def record_task_completed(route: str, elapsed_seconds: float) -> None:
+def record_task_completed(
+    route: str, elapsed_seconds: float, *, observe_duration: bool = True
+) -> None:
     """任务执行完成。
 
     Args:
         route: "pipeline" | "supervisor"
         elapsed_seconds: 从创建到完成的总耗时
+        observe_duration: 是否把耗时记进直方图。
+            ★ 续跑要传 False：续跑只跑了后半段，`elapsed_seconds` 是"剩余段耗时"
+              而不是端到端耗时。混进同一个 Histogram 会让 ca_task_duration_seconds
+              同时装着两种口径，P95 从此不可解释 —— 而曲线看不出自己脏了。
+              完成计数照加（任务确实完成了），只是不参与耗时分布。
     """
     ca_tasks_total.labels(status="completed").inc()
-    ca_task_duration_seconds.labels(route=route).observe(elapsed_seconds)
+    if observe_duration:
+        ca_task_duration_seconds.labels(route=route).observe(elapsed_seconds)
 
 
 def record_task_failed() -> None:
@@ -154,4 +198,22 @@ def record_harness_block(check_type: str) -> None:
         check_type: whitelist / param_validation / rate_limit / pii
     """
     ca_harness_blocks.labels(check_type=check_type).inc()
+
+
+def record_task_resumed(outcome: str) -> None:
+    """记录一次续跑请求的结果。
+
+    Args:
+        outcome: completed / no_checkpoint / finished / rejected
+    """
+    ca_task_resumes_total.labels(outcome=outcome).inc()
+
+
+def record_tool_reconcile(result: str) -> None:
+    """记录一次工具超时对账的结果。
+
+    Args:
+        result: hit（查到成功结果，判定已执行并回放）/ miss（判定未执行，交回重试）
+    """
+    ca_tool_reconcile_total.labels(result=result).inc()
 

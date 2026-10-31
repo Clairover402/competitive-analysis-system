@@ -85,7 +85,7 @@ from src.agents import (
 )
 from src.pipeline.state import AgentState
 from src.pipeline.checkpoint import PostgresSaver
-from src.db.dao import TaskDAO
+from src.db.dao import TaskDAO, TaskRunDAO
 from src.db.connection import create_pool
 from src.mcp import create_mcp_server
 from src.config import Settings
@@ -379,7 +379,16 @@ def _make_node_finalize(pool: Pool):
                     state.get("quality_passed", False))
 
         task_dao = TaskDAO(pool)
-        await task_dao.update_status(state["task_id"], "completed")
+        # expected 含 "pending"：图也可能被 run_pipeline_task() 直接调起
+        # （评估/CLI 路径，没有经过 _execute_task 抢执行权），此时状态还是 pending。
+        # 不含 "completed"/"failed"：盖章不能覆盖别人已经做出的结论 ——
+        # 一个已完成的任务被迟到的执行体标成别的状态，比状态没更新更难排查。
+        if not await task_dao.update_status(
+            state["task_id"], "completed", expected=("running", "pending")
+        ):
+            logger.warning(
+                "【Pipeline】状态已被推进，finalize 不再覆盖 task=%s", state["task_id"][:8]
+            )
 
         # 【L5 决策】长期记忆不再自动从报告提取
         # 原因：报告中的"Google市场份额23%"这类临时数据不应作为用户画像
@@ -447,6 +456,82 @@ def route_after_quality(state: AgentState) -> str:
     logger.info("【Pipeline】质量不通过 (score=%.0f, steps_left=%d)，路由到 write 重写",
                 state.get("quality_score", 0), state.get("remaining_steps", 0))
     return "write"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.5 业务快照（2026-10-31，亮点 A / A3）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _artifacts(step: str, state: AgentState, update: dict) -> dict:
+    """从「节点返回值 + 当前状态」里抽产物引用。
+
+    ★ 只记能回答「产出到哪」的数字与标识，不记正文：
+      collect 的 pages 是几百条 URL、write 的 report_content 是几万字，
+      落进快照就变成第二份数据副本，且它和 reports 表迟早分叉。
+    ★ 读 state 而不只读 update：quality 节点不产出 report_version
+      （那是 write 写的），但「评分针对的是第几版报告」正是快照该记的。
+    """
+    if step == "collect":
+        data = update.get("collected_data") or {}
+        return {
+            "competitors": len(data),
+            "pages": sum(len(v.get("pages") or []) for v in data.values() if isinstance(v, dict)),
+            "chunks": sum(len(v.get("chunk_ids") or []) for v in data.values() if isinstance(v, dict)),
+        }
+    if step == "analyze":
+        results = update.get("analysis_results") or {}
+        return {
+            "dimensions": len(results),
+            "cells": sum(len(v or {}) for v in results.values() if isinstance(v, dict)),
+        }
+    if step == "write":
+        return {
+            "report_version": update.get("report_version"),
+            "report_chars": len(update.get("report_content") or ""),
+        }
+    if step == "quality":
+        return {
+            "quality_score": update.get("quality_score"),
+            "quality_passed": update.get("quality_passed"),
+            "report_version": state.get("report_version"),
+        }
+    if step == "finalize":
+        return {"final_chars": len(update.get("final_report") or "")}
+    return {}
+
+
+async def _record_run(pool: Pool, task_id: str | None, step: str, artifacts: dict) -> None:
+    """写一行业务快照。失败只告警，不影响任务。
+
+    ★ 快照是**观测**不是**执行**：写不进去最多是"进度看不见"，
+      绝不能因为一张观测表抖动就把一份已经跑完的报告判成失败。
+    """
+    if not task_id:
+        return
+    try:
+        version = await TaskRunDAO(pool).record(task_id, step, artifacts)
+        logger.debug("【快照】task=%s step=%s version=%d", task_id[:8], step, version)
+    except Exception:  # noqa: BLE001 — 见上
+        logger.warning(
+            "【快照】写入失败（不影响任务） task=%s step=%s",
+            task_id[:8], step, exc_info=True,
+        )
+
+
+def _with_snapshot(step: str, node, pool: Pool):
+    """给节点套一层"出口写快照"。
+
+    ★ 为什么在节点**返回之后**写：这是「已完成」的唯一可靠判据。
+      写在入口（"开始跑 collect 了"）会让中断后的快照显示 collect 已完成，
+      续跑前置判断就会跳过它 —— 答错而不报错。
+    """
+    async def wrapped(state: AgentState) -> dict:
+        update = await node(state)
+        await _record_run(pool, state.get("task_id"), step, _artifacts(step, state, update))
+        return update
+
+    wrapped.__name__ = f"node_{step}"
+    return wrapped
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -520,11 +605,18 @@ async def build_pipeline_graph(
     # 第一个参数是节点名（字符串，用于边引用）
     # 第二个参数是节点函数（async def node_xxx(state) -> dict）
     # 节点名和节点函数分离：同一个函数可以用不同名字注册（虽然这里没用到）
-    graph.add_node("collect", _make_node_collect(mcp_server, llm_collector))
-    graph.add_node("analyze", _make_node_analyze(mcp_server, llm_analyzer))
-    graph.add_node("write", _make_node_write(mcp_server, llm_writer, pool))
-    graph.add_node("quality", _make_node_quality(mcp_server, llm_quality))
-    graph.add_node("finalize", _make_node_finalize(pool))
+    # 每个节点出口写一次业务快照（task_runs）——与 LangGraph 的 checkpoint
+    # 并存：checkpoint 管"从哪里继续跑"，快照管"跑到哪了、产物是哪个版本"。
+    graph.add_node("collect", _with_snapshot(
+        "collect", _make_node_collect(mcp_server, llm_collector), pool))
+    graph.add_node("analyze", _with_snapshot(
+        "analyze", _make_node_analyze(mcp_server, llm_analyzer), pool))
+    graph.add_node("write", _with_snapshot(
+        "write", _make_node_write(mcp_server, llm_writer, pool), pool))
+    graph.add_node("quality", _with_snapshot(
+        "quality", _make_node_quality(mcp_server, llm_quality), pool))
+    graph.add_node("finalize", _with_snapshot(
+        "finalize", _make_node_finalize(pool), pool))
 
     # ─── 确定性边 ───
     # 【L3 核心考点】add_edge("A", "B")

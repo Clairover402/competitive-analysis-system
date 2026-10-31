@@ -167,8 +167,13 @@ class TaskDAO:
                     result[field] = json.loads(val)
             return result
 
-    async def update_status(self, task_id: str, status: str) -> None:
-        """更新任务状态。
+    async def update_status(
+        self,
+        task_id: str,
+        status: str,
+        expected: str | tuple[str, ...] | None = None,
+    ) -> bool:
+        """更新任务状态；给了 expected 就是一次 CAS（compare-and-set）。
 
         【L4 工程】为什么只更新 status 不更新其他字段？
         ------------------------------------------------------------
@@ -176,16 +181,55 @@ class TaskDAO:
         如果需要同时改多个字段，加新方法（如 update_all）。
         这是 CQRS 思想在 DAO 层的简化应用。
 
+        【2026-10-31 加 CAS】原先是无条件 UPDATE，两个执行体都能把 pending
+        改成 running 并各跑一遍。单 worker 下暴露不出来，但这是真缺口：前端连点、
+        续跑与首发撞车，都会让同一任务被两条链路各执行一次——两次都"看着正常"，
+        只表现为 Tavily/LLM 配额异常消耗，日志里没有错误。
+        当时没做 lease（见计划-A 说明）：单进程单 worker，没有"两个执行体同时
+        抢同一任务"的真实前提。CAS 是这条链上唯一有测试场景的那一半。
+
+        ★ expected 是「先决状态」，不是「旧值」：SQL 里落成 `AND status = $3`。
+          返回 False 表示**这次推进没发生**（别人先动了），调用方必须停手，
+          不能当成"更新成功但没变"继续往下跑。
+        ★ 为什么允许传元组：续跑的起点不是单一状态——崩溃留下的 running、
+          上一轮失败的 failed、建好还没跑的 pending 都该能"抢到执行权"。
+          ⚠️ 同值更新也是一次成功写入（running → running 返回 True），
+             所以两个续跑请求同一刻到达时都会抢到；单 worker 下这由
+             routes.RESUME_STALE_MINUTES 的静默期把窗口压到很小，
+             多副本时才需要 lease_owner + lease_expires_at。
+        ★ 返回 bool 而不是 rowcount：调用方只需要"我抢到了没有"。
+
         status 状态机: pending → running → completed/failed
         updated_at 自动更新为 NOW()——用于监控"任务卡了多久"。
         """
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE tasks
-                   SET status = $2, updated_at = NOW()
-                   WHERE id = $1""",
-                task_id, status,
-            )
+            if expected is None:
+                # 无先决条件 = 旧行为（向后兼容，不破坏既有调用方）
+                await conn.execute(
+                    """UPDATE tasks
+                       SET status = $2, updated_at = NOW()
+                       WHERE id = $1""",
+                    task_id, status,
+                )
+                return True
+            if isinstance(expected, str):
+                tag = await conn.execute(
+                    """UPDATE tasks
+                       SET status = $2, updated_at = NOW()
+                       WHERE id = $1 AND status = $3""",
+                    task_id, status, expected,
+                )
+            else:
+                tag = await conn.execute(
+                    """UPDATE tasks
+                       SET status = $2, updated_at = NOW()
+                       WHERE id = $1 AND status = ANY($3::text[])""",
+                    task_id, status, list(expected),
+                )
+            # asyncpg 的 execute 返回命令标签（"UPDATE 1" / "UPDATE 0"），
+            # ★ 必须比字符串而不是 `> 0`：tag 是 str，`tag > 0` 在 Python 里会抛
+            #   TypeError；而 `bool(tag)` 恒为 True（"UPDATE 0" 也是非空串）。
+            return tag == "UPDATE 1"
 
     async def update_pipeline_mode(self, task_id: str, pipeline_mode: str) -> None:
         """回写任务实际执行的模式（pipeline / supervisor）。
@@ -227,6 +271,85 @@ class TaskDAO:
                    WHERE id = $1""",
                 task_id, json.dumps(competitors, ensure_ascii=False),
             )
+
+
+class TaskRunDAO:
+    """业务快照 —— 「这个任务现在跑到哪、做完了几步、产物是谁」。
+
+    【与 LangGraph checkpoints 的分工】（2026-10-31，亮点 A / A3）
+    checkpoint 存的是序列化后的整块 AgentState，只能用于「恢复执行」；
+    它答不出「已完成步骤 / 产物版本」，要答就得整块反序列化，而且
+    state 里根本没有"已完成的节点名"这个字段 —— 那是图拓扑的知识。
+    所以这里另存一行**可查询**的进度快照，两者并存、互不替代。
+
+    【写入成本】一个节点一行 UPSERT（主键查一次），相对节点里的 LLM 调用
+    可以忽略；调用方仍用 try/except 包住 —— 快照写失败只该让"进度看不见"，
+    不该让任务本身失败。
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    # UPSERT 的三处"合并而非覆盖"：
+    #   completed      → 追加去重（write/quality 在改写循环里会经过多次）
+    #   artifact_refs  → 按键合并（collect 的 pages 不能被 finalize 的 report_chars 抹掉）
+    #   idem_keys      → 每次从 tool_call_results 重算（唯一事实来源在那里）
+    # ⚠️ $1 被用在两处、两处类型不同：task_runs.task_id 是 UUID，
+    #    tool_call_results.task_id 是 TEXT。不显式写 `$1::uuid`，
+    #    asyncpg prepare 会直接抛 AmbiguousParameterError（text 对 uuid）——
+    #    不是运行期偶发，而是**这条 SQL 一次都跑不通**。
+    _UPSERT_SQL = """
+        INSERT INTO task_runs (task_id, step, completed, artifact_refs, idem_keys)
+        VALUES ($1::uuid, $2, $3::jsonb, $4::jsonb,
+                COALESCE((SELECT to_jsonb(array_agg(tool_call_id))
+                            FROM tool_call_results WHERE task_id = ($1::uuid)::text),
+                         '[]'::jsonb))
+        ON CONFLICT (task_id) DO UPDATE
+           SET step = EXCLUDED.step,
+               completed = CASE WHEN task_runs.completed ? $2::text
+                                THEN task_runs.completed
+                                ELSE task_runs.completed || to_jsonb($2::text) END,
+               artifact_refs = task_runs.artifact_refs || EXCLUDED.artifact_refs,
+               idem_keys = EXCLUDED.idem_keys,
+               version = task_runs.version + 1,
+               updated_at = now()
+        RETURNING version
+    """
+
+    async def record(
+        self,
+        task_id: str,
+        step: str,
+        artifacts: dict | None = None,
+    ) -> int:
+        """记录"节点 step 已执行完"，返回快照版本号（首次写入为 1）。
+
+        ⚠️ 这里记的是**进入节点之后**的状态：调用方必须在节点成功返回后再调，
+           节点抛异常时不能写 —— 否则「已完成」列表会包含一个其实没跑完的步骤，
+           续跑前置判断会据此跳过它（答错而不报错）。
+        """
+        step_arr = json.dumps([step], ensure_ascii=False)
+        arts = json.dumps(artifacts or {}, ensure_ascii=False, default=str)
+        async with self._pool.acquire() as conn:
+            version = await conn.fetchval(
+                self._UPSERT_SQL, task_id, step, step_arr, arts
+            )
+        return int(version or 0)
+
+    async def get(self, task_id: str) -> dict | None:
+        """读快照。无记录返回 None（= 这个任务还没跑过任何节点）。"""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM task_runs WHERE task_id = $1", task_id
+            )
+        if row is None:
+            return None
+        out = dict(row)
+        for field in ("completed", "artifact_refs", "idem_keys"):
+            val = out.get(field)
+            if isinstance(val, str):
+                out[field] = json.loads(val)
+        return out
 
 
 class ReportDAO:
@@ -645,6 +768,57 @@ class MemorySummaryDAO:
                 task_id, round_range, summary_text, summary_type,
             )
             return str(row["id"])
+
+    async def save_for_conversation(
+        self,
+        conversation_id: str,
+        round_range: str,
+        summary_text: str,
+        summary_type: str = "full_merge",
+    ) -> str:
+        """保存**会话维度**的摘要快照（与 task 维度共用这张表）。
+
+        ★ 为什么同一张表挂两种主体（2026-10-31）：
+          摘要的粒度语义完全一致 —— 「一段轮次范围 → 一条摘要文本」。
+          差别只在主体是 task（一次分析）还是 conversation（一段对话）。
+          拆成两张表会让"摘要记忆有几种粒度"这个问题出现两个答案，
+          而且两张表的查询逻辑会各漂各的。
+        ⚠️ 表上有 CHECK 保证 task_id / conversation_id 恰有其一，
+           所以这里不需要、也不该传 task_id。
+
+        用途：每次全量重建留一条快照，支撑**漂移可观测** ——
+        对比第 10/20/30 轮的快照，能直接看出哪些约束在合并中被概括掉。
+        这不是注入源（注入只用 conversations.summary 那一条），别把它当读路径。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO memory_summaries (conversation_id, round_range,
+                                                 summary_text, summary_type)
+                   VALUES ($1, $2, $3, $4)
+                   RETURNING id""",
+                conversation_id, round_range, summary_text, summary_type,
+            )
+            return str(row["id"])
+
+    async def list_by_conversation(
+        self, conversation_id: str, limit: int = 20
+    ) -> list[dict]:
+        """按时间**倒序**取某会话的摘要快照（回看 / 审计用）。
+
+        【为什么需要这个读口】只写不读的快照等于零消费者——
+        而这套快照存在的意义就是"能对比"，没有读口就没人能对比。
+        消费点：`GET /api/conversations/{id}/turns` 的 `summary_snapshots`。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT round_range, summary_text, summary_type, created_at
+                   FROM memory_summaries
+                   WHERE conversation_id = $1
+                   ORDER BY created_at DESC
+                   LIMIT $2""",
+                conversation_id, limit,
+            )
+            return [dict(r) for r in rows]
 
     async def get_latest(self, task_id: str) -> dict | None:
         """获取某任务最新的摘要。"""
@@ -1175,6 +1349,85 @@ class ToolCallResultDAO:
             )
         return tag == "INSERT 0 1"
 
+    async def get_record(self, tool_call_id: str) -> dict | None:
+        """取整行元数据：`{"result", "tool_name", "created_at"}`；无记录返回 None。
+
+        【为什么不能复用 get()】get() 已经把行拆成"当时那个原生结果"抛给调用方，
+        超时对账除了结果本身还要回答"这条记录是什么时候落的"——
+        日志里"3 秒前落的"和"3 天前落的"是两种完全不同的结论
+        （前者是刚才那次真执行完了、后者是上次跑留下的旧结果）。
+        改成统一返回 dict 会破坏 get() 的既有调用方，所以另开一个方法，
+        让"要结果"和"要证据"两条用途各自清晰。
+
+        ⚠️ 查到记录 ≠ 这次调用执行过：指纹是 sha256(task_id|tool|语义键)，
+        同一任务同一语义键本来就是同一个逻辑调用 —— 命中即"这件事已经被做过了"，
+        这正是对账要的结论，不需要额外的时间窗过滤。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT result, tool_name, created_at
+                   FROM tool_call_results WHERE tool_call_id = $1""",
+                tool_call_id,
+            )
+        if row is None:
+            return None
+        raw = row["result"]
+        return {
+            "result": json.loads(raw) if isinstance(raw, str) else raw,
+            "tool_name": row["tool_name"],
+            "created_at": row["created_at"],
+        }
+
+    async def get_fresh(self, tool_call_id: str, max_age_seconds: float) -> Any | None:
+        """【2026-10-31 跨任务搜索缓存】按幂等键取**未过期**的结果。
+
+        与 get() 的区别只有一条：created_at 超 TTL 返回 None（= 视为未缓存）。
+        为什么不复用 get()：24h 前的搜索结果对「数据会变」的搜索场景是过期品，
+        静默回放旧结果会把「搜不到新信息」伪装成「没有新信息」，不报错只答旧。
+
+        过期行不删除 —— 由下次 upsert_shared 原地覆盖，不额外加清理任务。
+        """
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                """SELECT result FROM tool_call_results
+                   WHERE tool_call_id = $1
+                     AND created_at > now() - make_interval(secs => $2)""",
+                tool_call_id, float(max_age_seconds),
+            )
+        return json.loads(raw) if raw else None
+
+    async def upsert_shared(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        args_digest: dict | None,
+        result: Any,
+    ) -> bool:
+        """跨任务共享缓存行的写入：**覆盖写**，与 save() 的 DO NOTHING 相反。
+
+        【为什么语义不同】save 服务幂等（「首次结果不可变」，覆盖会破坏回放语义）；
+        本方法服务缓存（数据会过期，新结果必须能替换旧结果 —— 否则 24h 后
+        ON CONFLICT DO NOTHING 会让第一版结果钉死在表里，缓存变成永久旧数据）。
+        task_id 恒 NULL：这行不属于任何任务，是 (tool, 语义键) 级的共享事实。
+        """
+        payload = json.dumps(result, ensure_ascii=False, default=str)
+        if len(payload.encode("utf-8")) > self.MAX_RESULT_BYTES:
+            return False
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO tool_call_results
+                       (tool_call_id, tool_name, task_id, args_digest, result)
+                   VALUES ($1, $2, NULL, $3::jsonb, $4::jsonb)
+                   ON CONFLICT (tool_call_id) DO UPDATE
+                       SET result = EXCLUDED.result,
+                           args_digest = EXCLUDED.args_digest,
+                           created_at = now()""",
+                tool_call_id, tool_name,
+                json.dumps(args_digest, ensure_ascii=False) if args_digest else None,
+                payload,
+            )
+        return True
+
 
 
 class UserDAO:
@@ -1286,7 +1539,8 @@ class ConversationDAO:
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                """SELECT id, user_id, title, summary, turn_count, created_at, updated_at
+                """SELECT id, user_id, title, summary, summary_upto_seq,
+                          turn_count, created_at, updated_at
                    FROM conversations
                    WHERE id = $1 AND user_id = $2""",
                 conversation_id, user_id,
@@ -1336,30 +1590,59 @@ class ConversationDAO:
             )
             return int(row["seq"])
 
-    async def recent_turns(self, conversation_id: str, limit: int = 6) -> list[dict]:
+    async def recent_turns(
+        self, conversation_id: str, limit: int | None = 6
+    ) -> list[dict]:
         """取最近 N 行流水，**按时间正序返回**。
 
         两步取法的原因：DESC + LIMIT 才能走 (conversation_id, seq DESC) 索引，
         但拼 prompt 时必须正序（倒序会让模型以为最后一句是最早说的）。
+
+        `limit=None` = 取全量。只有「首次生成摘要」用得到（那时没有前次摘要，
+        窗口外的原文是它们唯一的存在形式，不能只取尾部）。
         """
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT seq, role, content, intent
-                   FROM conversation_turns
-                   WHERE conversation_id = $1
-                   ORDER BY seq DESC
-                   LIMIT $2""",
-                conversation_id, limit,
-            )
+            if limit is None:
+                rows = await conn.fetch(
+                    """SELECT seq, role, content, intent
+                       FROM conversation_turns
+                       WHERE conversation_id = $1
+                       ORDER BY seq DESC""",
+                    conversation_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT seq, role, content, intent
+                       FROM conversation_turns
+                       WHERE conversation_id = $1
+                       ORDER BY seq DESC
+                       LIMIT $2""",
+                    conversation_id, limit,
+                )
             return [dict(r) for r in reversed(rows)]
 
-    async def update_summary(self, conversation_id: str, summary: str) -> None:
-        """覆盖写会话摘要（滚动式，不保留历史版本）。"""
+    async def update_summary(
+        self, conversation_id: str, summary: str, upto_seq: int | None = None
+    ) -> None:
+        """覆盖写会话摘要（滚动式，不保留历史版本），同时记下**覆盖到哪一行**。
+
+        ★ upto_seq 是"可回链"的全部实现（2026-10-31）：
+          它把 summary 从"一段没有边界的文本"变成"有明确覆盖范围的派生数据"——
+          调用方据此知道哪些 seq 已进摘要、哪些还在滑窗里、哪些两边都没有。
+          没有它，摘要刷新失败一次就会静默留一个洞（见 schema.sql 的注释）。
+
+        ⚠️ upto_seq 传 None 时**不覆盖已有值**（COALESCE），不是写成 NULL：
+          否则任何一次"只改摘要不算位置"的调用都会把锚点抹掉，
+          而抹掉之后无法区分"从没算过"与"算过但丢了"。
+        """
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """UPDATE conversations SET summary = $2, updated_at = NOW()
+                """UPDATE conversations
+                   SET summary = $2,
+                       summary_upto_seq = COALESCE($3, summary_upto_seq),
+                       updated_at = NOW()
                    WHERE id = $1""",
-                conversation_id, summary,
+                conversation_id, summary, upto_seq,
             )
 
     async def list_for_user(self, user_id: str, limit: int = 20) -> list[dict]:
