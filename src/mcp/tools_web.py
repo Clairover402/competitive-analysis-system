@@ -27,6 +27,7 @@ Agent 不知道工具内部实现，只知道 schema。
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -46,6 +47,24 @@ _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
+
+
+def _tag_engine(results: list[dict], engine: str) -> list[dict]:
+    """给搜索结果打上来源引擎标记。
+
+    【2026-10-30】为什么必须能区分 synthesize
+      三层引擎是 Bing → Sogou → synthesize 顺序 fallback，最后一层
+      **不搜索、只按 query 拼出 site:zhihu.com 之类的 URL**（见 _synthesize_urls）。
+      下游拿到的是「非空列表」，于是「搜索空结果率」恒为 0 —— 指标看着健康，
+      实际是兜底在替前三层背锅。更糟的是这些拼出来的 URL 会被抓取、切片、入向量库，
+      污染检索结果（实测抓到过 cryptorank.io/funds/obsidian-capital 这种
+      「Obsidian 笔记软件 → Obsidian 资本公司」的完全无关页面）。
+      打标之后才能算出 synthesize 占比，把它和真实搜索结果分开统计。
+    """
+    for r in results:
+        if isinstance(r, dict):
+            r["engine"] = engine
+    return results
 
 
 async def web_search(
@@ -122,7 +141,7 @@ async def web_search(
                     logger.info(
                         "web_search[Tavily]: query=%r results=%d", query, len(results)
                     )
-                    return results
+                    return _tag_engine(results, "tavily")
                 else:
                     logger.warning(
                         "web_search[Tavily]: query=%r 返回0结果，切换 Bing", query
@@ -147,7 +166,7 @@ async def web_search(
             results = _parse_bing(resp.text, max_results)
             if results:  # 解析成功且有结果
                 logger.info("web_search[Bing]: query=%r results=%d", query, len(results))
-                return results
+                return _tag_engine(results, "bing")
             else:
                 logger.warning("web_search[Bing]: query=%r 返回0结果，切换 Sogou", query)
     except Exception:
@@ -168,7 +187,7 @@ async def web_search(
             results = _parse_sogou(resp.text, max_results)
             if results:
                 logger.info("web_search[Sogou]: query=%r results=%d", query, len(results))
-                return results
+                return _tag_engine(results, "sogou")
             else:
                 logger.warning("web_search[Sogou]: query=%r 返回0结果，使用 synthesize 兜底", query)
     except Exception:
@@ -177,8 +196,11 @@ async def web_search(
     # ── L3: synthesize 终极兜底 ──
     # 构造定向高质量 URL：site:zhihu.com / site:csdn.net / site:36kr.com
     results = _synthesize_urls(query, max_results)
-    logger.info("web_search[synthesize]: query=%r results=%d（构造URL）", query, len(results))
-    return results
+    logger.warning(
+        "web_search[synthesize]: query=%r results=%d（前三层全挂，构造 URL 兜底）",
+        query, len(results),
+    )
+    return _tag_engine(results, "synthesize")
 
 
 async def _jina_fetch(url: str, max_chars: int = 10000) -> dict:
@@ -230,6 +252,98 @@ async def _jina_fetch(url: str, max_chars: int = 10000) -> dict:
     except Exception as e:
         result["error"] = str(e)
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Playwright 本地渲染兜底 —— 不依赖任何外部渲染服务
+# ═══════════════════════════════════════════════════════════════════════════
+# 【2026-10-30】为什么必须本地渲染
+#   Jina Reader（r.jina.ai）在 WSL 与 Windows 双端实测均 ConnectTimeout（21s），
+#   分支从未执行过。而目标竞品官网全是 SPA：飞书/钉钉/语雀首页服务端只返回
+#   <title> + 几个 CTA，去 script 后正文 22–117 字符；实测 8 个任务 126 次抓取里
+#   这三个域名失败率 80–100%，是 cp 0.464 的直接成因之一。
+#   Tavily 的 include_raw_content 也救不全（每任务 25–40 次搜索里约一半回落 fetch），
+#   所以补一层本地 chromium：执行 JS 后取 body.innerText，不解析 HTML 结构。
+#
+# 【为什么不常开】
+#   每页 2–4s，是 httpx 的 5–10 倍。只在 httpx 正文 CJK < 200 时触发，
+#   静态站（hubspot/bilibili 等实测 0% 失败）完全不受影响。
+#
+# 【为什么不复用 context】
+#   每个 URL 一个全新 context：站点间的 cookie/localStorage 不互通，
+#   避免 A 站的登录态或同意弹窗影响 B 站渲染结果。
+
+_pw_browser = None
+_pw_playwright = None
+_pw_lock: asyncio.Lock | None = None
+
+
+async def _get_browser():
+    """chromium 单例。断开（进程被系统回收/崩溃）时自动重建。"""
+    global _pw_browser, _pw_playwright, _pw_lock
+    if _pw_browser is not None and _pw_browser.is_connected():
+        return _pw_browser
+    if _pw_lock is None:
+        _pw_lock = asyncio.Lock()
+    async with _pw_lock:
+        if _pw_browser is not None and _pw_browser.is_connected():
+            return _pw_browser
+        from playwright.async_api import async_playwright
+
+        _pw_playwright = await async_playwright().start()
+        _pw_browser = await _pw_playwright.chromium.launch(
+            headless=True,
+            args=[
+                # 去掉 "Chrome 正受到自动测试软件的控制" 特征，部分站点据此返回拦截页
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        logger.info("playwright: chromium 已启动 version=%s", _pw_browser.version)
+        return _pw_browser
+
+
+async def _playwright_fetch(url: str, max_chars: int = 10000) -> dict | None:
+    """本地渲染取正文。返回 None = 渲染失败或无正文（调用方保留原结果）。
+
+    不抛异常：兜底层失败不能把整个 web_fetch 拖成异常，否则上游看不到原来的
+    「正文为空」而是一个 traceback，错误分类全乱。
+    """
+    context = None
+    try:
+        browser = await _get_browser()
+        context = await browser.new_context(
+            user_agent=_BROWSER_UA,
+            locale="zh-CN",
+            viewport={"width": 1440, "height": 900},
+        )
+        page = await context.new_page()
+        await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+        # 不用 networkidle：埋点/轮询页永远等不到 idle，会一直卡到超时。
+        # 固定等 2.5s 覆盖首屏渲染 + 首屏数据请求，比 load 事件更贴近"能看到内容"。
+        await page.wait_for_timeout(2500)
+        text, title = await page.evaluate(
+            "() => [document.body ? document.body.innerText : '', document.title || '']"
+        )
+        text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+        if not text:
+            return None
+        logger.info("web_fetch[playwright]: url=%s chars=%d", url, len(text))
+        return {
+            "status_code": 200,
+            "title": (title or "").strip(),
+            "text_content": text[:max_chars],
+            "rendered": True,
+        }
+    except Exception as e:  # noqa: BLE001 —— 兜底层必须吞掉一切
+        logger.warning("web_fetch[playwright] 渲染失败 url=%s error=%s", url, e)
+        return None
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def web_fetch(
@@ -327,6 +441,8 @@ async def web_fetch(
     # ── Jina Reader 兜底：正文过少（SPA 骨架）时重试 ──
     # 【2026-09-26】httpx 抓 SPA 页面只能拿到 JS 骨架，正文 CJK < 200。
     # 此时用 Jina Reader 服务端渲染再抓一次，能拿到真正文。
+    # 【2026-10-30】WSL 与 Windows 双端实测 r.jina.ai 均 ConnectTimeout（21s），
+    # 这条分支实际从未执行过；保留开关，实际兜底改走本地渲染（见下）。
     if settings is not None and settings.jina_reader_enabled:
         cjk = sum(1 for ch in result["text_content"] if '\u4e00' <= ch <= '\u9fff')
         if cjk < 200:
@@ -340,6 +456,19 @@ async def web_fetch(
             )
             if jina_cjk > cjk:
                 result = jina
+
+    # ── Playwright 渲染兜底：本地 chromium 执行 JS 后再取正文 ──
+    # 触发条件与 Jina 同一判据（CJK < 200），但覆盖面更宽：不只中文站，
+    # 英文 SPA（Notion / Atlassian 官网）也救得回来。
+    if settings is not None and settings.playwright_fallback_enabled:
+        cjk = sum(1 for ch in result.get("text_content") or "" if '\u4e00' <= ch <= '\u9fff')
+        if cjk < 200:
+            rendered = await _playwright_fetch(url, max_chars)
+            # 只有渲染后正文明显更多才替换 —— 渲染也可能拿到 cookie 墙/拦截页
+            if rendered and len(rendered["text_content"]) > len(result.get("text_content") or ""):
+                rendered["fallback"] = "playwright"
+                rendered["pre_render_chars"] = len(result.get("text_content") or "")
+                result = rendered
 
     return result
 

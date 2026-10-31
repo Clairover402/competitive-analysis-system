@@ -4,10 +4,49 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
+from collections import Counter
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+# ── 跨任务共享缓存（2026-10-31）──────────────────────────────
+# 【为什么存在】Tavily 免费额度 1000 次/月，40 条任务按旧口径直接烧穿。
+# 工具级幂等（idem_key）救不了它：指纹掺了 task_id，缓存按任务隔离，
+# 两个任务搜同一个 query 仍是两次真实调用。共享缓存把键挪到「query 语义」上，
+# 24h 内跨任务回放。
+# 【为什么只对 web_search 开】web_fetch 已有按 URL 的跨任务去重（上游 seen_urls
+# + 幂等键就是 URL）；embed/rerank 是纯计算无外部配额。搜索是唯一
+# 「同参数重跑 = 纯浪费外部配额且现有层拦不住」的工具。
+_SHARED_CACHE_TTL: dict[str, int] = {"web_search": 24 * 3600}
+
+# query 归一化：LLM 每次生成的措辞会漂（"飞书 2025 价格" vs "2025 飞书价格"）。
+# 完全字面匹配命中率太低；按「token 集」归一（大小写折叠 + 切词 + 排序），
+# 语序/空格差异不 Miss，只有真实换词才 Miss。
+# ⚠️ 先在中英/数字边界补空格再切：「2025飞书」必须切成「2025」+「飞书」，
+#    否则它作为一个 token，和「2025 飞书」的 token 集合永不相等。
+_SHARED_BOUNDARY_RE = re.compile(
+    r"(?<=[0-9a-zA-Z])(?=[\u4e00-\u9fff])|(?<=[\u4e00-\u9fff])(?=[0-9a-zA-Z])"
+)
+_SHARED_TOKEN_RE = re.compile(r"[0-9a-zA-Z\u4e00-\u9fff]+")
+
+
+def _shared_cache_key(arguments: dict) -> str | None:
+    """从工具参数提取归一化缓存键。非 web_search 形状的参数返回 None（不缓存）。"""
+    if not isinstance(arguments, dict):
+        return None
+    q = arguments.get("query")
+    if not isinstance(q, str) or not q.strip():
+        return None
+    normalized = _SHARED_BOUNDARY_RE.sub(" ", q.casefold())
+    tokens = sorted(_SHARED_TOKEN_RE.findall(normalized))
+    return " ".join(tokens) if tokens else None
+
+
+def _shared_call_id(tool_name: str, norm_query: str) -> str:
+    """共享缓存行键：**不含 task_id** —— 跨任务命中就是靠这一点。"""
+    return hashlib.sha256(f"shared|{tool_name}|{norm_query}".encode("utf-8")).hexdigest()
 
 # ============================================================
 # 工具处理器类型签名
@@ -105,6 +144,17 @@ def _summarize_result(result: Any) -> dict:
     """
     if isinstance(result, (list, tuple)):
         summary: dict[str, Any] = {"kind": "list", "n": len(result)}
+        # 搜索结果的引擎来源分布（2026-10-30）。
+        # 只记 n 的话，synthesize 兜底（不搜索、按 query 拼 URL）返回的非空列表
+        # 和 Tavily 真搜到的结果长得一模一样 —— 下游算出的「搜索空结果率」恒为 0，
+        # 假健康。记下来才能把「真搜到」和「拼出来的」分开。
+        engines = Counter(
+            item["engine"]
+            for item in result
+            if isinstance(item, dict) and item.get("engine")
+        )
+        if engines:
+            summary["engines"] = dict(engines)
         scores = [
             item["score"]
             for item in result
@@ -123,6 +173,11 @@ def _summarize_result(result: Any) -> dict:
             if isinstance(value, str):
                 summary["chars"] = len(value)
                 break
+        # 渲染兜底标记（2026-10-30）：playwright = httpx 拿到骨架后用本地 chromium
+        # 重新渲染取得的正文。不落这个键，抓取层「90% 靠渲染救回来」这件事
+        # 在库里完全看不见，只能去翻日志文件。
+        if result.get("fallback"):
+            summary["fallback"] = result["fallback"]
         return summary
     if isinstance(result, str):
         return {"kind": "str", "chars": len(result)}
@@ -137,6 +192,47 @@ def _tool_call_id(task_id: str | None, name: str, idem_key: str) -> str:
     task_id 参与哈希 ⇒ 缓存天然按任务隔离，跨任务永不串。
     """
     return hashlib.sha256(f"{task_id or '-'}|{name}|{idem_key}".encode("utf-8")).hexdigest()
+
+
+# ── 工具级超时（2026-10-31，亮点 A / A1）──────────────────────────────
+# 【为什么必须在这一层设】此前一个工具**没有任何超时上限**：httpx 的超时只护
+# 住 HTTP 读写，playwright 卡在 page.goto 之外的等待（站点弹窗、JS 死循环）
+# 会把 collect 节点挂住直到进程被杀 —— 而任务状态停在 running，
+# 用户看到的是"一直在跑"，日志里一行错误都没有。
+# 【为什么这些数字能这么宽】它们是 watch-dog，不是预算：每个值都 ≥ 该工具内部
+# 各段 httpx 超时之和（web_search 三层 20+15+15、web_fetch 20+30+20），
+# 正常路径永远碰不到，只有"真卡死"才会触发。
+# 【为什么 embed/rerank 也给】它们虽然是纯计算，但都经 httpx 打外部推理服务；
+# 留一个上限是为了让"卡住"以异常形式暴露，而不是拖成永不结束的协程。
+_TOOL_TIMEOUT_SECONDS: dict[str, float] = {
+    "web_search": 90.0,
+    "web_fetch": 120.0,
+    "embed_texts": 300.0,   # 大批量分多次请求，单个请求 60s
+    "embed_query": 60.0,
+    "rerank": 180.0,
+}
+DEFAULT_TOOL_TIMEOUT_SECONDS = 300.0
+
+
+def _tool_timeout(name: str) -> float:
+    return _TOOL_TIMEOUT_SECONDS.get(name, DEFAULT_TOOL_TIMEOUT_SECONDS)
+
+
+# 对账的三值结果：命中（已执行）/ 未命中（判定未执行）/ 不适用。
+# ⚠️ 不能用 None 表示"未命中" —— 工具真的可以合法返回 None，
+# 那样"查到了 None"和"没查到"就混成一个值，恰好是这类代码最典型的静默缺陷。
+_MISS = object()
+
+
+def _count_reconcile(result: str) -> None:
+    """对账结果计数。延迟 import + 吞异常：埋点不能影响主流程，
+    mcp 层也不该在模块级反向依赖 observability。"""
+    try:
+        from src.observability.metrics import record_tool_reconcile
+
+        record_tool_reconcile(result)
+    except Exception:  # noqa: BLE001 — 计数器坏了不该让工具调用失败
+        logger.debug("对账指标写入失败 result=%s", result, exc_info=True)
 
 
 class ToolDef:
@@ -422,11 +518,16 @@ class MCPServer:
         error: str | None = None
         result_summary: dict | None = None
         try:
-            result = await tool.handler(arguments)
+            # 超时上限见 _TOOL_TIMEOUT_SECONDS。无 idem_key 的调用没有对账依据
+            # （不知道"这个逻辑调用"是谁），超时只能判定为未完成、交回上层降级。
+            result = await asyncio.wait_for(tool.handler(arguments), _tool_timeout(name))
             # 2026-10-19：结果摘要入审计 —— 轨迹评估要靠它算空结果率、
             # 采集漏斗、rerank 分数区分度；不记原文，只记体积/分布。
             result_summary = _summarize_result(result)
             return result
+        except asyncio.TimeoutError:
+            error = f"TimeoutError: {name} 超过 {_tool_timeout(name):.0f}s 未返回"
+            raise
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             raise
@@ -474,6 +575,29 @@ class MCPServer:
             )
             return cached
 
+        # 1.5) 跨任务共享缓存（24h）：别的任务已经搜过同一 query → 直接回放。
+        #   放在 per-task 回放之后、in-flight 之前：本任务自己搜过的优先级最高
+        #   （语义完全一致），共享缓存兜跨任务，in-flight 只兜本进程并发。
+        shared_ttl = _SHARED_CACHE_TTL.get(name)
+        if shared_ttl is not None:
+            norm = _shared_cache_key(arguments)
+            if norm:
+                shared_id = _shared_call_id(name, norm)
+                try:
+                    shared_cached = await self._idem.get_fresh(shared_id, shared_ttl)
+                except Exception:
+                    # 同幂等层的纪律：存储挂了退化为直接执行，不阻断主流程
+                    logger.exception("共享缓存查询失败，跳过 tool=%r", name)
+                    shared_cached = None
+                if shared_cached is not None:
+                    await self._record(
+                        name, arguments, task_id, agent_name,
+                        round((time.perf_counter() - started) * 1000, 1),
+                        None,
+                        {"replayed": True, "cache": "shared", **_summarize_result(shared_cached)},
+                    )
+                    return shared_cached
+
         # 2) 进程内已有同 key 执行在跑（并发 / 快速重试）→ 共享它的结果
         existing = self._inflight.get(tc_id)
         if existing is not None:
@@ -490,6 +614,29 @@ class MCPServer:
             result = await asyncio.shield(exec_task)
             result_summary = _summarize_result(result)
             return result
+        except asyncio.TimeoutError as exc:
+            # ── 超时对账（2026-10-31）──
+            # 超时只能说明"没等到结果"，不能说明"没执行"：执行体可能已经打完
+            # 外部 API（配额已扣）却没能在期限内返回。此时先查结果日志：
+            #   命中 → 判定**已执行**，回放首次结果（省掉一次重复副作用）
+            #   未命中 → 判定**未执行**，抛回去交上层重试
+            # ⚠️ 查不到时无法区分"没执行"和"执行了但失败"，但对重试决策而言
+            #    两者一样（都该重试），所以表里不需要 status 列 —— 只缓存成功结果
+            #    本身就是正确设计。
+            hit = await self._reconcile(tc_id, name)
+            if hit is _MISS:
+                _count_reconcile("miss")
+                error = (
+                    f"TimeoutError: {name} 超过 {_tool_timeout(name):.0f}s 未返回，"
+                    f"对账未命中（判定未执行）"
+                )
+                raise
+            _count_reconcile("hit")
+            result_summary = {
+                "replayed": True, "reconcile": "timeout",
+                **_summarize_result(hit),
+            }
+            return hit
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             raise
@@ -500,6 +647,27 @@ class MCPServer:
                 error, result_summary,
             )
 
+    async def _reconcile(self, tc_id: str, name: str) -> Any:
+        """超时后对账：查结果日志，返回首次结果或 `_MISS`。
+
+        只查一次、不等待：执行体在超时那一刻已被取消，不会再落表；
+        真正可能命中的是「另一个进程/上一次尝试已经成功并落了表」。
+        存储故障按"查不到"处理（退化为重试），与幂等层的既有纪律一致。
+        """
+        try:
+            rec = await self._idem.get_record(tc_id)
+        except Exception:  # noqa: BLE001 — 对账失败不能盖住原始超时
+            logger.exception("超时对账查询失败，按未执行处理 tool=%r", name)
+            return _MISS
+        if rec is None:
+            logger.info("超时对账未命中，判定未执行 tool=%s id=%s", name, tc_id[:8])
+            return _MISS
+        logger.info(
+            "超时对账命中，判定已执行并回放 tool=%s id=%s 落库于 %s",
+            name, tc_id[:8], rec.get("created_at"),
+        )
+        return rec["result"]
+
     async def _exec_and_cache(
         self,
         tool: ToolDef,
@@ -509,7 +677,12 @@ class MCPServer:
     ) -> Any:
         """执行工具并把**成功**结果落幂等表。执行失败只上抛、不落表。"""
         try:
-            result = await tool.handler(arguments)
+            # 超时上限是 watch-dog：一旦触发，wait_for 会取消 handler —— 卡死的
+            # 执行体不能留在后台继续跑（它可能正在写库/占连接），
+            # 取消后由 _invoke_idempotent 走对账分支决定"已执行/未执行"。
+            result = await asyncio.wait_for(
+                tool.handler(arguments), _tool_timeout(tool.name)
+            )
         finally:
             self._inflight.pop(tc_id, None)
         try:
@@ -520,6 +693,19 @@ class MCPServer:
             # 落表失败 ≈ 这次执行白缓存（重试会重跑一次），但不能让它炸掉主流程
             logger.exception("幂等结果落库失败 tool=%r tc_id=%s…%s",
                              tool.name, tc_id[:8], tc_id[-8:])
+        # 共享缓存：只在幂等行落成功后写。upsert 覆盖旧值 —— 缓存语义允许
+        # 新换旧，与幂等行的 DO NOTHING（首次结果不可变）刻意相反。
+        shared_ttl = _SHARED_CACHE_TTL.get(tool.name)
+        if shared_ttl is not None:
+            norm = _shared_cache_key(arguments)
+            if norm:
+                try:
+                    await self._idem.upsert_shared(
+                        _shared_call_id(tool.name, norm),
+                        tool.name, _digest_arguments(arguments), result,
+                    )
+                except Exception:
+                    logger.exception("共享缓存落库失败 tool=%r（不影响本次结果）", tool.name)
         return result
 
     async def _record(

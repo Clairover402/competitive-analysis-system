@@ -182,6 +182,12 @@ class Settings(BaseSettings):
     # 当前抓 SPA 正文的主力方案改为 Tavily 的 include_raw_content（见 tools_web.py）。
     jina_reader_enabled: bool = False
 
+    # Playwright 本地渲染兜底：
+    # httpx 拿到的正文 CJK < 200（SPA 骨架）时，用本地 chromium 渲染后再取一次。
+    # 与 jina_reader_enabled 是同一触发点上的两种实现——Jina 在 WSL/Windows 双端
+    # 实测均不可达（2026-10-30），保留开关只为历史兼容，默认关；本地渲染默认开。
+    playwright_fallback_enabled: bool = True
+
     # ---- Limits ----
     max_concurrent_collectors: int = 3
     max_rounds_supervisor: int = 10
