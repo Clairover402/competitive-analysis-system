@@ -44,7 +44,44 @@ from src.agents.analyzer import analyzer_agent
 from src.agents.writer import writer_agent
 from src.agents.quality import quality_agent
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Agent 调用埋点（2026-11-01）
+# ═════════════════════════════════════════════════════════════════════════════
+# 【为什么包在这里】四条调用路径（pipeline 的 4 个节点 / A2A 的 send_task）
+#   都从 `src.agents` 取函数对象，包一次两边都覆盖；写在各 agent 内部要改 4 处，
+#   而且以后加第 5 个 agent 一定有人忘。
+#
+# 【判定口径】抛异常、或返回 dict 里带**非空** error → error；其余一律 success。
+#   ⚠️ quality 返回 `passed=False` 是**质检结论**，不是调用失败 —— 混进来会让
+#      「错误率」变成「不合格率」，那是两个完全不同的东西。
+from collections.abc import Awaitable, Callable
+from functools import wraps
 from typing import Any
+
+from src.observability.metrics import record_agent_call
+
+
+def _instrumented(name: str, fn: Callable[..., Awaitable[Any]]):
+    @wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = await fn(*args, **kwargs)
+        except Exception:
+            record_agent_call(name, "run", False)
+            raise
+        record_agent_call(
+            name, "run", not (isinstance(result, dict) and result.get("error"))
+        )
+        return result
+
+    return wrapper
+
+
+collector_agent = _instrumented("collector", collector_agent)
+analyzer_agent = _instrumented("analyzer", analyzer_agent)
+writer_agent = _instrumented("writer", writer_agent)
+quality_agent = _instrumented("quality", quality_agent)
+
 
 from langchain_deepseek import ChatDeepSeek
 

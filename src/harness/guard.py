@@ -54,6 +54,8 @@ import re
 import time
 from typing import TYPE_CHECKING
 
+from src.observability.metrics import record_harness_block
+
 if TYPE_CHECKING:
     from asyncpg import Pool
 
@@ -498,6 +500,7 @@ class HarnessGuard:
         # 不执行后续检查（参数校验、频控都没意义了——根本不该调）
         if not self.check_whitelist(agent_name, action):
             error = "WHITELIST_DENIED"
+            record_harness_block("whitelist")
             logger.warning("白名单拦截: agent=%s, action=%s", agent_name, action)
             # 【L5 决策】拦截也写审计（安全事件）
             await self._audit_event({
@@ -512,6 +515,7 @@ class HarnessGuard:
         valid, msg = self.validate_params(action, arguments, schema)
         if not valid:
             error = f"PARAM_INVALID: {msg}"
+            record_harness_block("param_validation")
             logger.warning("参数校验失败: %s", msg)
             await self._audit_event({
                 "task_id": task_id, "agent_name": agent_name, "action": action,
@@ -524,6 +528,7 @@ class HarnessGuard:
         # ── Layer 3: 频控 ──
         if not self.check_rate_limit(agent_name):
             error = "RATE_LIMITED"
+            record_harness_block("rate_limit")
             logger.warning("频控触发: agent=%s", agent_name)
             await self._audit_event({
                 "task_id": task_id, "agent_name": agent_name, "action": action,
