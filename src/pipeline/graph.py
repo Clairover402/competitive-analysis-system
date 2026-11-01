@@ -339,14 +339,16 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
         }
         logger.info("【Pipeline】quality node ── task=%s v=%d", 
                     state["task_id"], state.get("report_version", 1))
-        # 【2026-10-31 降本】质检打分走次级模型：输出是五维分 + issues 的固定
-        # JSON，占 12% 的 token（114 次 69.7 万）。风险是打分尺度会变（同一份
-        # 报告 9B 给的分与 DeepSeek 不同），所以这次只换模型、不改阈值 70，
-        # 并用规则门禁（计划 D）兜住「分数高但报告差」——打分可以松，规则不会。
-        from src.agents import create_llm_client
-
-        q_llm = create_llm_client(mcp_server.settings, temperature=0.0, tier="secondary")
-        result = await quality_agent(task, mcp_server, q_llm)
+        # 【2026-11-01 回滚到主模型】9B 在质检上不可用，实测两个独立故障：
+        #   ① 尺度混乱：LLM 输出维度分 0-10（8/9/9/9/7），代码按 0-100 加权
+        #      → 算出 8.3 分 → 判不通过 → 触发重写。6 个 pipeline 任务产生
+        #      16 份报告、0 份通过，重写把 token 全烧掉了。
+        #      更糟的是同一份报告内尺度还会混：准确性 27 / 可读性 9。
+        #   ② JSON 截断：comment 写太长撞 max_tokens，输出不完整 →
+        #      json.loads 抛异常 → 整个任务 failed（批次3 的 2 条失败即此）。
+        # 关键词生成仍走 secondary（−83% token 且没出问题）——分界不在任务难度，
+        # 在「输出里有没有自由文本解释」：纯列表抽取 9B 够用，带 comment 就崩。
+        result = await quality_agent(task, mcp_server, llm)
         return {
             "quality_score": result["overall_score"],
             # ⚠️ 双键兼容兜底：质检的 4 个兜底分支（空响应/格式异常/无JSON/解析失败）
