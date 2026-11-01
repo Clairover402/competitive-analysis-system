@@ -321,7 +321,7 @@ async def quality_agent(
         return {
             "overall_score": 0,
             "passed": False,
-            "dimension_scores": {dim: {"score": 0, "comment": "LLM 返回空响应"} for dim in _WEIGHTS},
+            "dimensions": {dim: {"score": 0, "comment": "LLM 返回空响应"} for dim in _WEIGHTS},
             "issues": ["LLM 返回空响应，无法评分"],
             "rewrite_suggestions": ["请人工检查报告质量"],
         }
@@ -342,7 +342,7 @@ async def quality_agent(
         return {
             "overall_score": 0,
             "passed": False,
-            "dimension_scores": {dim: {"score": 0, "comment": "LLM 输出格式异常"} for dim in _WEIGHTS},
+            "dimensions": {dim: {"score": 0, "comment": "LLM 输出格式异常"} for dim in _WEIGHTS},
             "issues": ["LLM 输出格式异常"],
             "rewrite_suggestions": ["请检查 LLM 服务状态"],
         }
@@ -360,7 +360,7 @@ async def quality_agent(
             return {
                 "overall_score": 0,
                 "passed": False,
-                "dimension_scores": {dim: {"score": 0, "comment": "LLM 输出中无 JSON"} for dim in _WEIGHTS},
+                "dimensions": {dim: {"score": 0, "comment": "LLM 输出中无 JSON"} for dim in _WEIGHTS},
                 "issues": ["LLM 输出无法解析"],
                 "rewrite_suggestions": ["请检查 LLM 服务状态"],
             }
@@ -373,7 +373,7 @@ async def quality_agent(
         return {
             "overall_score": 0,
             "passed": False,
-            "dimension_scores": {dim: {"score": 0, "comment": f"JSON解析失败: {e}"} for dim in _WEIGHTS},
+            "dimensions": {dim: {"score": 0, "comment": f"JSON解析失败: {e}"} for dim in _WEIGHTS},
             "issues": ["LLM 输出非有效 JSON"],
             "rewrite_suggestions": ["请检查 LLM 输出格式"],
         }

@@ -349,7 +349,11 @@ def _make_node_quality(mcp_server: MCPServer, llm: ChatDeepSeek):
         result = await quality_agent(task, mcp_server, q_llm)
         return {
             "quality_score": result["overall_score"],
-            "quality_details": result["dimensions"],
+            # ⚠️ 双键兼容兜底：质检的 4 个兜底分支（空响应/格式异常/无JSON/解析失败）
+            # 与成功路径的键名曾不一致（dimension_scores vs dimensions），
+            # 2026-10-31 批次3 两次触发兜底 → KeyError → 整条任务置 failed。
+            # 这里 `.get` 链保证任一路径都不炸；键名已统一为 dimensions。
+            "quality_details": result.get("dimensions") or result.get("dimension_scores") or {},
             "quality_passed": result["passed"],
             "rewrite_suggestions": result["rewrite_suggestions"],
         }
