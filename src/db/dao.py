@@ -167,6 +167,38 @@ class TaskDAO:
                     result[field] = json.loads(val)
             return result
 
+    async def list_recent(self, user_id: str, limit: int = 20) -> list[dict]:
+        """某用户最近创建的任务（新→旧），供任务队列列表接口使用。
+
+        为什么必须有这个方法：任务队列曾纯存浏览器 localStorage，
+        脚本提交/换设备/清缓存的任务在页面上不可见（2026-11-01 批次3
+        20 条脚本任务全看不到）。列表以服务端为准，越权边界与单查
+        一致——WHERE user_id 只看自己的任务。
+
+        ⚠️ tasks.user_id 是 VARCHAR（历史遗留），users.id 是 UUID，
+        这里的入参按调用方（CurrentUser.user_id 是 str）原样传入即可。
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, title, status, pipeline_mode,
+                          competitors, dimensions, created_at
+                   FROM tasks
+                   WHERE user_id = $1
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT $2""",
+                user_id, limit,
+            )
+            result = []
+            for row in rows:
+                d = dict(row)
+                # JSONB 字段反序列化（与 get() 同口径：str 或已解析的 list）
+                for field in ("competitors", "dimensions"):
+                    val = d.get(field)
+                    if isinstance(val, str):
+                        d[field] = json.loads(val)
+                result.append(d)
+            return result
+
     async def update_status(
         self,
         task_id: str,

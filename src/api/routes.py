@@ -2025,6 +2025,39 @@ async def get_conversation_turns(
 # §6 路由 — GET /api/tasks/{task_id}
 # ═════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/tasks")
+async def list_tasks(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> list[TaskResponse]:
+    """列出当前用户最近创建的任务（新→旧）。
+
+    为什么要有列表接口（2026-11-01）：前端任务队列原本纯存浏览器
+    localStorage，脚本提交/换设备的任务在页面上永远不可见（批次3
+    20 条脚本任务全看不到）。列表以服务端为准；单查的越权边界
+    （只看自己的任务）在这里同样成立——WHERE user_id 强制过滤。
+
+    progress 不随列表返回（那是 N 次快照查询，列表页用不到；
+    点进单任务详情时再查）。
+    """
+    pool = _get_pool(request)
+    rows = await TaskDAO(pool).list_recent(current_user.user_id, limit)
+    return [
+        TaskResponse(
+            task_id=str(r["id"]),
+            status=r["status"],
+            title=r["title"],
+            competitors=r.get("competitors", []),
+            dimensions=r.get("dimensions", []),
+            pipeline_mode=r.get("pipeline_mode", "pipeline"),
+            created_at=str(r.get("created_at", "")),
+            progress=None,
+        )
+        for r in rows
+    ]
+
+
 @app.get("/api/tasks/{task_id}")
 async def get_task(
     task_id: str,

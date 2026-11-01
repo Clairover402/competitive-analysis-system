@@ -890,20 +890,32 @@ async function loadTasks() {
   if (!el) return;
 
   try {
-    var taskIds = getLocalTaskIds();
+    var tasks = [];
 
-    if (taskIds.length === 0) {
-      el.innerHTML = renderEmptyState();
-      return;
+    // ── 服务端列表为主 ──
+    // 队列曾纯存 localStorage：脚本提交/换设备/清缓存的任务永远看不到
+    // （2026-11-01 后端补了 GET /api/tasks 列表接口，这里以它为准）。
+    try {
+      tasks = await API.get('/api/tasks?limit=20');
+      if (tasks && !Array.isArray(tasks)) tasks = tasks.items || [];
+    } catch (e) {
+      tasks = [];
     }
 
-    var recent = taskIds.slice(-20).reverse();
-    var tasks = [];
-    for (var i = 0; i < recent.length; i++) {
-      try {
-        var t = await API.get('/api/tasks/' + recent[i]);
-        tasks.push(t);
-      } catch(e) {}
+    // ── 回落：列表接口失败时按本地 id 逐个查（兼容旧后端/离线） ──
+    if (tasks.length === 0) {
+      var taskIds = getLocalTaskIds();
+      if (taskIds.length === 0) {
+        el.innerHTML = renderEmptyState();
+        return;
+      }
+      var recent = taskIds.slice(-20).reverse();
+      for (var i = 0; i < recent.length; i++) {
+        try {
+          var t = await API.get('/api/tasks/' + recent[i]);
+          tasks.push(t);
+        } catch(e) {}
+      }
     }
 
     if (tasks.length === 0) {
