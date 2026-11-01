@@ -24,8 +24,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime
+from pathlib import Path
 
 from src.config import Settings
+from src.evaluation.common.paths import relative, reports_dir
 from src.supervisor.intent import classify
 
 # (原话, gold, 争议点说明) —— 第三条只在 gold 存疑时写
@@ -68,10 +72,13 @@ async def main() -> None:
     cfg = Settings()
     ok = 0
     misses: list[tuple[str, str, str, str]] = []
+    rows: list[dict] = []
     for text, gold, _ in HOLDOUT:
         r = await classify(query=text, settings=cfg)
         hit = r.intent == gold
         ok += hit
+        rows.append({"text": text, "gold": gold, "pred": r.intent,
+                     "layer": r.layer, "hit": hit})
         if not hit:
             misses.append((text, gold, r.intent, r.layer))
         print(f"{'OK ' if hit else 'XX '}{gold:<9}->{r.intent:<9}{r.layer:<4} {text}")
@@ -82,6 +89,46 @@ async def main() -> None:
         print("错例：")
         for text, gold, pred, layer in misses:
             print(f"  {gold} -> {pred} ({layer})  {text}")
+    print(f"\n本轮已存 {relative(_save(ok, total, rows))}（run.json + summary.md）")
+
+
+def _save(correct: int, total: int, rows: list[dict]) -> Path:
+    """落一轮：`evaluation_reports/intent/holdout/<ts>/run.json`。
+
+    【为什么必须落盘】2026-10-31 加发布门禁时发现的缺口：这份评估**只打印**，
+    门禁的指标型检查读不到任何机读产物，只能永远 SKIP —— 而 SKIP 判失败。
+    评估跑完不落机读产物，等于评估从没跑过（对人来说是"我看过了"，
+    对门禁来说是"没有证据"）。
+    ⚠️ 与 `runs/` 分开目录：那下面是 CASES 的每轮结果，
+       混进去会让「最新一轮意图准确率」读到验收集的数。
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = reports_dir("intent") / "holdout" / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "total": total,
+        "correct": correct,
+        "accuracy": round(correct / total, 4) if total else None,
+        "misses": [r for r in rows if not r["hit"]],
+        "rows": rows,
+    }
+    (run_dir / "run.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    lines = [
+        f"# holdout 验收集 · {ts}",
+        "",
+        f"- 准确率：**{(correct / total if total else 0):.1%}**（{correct}/{total}）",
+        "- 口径：走完整 classify（L2→L3→L4），不是单测某一层",
+        "- ⚠️ 这批句子**看过一次就失效**，每轮改完 prompt 应补新句、删旧句",
+    ]
+    if correct < total:
+        lines += ["", "## 错例", ""]
+        lines += [f"- `{r['gold']} → {r['pred']}`（{r['layer']}）{r['text']}"
+                  for r in rows if not r["hit"]]
+    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return run_dir
 
 
 if __name__ == "__main__":
